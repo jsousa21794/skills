@@ -1,0 +1,21 @@
+# Modelfile de exemplo para o AMALIA-9B (português europeu), com janela de contexto alargada.
+# Uso:
+#   ollama create amalia-pt -f ollama/Modelfile.amalia
+#   OLLAMA_MODEL=amalia-pt
+#
+# O GGUF é uma conversão comunitária; confirma no Hugging Face a versão mais recente e a licença (Apache 2.0).
+# Se o modelo responder em inglês ou gerar texto degenerado, o template de chat do GGUF pode não ter sido
+# reconhecido: descomenta o bloco TEMPLATE (formato ChatML) e recria o modelo.
+FROM hf.co/csoares31/AMALIA-9B-0626-DPO-GGUF:Q6_K
+
+PARAMETER num_ctx 16384
+PARAMETER temperature 0.4
+
+# TEMPLATE """{{ if .System }}<|im_start|>system
+# {{ .System }}<|im_end|>
+# {{ end }}{{ if .Prompt }}<|im_start|>user
+# {{ .Prompt }}<|im_end|>
+# {{ end }}<|im_start|>assistant
+# {{ .Response }}<|im_end|>
+# """
+# PARAMETER stop <|im_end|>

@@ -10,6 +10,34 @@ export type Intensity = (typeof INTENSITIES)[number];
 export const LENGTH_OPTIONS = ["manter", "encurtar", "desenvolver"] as const;
 export type LengthOption = (typeof LENGTH_OPTIONS)[number];
 
+export interface VoiceMetrics {
+  sampleWords: number;
+  averageSentenceLength: number;
+  sentenceLengthStdDev: number;
+  longSentenceShare: number;
+  shortSentenceShare: number;
+  averageParagraphWords: number;
+  commasPer100Words: number;
+  semicolonsPer100Words: number;
+  colonsPer100Words: number;
+  dashesPer100Words: number;
+  parenthesesPer100Words: number;
+  exclamationShare: number;
+  questionShare: number;
+  firstPersonPer100Words: number;
+  typeTokenRatio: number;
+  connectors: { term: string; count: number }[];
+  /** Tratamento do leitor em português: tu, você, misto ou impessoal. */
+  address: "tu" | "você" | "misto" | "impessoal" | null;
+  enclisisPer100Words: number | null;
+  contractionsPer100Words: number | null;
+}
+
+export interface PreferredTerm {
+  from: string;
+  to: string;
+}
+
 export interface VoiceProfile {
   /** Nome curto do perfil, definido pelo utilizador. */
   name: string;
@@ -23,6 +51,12 @@ export interface VoiceProfile {
   sentenceStructure: string;
   /** Coisas a evitar. */
   avoid: string;
+  /** Métricas objetivas calculadas a partir das amostras (opcional). */
+  metrics?: VoiceMetrics | null;
+  /** Guia de estilo: palavras que nunca devem aparecer. */
+  avoidWords?: string[];
+  /** Guia de estilo: substituições preferidas. */
+  preferredTerms?: PreferredTerm[];
 }
 
 export interface RewriteOptions {
@@ -56,6 +90,19 @@ export interface TerminologyEntry {
   target: string;
 }
 
+export interface ParagraphCheck {
+  /** Índice do parágrafo dentro do texto revisto. */
+  index: number;
+  /** Semelhança de sentido com o parágrafo original correspondente (cosseno), quando calculável. */
+  similarity: number | null;
+  /** Número de padrões típicos de IA encontrados. */
+  patterns: number;
+  /** Marcas de outra variante linguística encontradas. */
+  foreignVariant: string[];
+  /** Verdadeiro quando o parágrafo foi automaticamente re-revisto. */
+  polished: boolean;
+}
+
 export interface SectionResult {
   index: number;
   original: string;
@@ -63,12 +110,18 @@ export interface SectionResult {
   ambiguities: Ambiguity[];
   terminology: TerminologyEntry[];
   warnings: string[];
+  checks: ParagraphCheck[];
 }
+
+export type MeaningCheckStatus = "ok" | "unavailable" | "off";
 
 export interface RewriteResult {
   rewritten: string;
   ambiguities: Ambiguity[];
   warnings: string[];
+  checks: ParagraphCheck[];
+  meaningCheck: MeaningCheckStatus;
+  polishedParagraphs: number;
   sections: number;
   model: string;
 }
@@ -77,6 +130,7 @@ export interface RewriteResult {
 export type RewriteEvent =
   | { type: "start"; sections: number; model: string }
   | { type: "progress"; completed: number; total: number }
+  | { type: "status"; message: string }
   | { type: "section"; section: SectionResult }
   | { type: "done"; result: RewriteResult }
   | { type: "error"; message: string; code?: string };
@@ -91,4 +145,24 @@ export interface ConfigStatus {
   baseURL: string;
   sectionWords: number;
   maxInputChars: number;
+  /** Contexto pedido ao Ollama por pedido (tokens), ou null noutros fornecedores. */
+  contextLength: number | null;
+  /** Contexto máximo do modelo, quando o fornecedor o expõe. */
+  modelContextLength: number | null;
+  /** Modelo de embeddings usado na verificação de sentido, ou null se desativada. */
+  embedModel: string | null;
+  /** Verdadeiro quando há um servidor LanguageTool configurado. */
+  languageTool: boolean;
+  autoPolish: boolean;
+}
+
+export interface LanguageToolIssue {
+  message: string;
+  shortMessage: string;
+  offset: number;
+  length: number;
+  category: string;
+  ruleId: string;
+  replacements: string[];
+  context: string;
 }

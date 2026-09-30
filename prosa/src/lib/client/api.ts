@@ -1,4 +1,4 @@
-import type { ConfigStatus, Language, RewriteEvent, RewriteRequest, VoiceProfile } from "../types";
+import type { ConfigStatus, Language, LanguageToolIssue, RewriteEvent, RewriteRequest, VoiceProfile } from "../types";
 
 export class ApiError extends Error {
   code: string;
@@ -73,4 +73,16 @@ export async function requestProfile(examples: string[], language: Language, sig
   if (!response.ok) throw await readError(response);
   const body = (await response.json()) as { profile: VoiceProfile };
   return body.profile;
+}
+
+export async function requestCheck(text: string, language: Language, signal?: AbortSignal): Promise<LanguageToolIssue[]> {
+  const response = await fetch("/api/check", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, language }),
+    signal,
+  });
+  if (!response.ok) throw await readError(response);
+  const body = (await response.json()) as { issues: LanguageToolIssue[] };
+  return body.issues;
 }

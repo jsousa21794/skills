@@ -1,6 +1,28 @@
 import { z } from "zod";
 import { INTENSITIES, LANGUAGES, LENGTH_OPTIONS, MODES } from "./types";
 
+export const voiceMetricsSchema = z.object({
+  sampleWords: z.number(),
+  averageSentenceLength: z.number(),
+  sentenceLengthStdDev: z.number(),
+  longSentenceShare: z.number(),
+  shortSentenceShare: z.number(),
+  averageParagraphWords: z.number(),
+  commasPer100Words: z.number(),
+  semicolonsPer100Words: z.number(),
+  colonsPer100Words: z.number(),
+  dashesPer100Words: z.number(),
+  parenthesesPer100Words: z.number(),
+  exclamationShare: z.number(),
+  questionShare: z.number(),
+  firstPersonPer100Words: z.number(),
+  typeTokenRatio: z.number(),
+  connectors: z.array(z.object({ term: z.string(), count: z.number() })).max(10),
+  address: z.enum(["tu", "você", "misto", "impessoal"]).nullable(),
+  enclisisPer100Words: z.number().nullable(),
+  contractionsPer100Words: z.number().nullable(),
+});
+
 export const voiceProfileSchema = z.object({
   name: z.string().max(80).default("O meu perfil"),
   vocabulary: z.string().max(2000).default(""),
@@ -8,6 +30,9 @@ export const voiceProfileSchema = z.object({
   formality: z.string().max(1000).default(""),
   sentenceStructure: z.string().max(2000).default(""),
   avoid: z.string().max(2000).default(""),
+  metrics: voiceMetricsSchema.nullable().optional(),
+  avoidWords: z.array(z.string().min(1).max(80)).max(200).optional(),
+  preferredTerms: z.array(z.object({ from: z.string().min(1).max(80), to: z.string().min(1).max(80) })).max(200).optional(),
 });
 
 export const rewriteRequestSchema = z.object({
@@ -31,6 +56,11 @@ export type RewriteRequestInput = z.input<typeof rewriteRequestSchema>;
 
 export const profileRequestSchema = z.object({
   examples: z.array(z.string().min(20, "Cada exemplo precisa de pelo menos 20 caracteres.")).min(1).max(10),
+  language: z.enum(LANGUAGES),
+});
+
+export const checkRequestSchema = z.object({
+  text: z.string().min(1).max(200000),
   language: z.enum(LANGUAGES),
 });
 

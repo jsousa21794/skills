@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import { formatTime, type Version } from "@/lib/history";
 import { IconTrash, IconX } from "./Icons";
 
@@ -10,26 +11,28 @@ interface Props {
   currentId: string | null;
   onRestore: (version: Version) => void;
   onCompare: (version: Version) => void;
+  onUpdate: (id: string, patch: Partial<Pick<Version, "label" | "pinned">>) => void;
+  onDelete: (id: string) => void;
   persistEnabled: boolean;
   onTogglePersist: (enabled: boolean) => void;
   onClearAll: () => void;
 }
 
-const LABELS: Record<string, string> = {
-  ligeira: "ligeira",
-  moderada: "moderada",
-  profunda: "profunda",
-};
-
-export function HistoryDrawer({ open, onClose, versions, currentId, onRestore, onCompare, persistEnabled, onTogglePersist, onClearAll }: Props) {
+export function HistoryDrawer({ open, onClose, versions, currentId, onRestore, onCompare, onUpdate, onDelete, persistEnabled, onTogglePersist, onClearAll }: Props) {
+  const [editing, setEditing] = useState<string | null>(null);
+  const [draft, setDraft] = useState("");
   if (!open) return null;
+
+  const commitLabel = (id: string) => {
+    const label = draft.trim();
+    if (label) onUpdate(id, { label });
+    setEditing(null);
+  };
+
   return (
     <div className="fixed inset-0 z-40" role="dialog" aria-modal="true" aria-labelledby="history-title">
       <button type="button" className="absolute inset-0 bg-black/20 dark:bg-black/50" aria-label="Fechar histórico" onClick={onClose} />
-      <aside
-        className="absolute inset-y-0 right-0 flex w-full max-w-sm flex-col border-l bg-elevated shadow-xl"
-        style={{ animation: "fade-up 200ms var(--ease-out) both" }}
-      >
+      <aside className="absolute inset-y-0 right-0 flex w-full max-w-sm flex-col border-l bg-elevated shadow-xl" style={{ animation: "fade-up 200ms var(--ease-out) both" }}>
         <header className="flex items-center justify-between border-b px-4 py-3">
           <h2 id="history-title" className="text-sm font-semibold">
             Histórico de versões
@@ -46,21 +49,53 @@ export function HistoryDrawer({ open, onClose, versions, currentId, onRestore, o
               {versions.map((version) => (
                 <li key={version.id} className={`rounded-lg border p-3 ${version.id === currentId ? "border-accent bg-accent-soft/40" : ""}`}>
                   <div className="mb-1 flex items-baseline justify-between gap-2">
-                    <span className="text-sm font-medium">{version.label}</span>
-                    <time className="text-[11px] text-subtle" dateTime={new Date(version.createdAt).toISOString()}>
+                    {editing === version.id ? (
+                      <input
+                        className="field h-7 py-0 text-sm"
+                        value={draft}
+                        autoFocus
+                        onChange={(e) => setDraft(e.target.value)}
+                        onBlur={() => commitLabel(version.id)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") commitLabel(version.id);
+                          if (e.key === "Escape") setEditing(null);
+                        }}
+                        aria-label="Nome da versão"
+                      />
+                    ) : (
+                      <button
+                        type="button"
+                        className="truncate text-left text-sm font-medium hover:underline"
+                        title="Renomear"
+                        onClick={() => {
+                          setEditing(version.id);
+                          setDraft(version.label);
+                        }}
+                      >
+                        {version.pinned && <span className="mr-1 text-accent" aria-label="Marcada">★</span>}
+                        {version.label}
+                      </button>
+                    )}
+                    <time className="shrink-0 text-[11px] text-subtle" dateTime={new Date(version.createdAt).toISOString()}>
                       {formatTime(version.createdAt)}
                     </time>
                   </div>
                   <p className="mb-2 line-clamp-2 text-xs text-muted">{version.text}</p>
                   <div className="flex items-center gap-1.5 text-[11px] text-subtle">
-                    <span>{version.options.language}</span>·<span>{version.options.mode}</span>·<span>{LABELS[version.options.intensity] ?? version.options.intensity}</span>
+                    <span>{version.options.language}</span>·<span>{version.options.mode}</span>·<span>{version.options.intensity}</span>
                   </div>
-                  <div className="mt-2 flex gap-1.5">
+                  <div className="mt-2 flex flex-wrap gap-1.5">
                     <button type="button" className="btn btn-sm" onClick={() => onRestore(version)}>
                       Restaurar
                     </button>
                     <button type="button" className="btn btn-sm btn-ghost" onClick={() => onCompare(version)}>
-                      Comparar com atual
+                      Comparar
+                    </button>
+                    <button type="button" className="btn btn-sm btn-ghost" onClick={() => onUpdate(version.id, { pinned: !version.pinned })} title="Versões marcadas não são descartadas quando o histórico enche">
+                      {version.pinned ? "Desmarcar" : "Marcar"}
+                    </button>
+                    <button type="button" className="btn btn-sm btn-ghost text-danger" onClick={() => onDelete(version.id)} aria-label="Eliminar versão">
+                      <IconTrash size={12} />
                     </button>
                   </div>
                 </li>

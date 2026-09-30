@@ -1,20 +1,21 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ApiError, fetchConfig, streamRewrite } from "@/lib/client/api";
+import { ApiError, fetchConfig, requestCheck, streamRewrite } from "@/lib/client/api";
 import { STORAGE_KEYS, clearAll, readJson, remove, writeJson } from "@/lib/client/storage";
 import { createVersionId, pushVersion, type Version } from "@/lib/history";
-import { joinParagraphs, splitParagraphs } from "@/lib/text";
-import type { Ambiguity, ConfigStatus, RewriteRequest, VoiceProfile } from "@/lib/types";
+import { countWords, joinParagraphs, localeFor, splitParagraphs } from "@/lib/text";
+import type { Ambiguity, ConfigStatus, LanguageToolIssue, MeaningCheckStatus, ParagraphCheck, RewriteRequest, VoiceProfile } from "@/lib/types";
 import { Controls, type Settings } from "./Controls";
 import { HistoryDrawer } from "./HistoryDrawer";
 import { IconHistory, IconSparkle, IconStop, IconUser, IconWarning } from "./Icons";
 import { Indicators } from "./Indicators";
+import { LanguageToolPanel } from "./LanguageToolPanel";
 import { LockedTerms } from "./LockedTerms";
 import { NotesPanel } from "./NotesPanel";
 import { OriginalPanel } from "./OriginalPanel";
 import { ProgressBar } from "./ProgressBar";
-import { RevisedPanel } from "./RevisedPanel";
+import { RevisedPanel, type RevisedView } from "./RevisedPanel";
 import { ThemeToggle } from "./ThemeToggle";
 import { VoiceProfileDialog } from "./VoiceProfileDialog";
 
@@ -27,10 +28,16 @@ const DEFAULT_SETTINGS: Settings = {
 };
 
 const INTENSITY_LABEL = { ligeira: "Ligeira", moderada: "Moderada", profunda: "Profunda" } as const;
+const DEFAULT_SIMILARITY_MIN = 0.72;
 
 interface Progress {
   completed: number;
   total: number;
+}
+
+/** Estimativa grosseira de tokens para avisar sobre a janela de contexto. */
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 3.6);
 }
 
 export function Workspace() {
@@ -46,24 +53,31 @@ export function Workspace() {
   const [busy, setBusy] = useState(false);
   const [busyParagraph, setBusyParagraph] = useState<number | null>(null);
   const [progress, setProgress] = useState<Progress>({ completed: 0, total: 0 });
+  const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [ambiguities, setAmbiguities] = useState<Ambiguity[]>([]);
   const [warnings, setWarnings] = useState<string[]>([]);
+  const [checks, setChecks] = useState<ParagraphCheck[]>([]);
+  const [meaningCheck, setMeaningCheck] = useState<MeaningCheckStatus | null>(null);
 
   const [persistHistory, setPersistHistory] = useState<boolean>(() => readJson<boolean>(STORAGE_KEYS.historyEnabled) === true);
-  const [versions, setVersions] = useState<Version[]>(() =>
-    readJson<boolean>(STORAGE_KEYS.historyEnabled) === true ? (readJson<Version[]>(STORAGE_KEYS.history) ?? []) : [],
-  );
+  const [versions, setVersions] = useState<Version[]>(() => (readJson<boolean>(STORAGE_KEYS.historyEnabled) === true ? (readJson<Version[]>(STORAGE_KEYS.history) ?? []) : []));
   const [currentId, setCurrentId] = useState<string | null>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
-  const [showDiff, setShowDiff] = useState(false);
+  const [view, setView] = useState<RevisedView>("text");
   const [compareVersion, setCompareVersion] = useState<Version | null>(null);
+  const [rejectedChanges, setRejectedChanges] = useState<Set<number>>(new Set());
   const [mobileTab, setMobileTab] = useState<"original" | "revised">("original");
+
+  const [ltBusy, setLtBusy] = useState(false);
+  const [ltError, setLtError] = useState<string | null>(null);
+  const [ltOriginal, setLtOriginal] = useState<LanguageToolIssue[] | null>(null);
+  const [ltRevised, setLtRevised] = useState<LanguageToolIssue[] | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
 
-  // Configuração do servidor (só indica se a chave existe e qual o modelo; nunca a chave).
+  // Configuração do servidor (só indica se o fornecedor está pronto e qual o modelo; nunca a chave).
   useEffect(() => {
     fetchConfig()
       .then(setConfig)
@@ -85,6 +99,7 @@ export function Workspace() {
 
   const configured = config?.ready ?? false;
   const maxChars = config?.maxInputChars ?? 80000;
+  const locale = localeFor(settings.language);
 
   const buildRequest = useCallback(
     (text: string, context?: RewriteRequest["context"]): RewriteRequest => ({
@@ -126,6 +141,13 @@ export function Workspace() {
     return "Ocorreu um erro inesperado.";
   };
 
+  const resetRevisionState = () => {
+    setView("text");
+    setCompareVersion(null);
+    setRejectedChanges(new Set());
+    setLtRevised(null);
+  };
+
   const rewrite = useCallback(async () => {
     const text = original.trim();
     if (!text || busy) return;
@@ -138,11 +160,13 @@ export function Workspace() {
     setBusy(true);
     setBusyParagraph(null);
     setError(null);
-    setShowDiff(false);
-    setCompareVersion(null);
+    setStatusMessage(null);
+    resetRevisionState();
     setProgress({ completed: 0, total: 0 });
     setAmbiguities([]);
     setWarnings([]);
+    setChecks([]);
+    setMeaningCheck(null);
     setMobileTab("revised");
 
     const partial: string[] = [];
@@ -152,13 +176,19 @@ export function Workspace() {
           setProgress({ completed: 0, total: event.sections });
         } else if (event.type === "progress") {
           setProgress({ completed: event.completed, total: event.total });
+          setStatusMessage(null);
+        } else if (event.type === "status") {
+          setStatusMessage(event.message);
         } else if (event.type === "section") {
           partial.push(event.section.rewritten);
           setRevised(partial.join("\n\n"));
+          setChecks((prev) => [...prev, ...event.section.checks]);
         } else if (event.type === "done") {
           setRevised(event.result.rewritten);
           setAmbiguities(event.result.ambiguities);
           setWarnings(event.result.warnings);
+          setChecks(event.result.checks);
+          setMeaningCheck(event.result.meaningCheck);
           recordVersion(text, event.result.rewritten, `${INTENSITY_LABEL[settings.intensity]} · ${settings.mode}`, {
             ambiguities: event.result.ambiguities,
             warnings: event.result.warnings,
@@ -171,6 +201,7 @@ export function Workspace() {
       setError(describeError(err));
     } finally {
       setBusy(false);
+      setStatusMessage(null);
       abortRef.current = null;
     }
   }, [original, busy, maxChars, buildRequest, recordVersion, settings.intensity, settings.mode]);
@@ -193,6 +224,7 @@ export function Workspace() {
           after: paragraphs.slice(index + 1, index + 3).join("\n\n") || undefined,
         });
         for await (const event of streamRewrite(request, controller.signal)) {
+          if (event.type === "status") setStatusMessage(event.message);
           if (event.type === "done") {
             const next = [...paragraphs];
             next[index] = event.result.rewritten;
@@ -200,10 +232,14 @@ export function Workspace() {
             setRevised(joined);
             setAmbiguities((prev) => [...prev, ...event.result.ambiguities]);
             setWarnings((prev) => [...prev, ...event.result.warnings]);
-            recordVersion(revised, joined, `Parágrafo ${index + 1} revisto`, {
-              ambiguities: event.result.ambiguities,
-              warnings: event.result.warnings,
+            setChecks((prev) => {
+              const others = prev.filter((c) => c.index !== index);
+              const fresh = event.result.checks.map((c) => ({ ...c, index }));
+              return [...others, ...fresh].sort((a, b) => a.index - b.index);
             });
+            setRejectedChanges(new Set());
+            setLtRevised(null);
+            recordVersion(revised, joined, `Parágrafo ${index + 1} revisto`, { ambiguities: event.result.ambiguities, warnings: event.result.warnings });
           } else if (event.type === "error") {
             setError(event.message);
           }
@@ -213,6 +249,7 @@ export function Workspace() {
       } finally {
         setBusy(false);
         setBusyParagraph(null);
+        setStatusMessage(null);
         abortRef.current = null;
       }
     },
@@ -225,35 +262,62 @@ export function Workspace() {
     setRevised(original);
     setAmbiguities([]);
     setWarnings([]);
-    setShowDiff(false);
+    setChecks([]);
+    setMeaningCheck(null);
+    resetRevisionState();
     setCurrentId(null);
   };
 
-  const download = () => {
-    const blob = new Blob([revised], { type: "text/plain;charset=utf-8" });
+  const downloadBlob = (blob: Blob, filename: string) => {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `prosa-revisto-${new Date().toISOString().slice(0, 10)}.txt`;
+    a.download = filename;
     a.click();
     URL.revokeObjectURL(url);
+  };
+
+  const stamp = () => new Date().toISOString().slice(0, 10);
+
+  const downloadTxt = () => downloadBlob(new Blob([revised], { type: "text/plain;charset=utf-8" }), `prosa-revisto-${stamp()}.txt`);
+
+  const downloadDocx = async () => {
+    try {
+      const { buildTrackedChangesDocx } = await import("@/lib/client/docx");
+      const blob = await buildTrackedChangesDocx(compareVersion ? compareVersion.text : original, revised);
+      downloadBlob(blob, `prosa-alteracoes-${stamp()}.docx`);
+    } catch (err) {
+      setError(`Não foi possível gerar o .docx: ${describeError(err)}`);
+    }
   };
 
   const restoreVersion = (version: Version) => {
     setRevised(version.text);
     setAmbiguities(version.ambiguities);
     setWarnings(version.warnings);
+    setChecks([]);
     setCurrentId(version.id);
-    setCompareVersion(null);
+    resetRevisionState();
     setHistoryOpen(false);
     setMobileTab("revised");
   };
 
   const compareWithVersion = (version: Version) => {
     setCompareVersion(version);
-    setShowDiff(true);
+    setRejectedChanges(new Set());
+    setView("compare");
     setHistoryOpen(false);
     setMobileTab("revised");
+  };
+
+  const updateVersion = (id: string, patch: Partial<Pick<Version, "label" | "pinned">>) => {
+    setVersions((prev) => prev.map((v) => (v.id === id ? { ...v, ...patch } : v)));
+  };
+
+  const deleteVersion = (id: string) => {
+    setVersions((prev) => prev.filter((v) => v.id !== id));
+    if (currentId === id) setCurrentId(null);
+    if (compareVersion?.id === id) setCompareVersion(null);
   };
 
   const togglePersist = (enabled: boolean) => {
@@ -274,6 +338,42 @@ export function Workspace() {
     setHistoryOpen(false);
   };
 
+  const toggleChange = (id: number, rejected: boolean) => {
+    setRejectedChanges((prev) => {
+      const next = new Set(prev);
+      if (rejected) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  };
+
+  const applyChanges = (text: string) => {
+    setRevised(text);
+    setRejectedChanges(new Set());
+    setChecks([]);
+    setLtRevised(null);
+    recordVersion(revised, text, "Alterações aplicadas manualmente", { ambiguities: [], warnings: [] });
+    setView("text");
+  };
+
+  const runLanguageTool = async () => {
+    if (!config?.languageTool || ltBusy) return;
+    setLtBusy(true);
+    setLtError(null);
+    try {
+      const [o, r] = await Promise.all([
+        original.trim() ? requestCheck(original, settings.language) : Promise.resolve([]),
+        revised.trim() ? requestCheck(revised, settings.language) : Promise.resolve(null),
+      ]);
+      setLtOriginal(o);
+      setLtRevised(r);
+    } catch (err) {
+      setLtError(describeError(err));
+    } finally {
+      setLtBusy(false);
+    }
+  };
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
@@ -286,7 +386,7 @@ export function Workspace() {
   }, [rewrite]);
 
   const compareWith = compareVersion ? compareVersion.text : original;
-  const compareLabel = compareVersion ? `versão «${compareVersion.label}»` : "o original";
+  const compareLabel = compareVersion ? `a versão «${compareVersion.label}»` : "o original";
   const canRewrite = original.trim().length > 0 && !busy && configured && original.length <= maxChars;
 
   const profileSummary = useMemo(() => {
@@ -294,6 +394,19 @@ export function Workspace() {
     const filled = [profile.vocabulary, profile.rhythm, profile.formality, profile.sentenceStructure, profile.avoid].filter((f) => f.trim()).length;
     return filled > 0 ? `${profile.name} · ${filled}/5 campos` : `${profile.name} · vazio`;
   }, [profile]);
+
+  const contextWarning = useMemo(() => {
+    if (!config || config.provider !== "ollama" || !config.contextLength) return null;
+    const sectionTokens = estimateTokens(original.slice(0, Math.min(original.length, config.sectionWords * 7)));
+    const needed = 1800 + sectionTokens * 2;
+    if (config.modelContextLength && config.contextLength > config.modelContextLength) {
+      return `OLLAMA_NUM_CTX (${config.contextLength}) é maior do que o contexto máximo do modelo (${config.modelContextLength}). O Ollama vai limitar ao máximo do modelo.`;
+    }
+    if (countWords(original) > 0 && needed > config.contextLength) {
+      return `Cada secção pode precisar de cerca de ${needed} tokens (instruções, texto e resposta), acima da janela de ${config.contextLength} tokens pedida ao Ollama. Reduz PROSA_SECTION_WORDS ou aumenta OLLAMA_NUM_CTX.`;
+    }
+    return null;
+  }, [config, original]);
 
   return (
     <div className="mx-auto flex min-h-dvh max-w-7xl flex-col px-4 pb-10 sm:px-6">
@@ -328,6 +441,12 @@ export function Workspace() {
           </div>
         )}
         {configError && <p className="text-xs text-danger">{configError}</p>}
+        {contextWarning && (
+          <div className="fade-up flex gap-2.5 rounded-xl border border-warning-fg/20 bg-warning p-3 text-xs text-warning-fg" role="status">
+            <IconWarning size={14} className="mt-0.5 shrink-0" />
+            <span>{contextWarning}</span>
+          </div>
+        )}
 
         <section className="surface p-4">
           <Controls settings={settings} onChange={setSettings} disabled={busy} />
@@ -346,10 +465,11 @@ export function Workspace() {
               <IconSparkle size={14} /> Reescrever
             </button>
           )}
-          <ProgressBar completed={progress.completed} total={progress.total} active={busy} label={busyParagraph !== null ? `A rever o parágrafo ${busyParagraph + 1}…` : undefined} />
+          <ProgressBar completed={progress.completed} total={progress.total} active={busy} label={statusMessage ?? (busyParagraph !== null ? `A rever o parágrafo ${busyParagraph + 1}…` : undefined)} />
           {config && (
-            <span className="ml-auto hidden text-[11px] text-subtle sm:inline" title={`Fornecedor: ${config.provider} · ${config.baseURL}`}>
+            <span className="ml-auto hidden text-[11px] text-subtle sm:inline" title={`Fornecedor: ${config.provider} · ${config.baseURL}${config.embedModel ? ` · embeddings: ${config.embedModel}` : ""}`}>
               {config.provider === "ollama" ? "Ollama" : "OpenAI"} · {config.model}
+              {config.contextLength ? ` · ${config.contextLength} tokens de contexto${config.modelContextLength ? ` (máx. ${config.modelContextLength})` : ""}` : ""}
             </span>
           )}
         </div>
@@ -384,26 +504,36 @@ export function Workspace() {
           </div>
           <div className={mobileTab === "revised" ? "" : "hidden lg:block"}>
             <RevisedPanel
-              original={original}
               revised={revised}
               compareWith={compareWith}
               compareLabel={compareLabel}
+              locale={locale}
               busy={busy}
               busyParagraph={busyParagraph}
+              checks={checks}
+              similarityMin={DEFAULT_SIMILARITY_MIN}
+              view={view}
+              onViewChange={setView}
               onReviseParagraph={(i) => void reviseParagraph(i)}
               onEdit={setRevised}
               onRestoreOriginal={restoreOriginal}
-              onDownload={download}
-              showDiff={showDiff}
-              onToggleDiff={() => setShowDiff((v) => !v)}
+              onDownloadTxt={downloadTxt}
+              onDownloadDocx={() => void downloadDocx()}
+              rejectedChanges={rejectedChanges}
+              onToggleChange={toggleChange}
+              onApplyChanges={applyChanges}
             />
           </div>
         </div>
 
         <div className={`grid gap-4 ${ambiguities.length + warnings.length > 0 ? "lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]" : ""}`}>
           <NotesPanel ambiguities={ambiguities} warnings={warnings} />
-          {(original.trim() || revised.trim()) && <Indicators original={original} revised={revised} />}
+          {(original.trim() || revised.trim()) && <Indicators original={original} revised={revised} language={settings.language} checks={checks} meaningCheck={meaningCheck} />}
         </div>
+
+        {(original.trim() || revised.trim()) && (
+          <LanguageToolPanel available={config?.languageTool ?? false} busy={ltBusy} error={ltError} original={ltOriginal} revised={ltRevised} onRun={() => void runLanguageTool()} hasRevised={revised.trim().length > 0} />
+        )}
       </main>
 
       <footer className="mt-8 flex flex-wrap items-center justify-between gap-2 text-[11px] text-subtle">
@@ -418,6 +548,8 @@ export function Workspace() {
         currentId={currentId}
         onRestore={restoreVersion}
         onCompare={compareWithVersion}
+        onUpdate={updateVersion}
+        onDelete={deleteVersion}
         persistEnabled={persistHistory}
         onTogglePersist={togglePersist}
         onClearAll={clearEverything}

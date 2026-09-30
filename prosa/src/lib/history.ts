@@ -11,6 +11,8 @@ export interface Version {
   options: Pick<RewriteOptions, "language" | "mode" | "intensity" | "length">;
   ambiguities: Ambiguity[];
   warnings: string[];
+  /** Versões marcadas não são descartadas quando o histórico atinge o limite. */
+  pinned?: boolean;
 }
 
 export const MAX_VERSIONS = 30;
@@ -21,7 +23,11 @@ export function createVersionId(): string {
 }
 
 export function pushVersion(history: Version[], version: Version): Version[] {
-  return [version, ...history].slice(0, MAX_VERSIONS);
+  const next = [version, ...history];
+  if (next.length <= MAX_VERSIONS) return next;
+  const pinned = next.filter((v) => v.pinned);
+  const unpinned = next.filter((v) => !v.pinned).slice(0, Math.max(0, MAX_VERSIONS - pinned.length));
+  return next.filter((v) => pinned.includes(v) || unpinned.includes(v));
 }
 
 export function formatTime(timestamp: number, locale = "pt-PT"): string {

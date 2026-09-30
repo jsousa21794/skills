@@ -1,4 +1,5 @@
 import type { Intensity, Language, LengthOption, Mode, RewriteOptions, TerminologyEntry, VoiceProfile } from "./types";
+import { describeVoiceMetrics, metricsAreMeaningful } from "./voice";
 
 /**
  * Construção dos prompts. Tudo o que o utilizador escreve entra sempre
@@ -91,7 +92,12 @@ function profileBlock(profile: VoiceProfile | null | undefined): string {
     profile.formality && `Formalidade: ${profile.formality}`,
     profile.sentenceStructure && `Construção frásica: ${profile.sentenceStructure}`,
     profile.avoid && `Evitar: ${profile.avoid}`,
+    metricsAreMeaningful(profile.metrics) && `Métricas observadas nas amostras (aproxima-te delas): ${describeVoiceMetrics(profile.metrics)}`,
   ].filter(Boolean);
+  const avoidWords = (profile.avoidWords ?? []).map((w) => w.trim()).filter(Boolean);
+  const preferred = (profile.preferredTerms ?? []).filter((p) => p.from.trim() && p.to.trim());
+  if (avoidWords.length > 0) lines.push(`Palavras e expressões proibidas neste perfil: ${avoidWords.map((w) => `«${w}»`).join(", ")}.`);
+  if (preferred.length > 0) lines.push(`Substituições preferidas: ${preferred.map((p) => `«${p.from}» → «${p.to}»`).join("; ")}.`);
   if (lines.length === 0) return "";
   return `\n\nPerfil de voz do utilizador (aplica estas preferências ao escrever; nunca copies passagens dos exemplos de onde o perfil foi extraído):\n<perfil>\n${lines.join("\n")}\n</perfil>`;
 }
@@ -162,6 +168,36 @@ export function buildSectionPrompt(input: SectionPromptInput): string {
     parts.push(`Texto imediatamente depois, apenas para contexto (não o incluas na resposta):\n<contexto_seguinte>\n${input.contextAfter}\n</contexto_seguinte>`);
   }
   parts.push(`Texto a rever:\n<texto>\n${input.text}\n</texto>`);
+  return parts.join("\n\n");
+}
+
+export interface PolishPromptInput {
+  paragraph: string;
+  before?: string;
+  after?: string;
+  avoidTerms: string[];
+  foreignVariantTerms: string[];
+  language: Language;
+}
+
+/** Pedido de re-revisão de um parágrafo que ficou com padrões típicos de IA ou marcas de outra variante. */
+export function buildPolishPrompt(input: PolishPromptInput): string {
+  const parts: string[] = [
+    "Revê de novo apenas este parágrafo, que já foi reescrito uma vez mas ficou com marcas que queremos eliminar. Mantém exatamente o sentido, os factos e a extensão aproximada.",
+  ];
+  if (input.avoidTerms.length > 0) {
+    parts.push(
+      `Não uses nenhuma destas expressões nem variantes próximas (substitui pela ideia concreta, não por um sinónimo equivalente): ${input.avoidTerms.map((t) => `«${t}»`).join(", ")}.`,
+    );
+  }
+  if (input.foreignVariantTerms.length > 0) {
+    parts.push(
+      `O parágrafo contém marcas de outra variante linguística que não a pedida (${LANGUAGE_LABELS[input.language]}): ${input.foreignVariantTerms.map((t) => `«${t}»`).join(", ")}. Corrige-as para a variante pedida.`,
+    );
+  }
+  if (input.before) parts.push(`Parágrafo anterior, apenas para contexto:\n<contexto_anterior>\n${input.before}\n</contexto_anterior>`);
+  if (input.after) parts.push(`Parágrafo seguinte, apenas para contexto:\n<contexto_seguinte>\n${input.after}\n</contexto_seguinte>`);
+  parts.push(`Parágrafo a rever:\n<texto>\n${input.paragraph}\n</texto>`);
   return parts.join("\n\n");
 }
 
