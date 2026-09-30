@@ -42,11 +42,14 @@ function LengthBars({ lengths, max }: { lengths: number[]; max: number }) {
 }
 
 function Repetitions({ metrics }: { metrics: TextMetrics }) {
+  const seen = new Set<string>();
   const items = [
     ...metrics.repeatedOpeners.map((f) => ({ ...f, kind: "início de frase" })),
     ...metrics.repeatedBigrams.map((f) => ({ ...f, kind: "expressão" })),
     ...metrics.repeatedWords.map((f) => ({ ...f, kind: "palavra" })),
-  ].slice(0, 8);
+  ]
+    .filter((item) => (seen.has(item.term) ? false : (seen.add(item.term), true)))
+    .slice(0, 8);
   if (items.length === 0) return <p className="text-xs text-subtle">Sem repetições salientes.</p>;
   return (
     <ul className="flex flex-wrap gap-1.5">

@@ -22,10 +22,10 @@ describe("segmentDocument", () => {
   });
 
   it("parte por frases um parágrafo maior do que o limite", () => {
-    const sentences = Array.from({ length: 10 }, (_, i) => `Frase ${i} com algumas palavras dentro.`).join(" ");
-    const segments = segmentDocument(sentences, 25);
+    const sentences = Array.from({ length: 14 }, (_, i) => `Frase ${i} com algumas palavras dentro.`).join(" ");
+    const segments = segmentDocument(sentences, 50);
     expect(segments.length).toBeGreaterThan(1);
-    expect(segments.every((s) => countWords(s.text) <= 25)).toBe(true);
+    expect(segments.every((s) => countWords(s.text) <= 50)).toBe(true);
     expect(segments.map((s) => s.text).join(" ")).toBe(sentences);
   });
 
