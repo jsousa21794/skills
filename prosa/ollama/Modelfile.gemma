@@ -1,0 +1,8 @@
+# Modelfile de exemplo para um generalista com bom controlo de variante (pt-PT, pt-BR, en-GB, en-US).
+# Uso:
+#   ollama create prosa-gemma -f ollama/Modelfile.gemma
+#   OLLAMA_MODEL=prosa-gemma
+FROM gemma3:12b
+
+PARAMETER num_ctx 16384
+PARAMETER temperature 0.4
