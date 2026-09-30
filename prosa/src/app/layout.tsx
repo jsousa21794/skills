@@ -4,7 +4,7 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: "Prosa — revisão e reescrita com voz própria",
   description:
-    "Transforma textos rígidos ou genéricos em textos naturais e fluidos, na tua voz, sem perder o rigor do original.",
+    "Transforma textos rígidos ou genéricos em textos naturais e fluidos, na tua voz, sem perder o rigor do original. Funciona com modelos locais (Ollama) ou com a OpenAI.",
   applicationName: "Prosa",
 };
 

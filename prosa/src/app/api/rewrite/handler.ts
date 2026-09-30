@@ -5,7 +5,8 @@ import type { RewriteEvent } from "@/lib/types";
 
 export interface RewriteHandlerDeps {
   createRuntime: (signal?: AbortSignal) => RewriteRuntime;
-  isConfigured: () => boolean;
+  /** Devolve uma mensagem quando falta configuração, ou null quando está tudo definido. */
+  setupProblem: () => string | null;
   maxInputChars: number;
 }
 
@@ -44,14 +45,9 @@ export async function handleRewrite(request: Request, deps: RewriteHandlerDeps):
     );
   }
 
-  if (!deps.isConfigured()) {
-    return json(
-      {
-        error: "Falta a chave da API. Define ANTHROPIC_API_KEY em .env.local (vê o .env.example) e reinicia o servidor. Sem ela não há reescrita real.",
-        code: "not_configured",
-      },
-      503,
-    );
+  const problem = deps.setupProblem();
+  if (problem) {
+    return json({ error: problem, code: "not_configured" }, 503);
   }
 
   const encoder = new TextEncoder();

@@ -83,7 +83,7 @@ export function Workspace() {
     if (persistHistory) writeJson(STORAGE_KEYS.history, versions);
   }, [versions, persistHistory]);
 
-  const configured = config?.configured ?? false;
+  const configured = config?.ready ?? false;
   const maxChars = config?.maxInputChars ?? 80000;
 
   const buildRequest = useCallback(
@@ -315,14 +315,15 @@ export function Workspace() {
       </header>
 
       <main className="flex flex-1 flex-col gap-4 pt-4">
-        {config && !config.configured && (
+        {config && !config.ready && config.problem && (
           <div className="fade-up flex gap-2.5 rounded-xl border border-warning-fg/20 bg-warning p-3 text-sm text-warning-fg" role="alert">
             <IconWarning className="mt-0.5 shrink-0" />
             <div>
-              <p className="font-medium">A chave da API não está configurada, por isso a reescrita real está desativada.</p>
-              <p className="mt-0.5 text-xs leading-relaxed">
-                Copia <code className="rounded bg-elevated/60 px-1">.env.example</code> para <code className="rounded bg-elevated/60 px-1">.env.local</code>, define <code className="rounded bg-elevated/60 px-1">ANTHROPIC_API_KEY</code> e reinicia o servidor. A Prosa nunca mostra resultados simulados como se fossem reais.
-              </p>
+              <p className="font-medium">A reescrita real está desativada até o fornecedor de IA estar disponível.</p>
+              <p className="mt-0.5 text-xs leading-relaxed">{config.problem} A Prosa nunca mostra resultados simulados como se fossem reais.</p>
+              <button type="button" className="btn btn-sm mt-2" onClick={() => fetchConfig().then(setConfig).catch(() => undefined)}>
+                Verificar de novo
+              </button>
             </div>
           </div>
         )}
@@ -347,8 +348,8 @@ export function Workspace() {
           )}
           <ProgressBar completed={progress.completed} total={progress.total} active={busy} label={busyParagraph !== null ? `A rever o parágrafo ${busyParagraph + 1}…` : undefined} />
           {config && (
-            <span className="ml-auto hidden text-[11px] text-subtle sm:inline" title="Modelo configurado no servidor">
-              {config.model} · esforço {config.effort}
+            <span className="ml-auto hidden text-[11px] text-subtle sm:inline" title={`Fornecedor: ${config.provider} · ${config.baseURL}`}>
+              {config.provider === "ollama" ? "Ollama" : "OpenAI"} · {config.model}
             </span>
           )}
         </div>

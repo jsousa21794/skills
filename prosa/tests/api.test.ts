@@ -20,7 +20,7 @@ function deps(overrides: Partial<Parameters<typeof handleRewrite>[1]> = {}) {
   const { generate } = fakeGenerate((call) => ({ rewritten: extractText(call.user).toUpperCase(), ambiguities: [], terminology: [] }));
   return {
     createRuntime: (signal?: AbortSignal) => ({ generate, model: "modelo-teste", sectionWords: 650, signal }),
-    isConfigured: () => true,
+    setupProblem: () => null,
     maxInputChars: 1000,
     ...overrides,
   };
@@ -51,12 +51,15 @@ describe("POST /api/rewrite", () => {
     expect(response.status).toBe(413);
   });
 
-  it("explica como configurar a chave quando falta, sem simular resultados", async () => {
-    const response = await handleRewrite(post("/api/rewrite", validBody), deps({ isConfigured: () => false }));
+  it("explica como configurar o fornecedor quando falta, sem simular resultados", async () => {
+    const response = await handleRewrite(
+      post("/api/rewrite", validBody),
+      deps({ setupProblem: () => "Falta a chave da API. Define OPENAI_API_KEY em .env.local." }),
+    );
     expect(response.status).toBe(503);
     const body = await response.json();
     expect(body.code).toBe("not_configured");
-    expect(body.error).toContain("ANTHROPIC_API_KEY");
+    expect(body.error).toContain("OPENAI_API_KEY");
   });
 
   it("devolve um fluxo NDJSON com progresso e resultado", async () => {
@@ -99,7 +102,7 @@ describe("POST /api/profile", () => {
     }));
     const response = await handleProfile(
       post("/api/profile", { examples: ["Este é um exemplo suficientemente longo da minha escrita."], language: "pt-PT" }),
-      { generate: () => generate, isConfigured: () => true },
+      { generate: () => generate, setupProblem: () => null },
     );
     expect(response.status).toBe(200);
     const body = await response.json();
@@ -111,15 +114,15 @@ describe("POST /api/profile", () => {
   it("valida exemplos demasiado curtos", async () => {
     const response = await handleProfile(post("/api/profile", { examples: ["curto"], language: "pt-PT" }), {
       generate: () => fakeGenerate(() => ({})).generate,
-      isConfigured: () => true,
+      setupProblem: () => null,
     });
     expect(response.status).toBe(400);
   });
 
-  it("devolve 503 sem chave configurada", async () => {
+  it("devolve 503 quando falta configuração", async () => {
     const response = await handleProfile(post("/api/profile", { examples: ["Exemplo com mais de vinte caracteres."], language: "pt-PT" }), {
       generate: () => fakeGenerate(() => ({})).generate,
-      isConfigured: () => false,
+      setupProblem: () => "Falta OPENAI_API_KEY.",
     });
     expect(response.status).toBe(503);
   });

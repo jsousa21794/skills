@@ -82,9 +82,13 @@ export type RewriteEvent =
   | { type: "error"; message: string; code?: string };
 
 export interface ConfigStatus {
-  configured: boolean;
+  provider: "ollama" | "openai";
+  /** Verdadeiro quando a configuração está completa e o fornecedor respondeu à verificação. */
+  ready: boolean;
+  /** Mensagem a mostrar ao utilizador quando algo falta ou não responde. */
+  problem: string | null;
   model: string;
-  effort: string;
+  baseURL: string;
   sectionWords: number;
   maxInputChars: number;
 }

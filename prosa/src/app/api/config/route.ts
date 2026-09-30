@@ -1,15 +1,20 @@
 import { NextResponse } from "next/server";
-import { getServerConfig, isConfigured } from "@/lib/config";
+import { getServerConfig, probeProvider, setupProblem } from "@/lib/config";
 import type { ConfigStatus } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
-export function GET() {
+export async function GET() {
   const config = getServerConfig();
+  const staticProblem = setupProblem(config);
+  const probe = staticProblem ? null : await probeProvider(config);
+  const problem = staticProblem ?? probe?.problem ?? null;
   const status: ConfigStatus = {
-    configured: isConfigured(config),
+    provider: config.provider,
+    ready: problem === null,
+    problem,
     model: config.model,
-    effort: config.effort,
+    baseURL: config.baseURL,
     sectionWords: config.sectionWords,
     maxInputChars: config.maxInputChars,
   };

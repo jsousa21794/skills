@@ -1,5 +1,5 @@
 import { createGenerate } from "@/lib/ai/client";
-import { getServerConfig, isConfigured } from "@/lib/config";
+import { getServerConfig, setupProblem } from "@/lib/config";
 import { handleProfile } from "./handler";
 
 export const dynamic = "force-dynamic";
@@ -9,6 +9,6 @@ export async function POST(request: Request) {
   const config = getServerConfig();
   return handleProfile(request, {
     generate: () => createGenerate(config),
-    isConfigured: () => isConfigured(config),
+    setupProblem: () => setupProblem(config),
   });
 }

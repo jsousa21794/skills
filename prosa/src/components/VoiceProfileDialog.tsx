@@ -89,7 +89,7 @@ export function VoiceProfileDialog({ open, onClose, language, profile, onChange,
                 Adicionar exemplo
               </button>
             )}
-            <button type="button" className="btn btn-primary btn-sm" onClick={analyse} disabled={busy || !configured} title={configured ? undefined : "Configura ANTHROPIC_API_KEY para analisar exemplos."}>
+            <button type="button" className="btn btn-primary btn-sm" onClick={analyse} disabled={busy || !configured} title={configured ? undefined : "O fornecedor de IA não está disponível. Vê o aviso no topo da página."}>
               <IconSparkle size={14} /> {busy ? "A analisar…" : "Criar perfil a partir dos exemplos"}
             </button>
           </div>
