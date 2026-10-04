@@ -1,7 +1,7 @@
 # Ollama × IBKR Trader
 
 Sistema de trading autónomo em Python: velas de 1 minuto da **Interactive
-Brokers** (`ib_insync`, Paper Trading na porta 7497), decisões tomadas por um
+Brokers** (`ib_async`, Paper Trading na porta 7497), decisões tomadas por um
 LLM local via **Ollama**, ordens **Bracket** automáticas (Stop Loss 2 % /
 Take Profit 5 %), registo em **SQLite** e **retrospetiva diária** que reescreve o
 prompt com base no desempenho real. Interface em **CustomTkinter** (modo escuro).
@@ -21,7 +21,7 @@ trader/
   gui.py                     CustomTkinter: controlo, portefólio, consola
   ui_bus.py                  fila thread-safe motor -> GUI + handler de logging
   trading_engine.py          loop asyncio numa thread dedicada (ciclo de decisão)
-  ibkr_client.py             ib_insync: ligação, velas 1 min, carteira, Brackets
+  ibkr_client.py             ib_async: ligação, velas 1 min, carteira, Brackets
   ollama_brain.py            system prompt "lucrar ou morrer", /api/chat, parser JSON
   indicators.py              RSI, SMA, EMA, variação % (Python puro)
   database.py                SQLite: decisões, ordens, trades, fills, P&L, prompts
@@ -33,7 +33,7 @@ trader.spec, build.sh/.bat   empacotamento PyInstaller num único executável
 ### Threads e loops
 
 - **Thread principal**: Tkinter (obrigatório em macOS/Windows). A GUI nunca
-  chama `ib_insync`; envia comandos com `engine.call(coroutine)`
+  chama `ib_async`; envia comandos com `engine.call(coroutine)`
   (`asyncio.run_coroutine_threadsafe`) e consome o `UIBus` com `after()`.
 - **Thread `trading-engine`**: cria o seu próprio loop `asyncio` e nele vivem o
   `IB()`, as subscrições de velas, o ciclo de decisão, o loop de portefólio, o
@@ -78,7 +78,7 @@ python main.py
 ```
 
 Requisitos:
-- Python 3.10+ com Tk (no Linux: `sudo apt install python3-tk`).
+- Python 3.10+ (exigido pelo `ib_async`) com Tk (no Linux: `sudo apt install python3-tk`).
 - **TWS ou IB Gateway** em Paper Trading com API ativa:
   *Configure → API → Settings*: ✔ Enable ActiveX and Socket Clients,
   ✘ Read-Only API, porta **7497**, 127.0.0.1 nos Trusted IPs.
@@ -99,7 +99,7 @@ build.bat           # Windows
 ```
 
 O `trader.spec` recolhe os assets do CustomTkinter e os submódulos do
-`ib_insync`/`eventkit`, exclui bibliotecas pesadas não usadas e gera
+`ib_async`/`eventkit`, exclui bibliotecas pesadas não usadas e gera
 `dist/OllamaIBKRTrader(.exe)` sem consola. Para depurar, muda `console=True`.
 Os dados continuam a ser gravados na pasta do utilizador, nunca dentro do
 bundle.
@@ -124,5 +124,10 @@ isso que a retrospetiva penaliza explicitamente a sobreconfiança e recalibra o
 limiar de execução. O que protege o capital são as regras determinísticas de
 risco, não o tom do prompt.
 
-`ib_insync` foi arquivado em 2024; o código importa `ib_async` (fork mantido,
-mesma API) automaticamente se `ib_insync` não estiver instalado.
+## Biblioteca IBKR
+
+`ib_insync` não recebe versões desde julho de 2023 (0.9.86) e o repositório
+foi arquivado. O projeto usa `ib_async` (github.com/ib-api-reloaded/ib_async),
+fork oficial mantido pela comunidade com a mesma API, versão 2.1.0 de
+dezembro de 2025, Python 3.10+. Se só existir `ib_insync` instalado, o
+código recorre a ele automaticamente.

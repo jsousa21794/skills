@@ -7,7 +7,7 @@ do system prompt do Ollama, relembrando-lhe a diretriz de sobrevivência.
 Também recalibra ``min_confidence``: se as decisões erradas tinham tanta ou
 mais confiança do que as certas, o limiar de execução sobe.
 
-Não depende do ``ib_insync``: recebe um ``price_fetcher`` opcional (async) que
+Não depende do ``ib_async``: recebe um ``price_fetcher`` opcional (async) que
 devolve ``[(datetime_utc, close), ...]`` por símbolo. Sem ele, usa os preços
 das próprias decisões seguintes como proxy do mercado.
 """

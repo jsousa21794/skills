@@ -1,7 +1,7 @@
 """Persistência em SQLite: decisões, ordens, execuções, P&L e prompts.
 
 Thread-safe (um ``Lock`` por ligação) porque é usada tanto pela thread do
-``asyncio`` (motor de trading) como por callbacks do ``ib_insync``.
+``asyncio`` (motor de trading) como por callbacks do ``ib_async``.
 """
 
 from __future__ import annotations
@@ -292,7 +292,7 @@ class Database:
 
     def insert_fill(self, *, exec_id: str, order_id: int, symbol: str, side: str,
                     shares: float, price: float, ts: datetime) -> bool:
-        """Devolve False se a execução já estava registada (ib_insync pode repetir eventos)."""
+        """Devolve False se a execução já estava registada (ib_async pode repetir eventos)."""
         try:
             self._execute(
                 "INSERT INTO fills (ts, exec_id, order_id, symbol, side, shares, price) VALUES (?,?,?,?,?,?,?)",

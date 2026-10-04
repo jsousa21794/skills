@@ -1,4 +1,4 @@
-"""Cliente assíncrono para a Interactive Brokers via ``ib_insync``.
+"""Cliente assíncrono para a Interactive Brokers via ``ib_async``.
 
 Responsabilidades:
 - Ligação/reconexão à TWS/Gateway em Paper Trading (porta 7497).
@@ -6,6 +6,10 @@ Responsabilidades:
 - Leitura do estado da conta e posições.
 - Colocação de ordens *Bracket* (entrada a mercado + Take Profit + Stop Loss).
 - Encaminhamento de execuções/estados de ordens para o motor.
+
+``ib_async`` (github.com/ib-api-reloaded/ib_async) é o sucessor mantido do
+``ib_insync``, que não recebe versões desde 2023; a API é idêntica, por isso
+o ``ib_insync`` continua a funcionar como fallback.
 
 Toda a API é pensada para ser chamada a partir da thread/loop do motor.
 """
@@ -18,10 +22,10 @@ import math
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
 
-try:  # ib_insync foi arquivado em 2024; ib_async é o fork mantido com a mesma API.
-    from ib_insync import IB, BarDataList, Contract, Fill, LimitOrder, MarketOrder, Stock, StopOrder, Trade
-except ImportError:  # pragma: no cover
-    from ib_async import IB, BarDataList, Contract, Fill, LimitOrder, MarketOrder, Stock, StopOrder, Trade  # type: ignore
+try:  # ib_async é o fork mantido do ib_insync (arquivado em 2024); mesma API.
+    from ib_async import IB, BarDataList, Contract, Fill, LimitOrder, MarketOrder, Stock, StopOrder, Trade
+except ImportError:  # pragma: no cover - instalação antiga com ib_insync
+    from ib_insync import IB, BarDataList, Contract, Fill, LimitOrder, MarketOrder, Stock, StopOrder, Trade  # type: ignore
 
 from .config import Settings
 

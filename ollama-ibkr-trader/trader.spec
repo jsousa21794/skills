@@ -8,7 +8,7 @@ Saída: dist/OllamaIBKRTrader(.exe)
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 datas, binaries, hiddenimports = [], [], []
-for pkg in ("customtkinter", "ib_insync", "eventkit"):
+for pkg in ("customtkinter", "ib_async", "eventkit"):
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b

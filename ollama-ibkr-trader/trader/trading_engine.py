@@ -1,7 +1,7 @@
 """Motor de trading: loop ``asyncio`` numa thread dedicada.
 
 Separação de responsabilidades:
-- A GUI (thread principal, Tkinter) nunca chama ``ib_insync`` diretamente;
+- A GUI (thread principal, Tkinter) nunca chama ``ib_async`` diretamente;
   envia pedidos através de ``TradingEngine.call()`` (``run_coroutine_threadsafe``).
 - O motor publica estado/logs no ``UIBus`` e nunca toca em widgets.
 

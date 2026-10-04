@@ -67,7 +67,6 @@ def setup_logging(bus: UIBus, log_file: str, level: int = logging.INFO) -> loggi
     file_handler = RotatingFileHandler(log_file, maxBytes=5_000_000, backupCount=3, encoding="utf-8")
     file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     root.addHandler(file_handler)
-    # Reduz ruído do ib_insync na consola.
-    logging.getLogger("ib_insync").setLevel(logging.WARNING)
+    # Reduz ruído do ib_async na consola.
     logging.getLogger("ib_async").setLevel(logging.WARNING)
     return root
