@@ -1,5 +1,5 @@
 {
-  "_sobre": "Lições iniciais com fonte, derivadas da pesquisa em research_notes/. Importância baixa (0.3-0.6): são substituídas pelas lições medidas nas tuas próprias decisões assim que houver suporte estatístico. Edita à vontade; o bot reimporta quando o ficheiro muda.",
+  "_sobre": "Lições iniciais com fonte, derivadas da pesquisa em research_notes/ (GitHub, Hugging Face e outros locais: literatura académica, comunidades e experiências de LLMs ao vivo). Importância baixa (0.3-0.6): são substituídas pelas lições medidas nas tuas próprias decisões assim que houver suporte estatístico. As marcadas 'Candidata a re-medir' só devem ser promovidas depois de confirmadas com trader.lessons_offline no histórico dos teus ativos. Edita à vontade; o bot reimporta quando o ficheiro muda.",
   "lessons": [
     {
       "key": "abertura_volatil",
@@ -60,6 +60,84 @@
       "importance": 0.35,
       "text": "O poder preditivo do sentimento de notícias sobre o preço concentra-se nas primeiras duas horas após a notícia. Sentimento antigo não justifica uma entrada; sentimento fortemente negativo recente contraria um BUY.",
       "source": "Estudo AUT sobre sentimento intradiário; Lopez-Lira & Tang arXiv 2304.07619"
+    },
+    {
+      "key": "indicadores_isolados_sem_edge",
+      "importance": 0.55,
+      "text": "Regras isoladas de RSI, médias móveis, canais e OBV em velas de 5 minutos não mostraram poder preditivo depois da correção de data-snooping (7 846 regras em SPDR a 5 min: nenhuma significativa). Um BUY/SELL baseado só num destes indicadores é um prior negativo: exigir confluência e um contexto (volume, hora, tendência).",
+      "source": "Marshall, Cahan & Cahan 2008 (Journal of Empirical Finance); Sullivan, Timmermann & White 1999"
+    },
+    {
+      "key": "piso_de_friccao",
+      "importance": 0.55,
+      "text": "Qualquer sinal tem de cobrir o piso de fricção (spread + comissão + slippage) antes de contar: em MNQ a 5 min, 11 de 14 famílias de sinais OHLCV renderam 0,07-1,50 pontos brutos por trade contra 2,0 pontos de fricção. Movimentos esperados pequenos não justificam entrada.",
+      "source": "Mesfin 2026, arXiv 2605.04004 (walk-forward 2021-2025)"
+    },
+    {
+      "key": "reversao_curta_e_bid_ask",
+      "importance": 0.45,
+      "text": "A reversão de curtíssimo prazo (menos de 1 hora) em ações individuais é sobretudo bid-ask bounce e desequilíbrio de liquidez, não sinal. Não propor reversão a 5 minutos sem um custo de spread explícito e sem confirmação.",
+      "source": "Heston, Korajczyk & Sadka 2010 (Journal of Finance)"
+    },
+    {
+      "key": "almoco_e_fecho_liquidez",
+      "importance": 0.45,
+      "text": "A liquidez concentra-se no fecho (leilão de fecho cerca de 9% do volume diário, última hora 17-21%) e é mínima entre as 11:30 e as 13:30 ET. Sinais técnicos no meio-dia operam em liquidez baixa; o retorno antes do almoço é tipicamente plano ou negativo.",
+      "source": "Cboe 2024 (leilão de fecho); Nasdaq 2021 (última hora); Quantpedia, Lunch Effect 2010-2024"
+    },
+    {
+      "key": "intradiario_vs_overnight",
+      "importance": 0.4,
+      "text": "Em índices US o retorno intradiário agregado é negativo e o overnight positivo; o momentum de curto prazo realiza-se overnight. Posições long intradiárias em ETFs de índice sem sinal específico têm drift contra.",
+      "source": "Lou, Polk & Skouras 2019 (JFE); Knuteson, arXiv 2010.01727"
+    },
+    {
+      "key": "ultima_meia_hora_momentum",
+      "importance": 0.4,
+      "text": "Candidata a re-medir: o sinal do retorno acumulado desde o fecho anterior até cerca das 15:30 ET prevê o sinal dos últimos 30 minutos em ETFs de índice, mais forte em dias voláteis e de alto volume. Só vale como lição depois de medida no histórico do próprio ativo.",
+      "source": "Gao, Han, Li & Zhou 2018 (JFE); replicação QuantConnect 6,67%/ano em SPY (bruto)"
+    },
+    {
+      "key": "breakout_so_com_volume",
+      "importance": 0.4,
+      "text": "Candidata a re-medir: breakouts da abertura só mostraram edge líquido quando restritos a ações com volume relativo anormal na abertura; breakouts simples em índices sem filtro de volume renderam cerca de zero líquido de custos.",
+      "source": "Zarattini, Barbon & Aziz, SFI 24-98 (Stocks in Play); replicação negativa do ORB simples (MQL5 blog 776235, 2015-2026)"
+    },
+    {
+      "key": "edge_tecnico_decai",
+      "importance": 0.4,
+      "text": "O edge técnico a 30 minutos decai com o tempo: 2 580 modelos renderam 8,8%/ano bruto em 1983-2000 e muito pior out-of-sample em 2001-2006. Toda a lição técnica tem prazo de validade e deve ser re-medida; uma lição antiga sem confirmação recente vale pouco.",
+      "source": "Schulmeister 2009 (Review of Financial Economics)"
+    },
+    {
+      "key": "llm_overtrading",
+      "importance": 0.5,
+      "text": "Com o mesmo prompt, o modelo que fez 158 trades venceu o que fez 1 418 (Alpha Arena 1.5, ações US). Over-trading destrói resultados: menos propostas e com mais confluência; HOLD é a resposta normal.",
+      "source": "nof1 Alpha Arena Season 1.5 (Forklog, 2026)"
+    },
+    {
+      "key": "llm_winrate_vs_payoff",
+      "importance": 0.5,
+      "text": "Win-rate alto com payoff abaixo de 1 perde dinheiro: um bot LLM fechou negativo um dia com 53% de acertos, enquanto um bot por regras com payoff 2,37 ganhou. Propor entradas só quando o alvo é claramente maior do que o stop.",
+      "source": "FX AI Bot Lab, 'Win Rate Lied This Week' (Substack, 2026)"
+    },
+    {
+      "key": "llm_numeros_fabricados",
+      "importance": 0.45,
+      "text": "Os LLMs fabricam números em 8 a 23% das respostas sobre dados financeiros. Nunca citar valores que não estejam no prompt; a decisão é validada em código contra os dados reais.",
+      "source": "Ntale 2026 (alucinação numérica em LLMs financeiros); arXiv 2607.15414"
+    },
+    {
+      "key": "llm_vies_direcional",
+      "importance": 0.4,
+      "text": "Cada modelo tem um viés direcional persistente (uns propõem short, outros long, independentemente do mercado). A proporção BUY/SELL do bot é medida contra a base e neutralizada; um padrão de propostas sempre no mesmo sentido é sinal de viés, não de edge.",
+      "source": "nof1 Alpha Arena Season 1 (Out-Nov 2025): quatro em seis modelos perderam; vieses short/long por modelo"
+    },
+    {
+      "key": "llm_regras_mais_que_modelo",
+      "importance": 0.4,
+      "text": "A arquitetura e as regras do agente explicam mais da variação de resultados do que o modelo base, e foram os stop-losses em código que mantiveram viva uma experiência com ChatGPT até um drawdown de -45,85%. O sistema de risco manda; a proposta do modelo é só uma opinião.",
+      "source": "Agent Market Arena (2025-2026); diário de Nathan Smith, semanas 4 a 20 (Benzinga/HackerNoon 2025)"
     }
   ]
 }
