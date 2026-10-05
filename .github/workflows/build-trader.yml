@@ -1,0 +1,71 @@
+name: Build Ollama IBKR Trader
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["claude/trading-system-ollama-ibkr-3qzwm3", "main"]
+    paths: ["ollama-ibkr-trader/**", ".github/workflows/build-trader.yml"]
+    tags: ["trader-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ollama-ibkr-trader
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get update && sudo apt-get install -y python3-tk
+      - run: pip install -r requirements.txt pytest
+      - run: python -m pytest -q
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: OllamaIBKRTrader-windows
+            binary: dist/OllamaIBKRTrader.exe
+          - os: macos-latest
+            artifact: OllamaIBKRTrader-macos
+            binary: dist/OllamaIBKRTrader
+          - os: ubuntu-latest
+            artifact: OllamaIBKRTrader-linux
+            binary: dist/OllamaIBKRTrader
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: ollama-ibkr-trader
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y python3-tk
+      - run: pip install -r requirements.txt pyinstaller
+      - run: pyinstaller --clean --noconfirm trader.spec
+      - name: Smoke test (binary imports and starts)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          chmod +x ${{ matrix.binary }}
+          ls -la dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ollama-ibkr-trader/${{ matrix.binary }}
+          if-no-files-found: error
+      - name: Attach to release (tags only)
+        if: startsWith(github.ref, 'refs/tags/trader-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ollama-ibkr-trader/${{ matrix.binary }}
