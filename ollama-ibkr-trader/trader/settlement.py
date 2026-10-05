@@ -7,7 +7,9 @@ instante, calcula-se o retorno, o alpha e um rótulo ``correct``.
 
 Rótulo: BUY correta se retorno >= +limiar; SELL correta se <= -limiar; HOLD
 correta se |retorno| < limiar de oportunidade perdida. O limiar é metade da
-distância do stop em % quando há ATR, com um mínimo de 0,1%.
+distância do stop em % quando há ATR, com um mínimo de 0,1%, e nunca abaixo
+do custo estimado ida+volta em % (``cost_pct``): um movimento que não paga a
+comissão é prejuízo, não acerto.
 """
 
 from __future__ import annotations
@@ -76,6 +78,9 @@ class Settler:
                     alpha = direction * ret - direction * bench_ret if direction else None
             atr = d.get("atr")
             thr = max(0.1, (atr / entry * 100.0) * self.s.atr_stop_multiple / 2) if atr else 0.2
+            # Um movimento que não cobre o custo ida+volta não é um acerto.
+            cost_pct = float(d.get("cost_pct") or 0.0)
+            thr = max(thr, cost_pct)
             missed = max(thr * 2, 0.5)
             self.db.settle_decision(d["id"], settled_price=price, settled_return=round(ret, 4),
                                     bench_return=round(bench_ret, 4) if bench_ret is not None else None,

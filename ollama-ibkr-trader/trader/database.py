@@ -187,8 +187,11 @@ DECISION_COLUMNS = {
     "correct": "INTEGER",
     "hour_ny": "INTEGER",
     "regime": "TEXT",
+    "cost_pct": "REAL",
 }
-TRADE_COLUMNS = {"decision_action": "TEXT", "stop_price": "REAL", "tp_price": "REAL", "risk_amount": "REAL"}
+TRADE_COLUMNS = {"decision_action": "TEXT", "stop_price": "REAL", "tp_price": "REAL", "risk_amount": "REAL",
+                 "commission": "REAL NOT NULL DEFAULT 0", "gross_pnl": "REAL NOT NULL DEFAULT 0"}
+FILL_COLUMNS = {"commission": "REAL", "commission_estimated": "INTEGER NOT NULL DEFAULT 1"}
 
 
 def utc_now() -> datetime:
@@ -213,7 +216,7 @@ class Database:
 
     def _migrate(self) -> None:
         with self._lock:
-            for table, columns in (("decisions", DECISION_COLUMNS), ("trades", TRADE_COLUMNS)):
+            for table, columns in (("decisions", DECISION_COLUMNS), ("trades", TRADE_COLUMNS), ("fills", FILL_COLUMNS)):
                 existing = {row[1] for row in self._conn.execute(f"PRAGMA table_info({table})")}
                 for name, decl in columns.items():
                     if name not in existing:
@@ -528,31 +531,39 @@ class Database:
             )
         return self._query("SELECT * FROM trades WHERE status='OPEN' ORDER BY id")
 
-    def record_entry_fill(self, trade_id: int, shares: float, price: float, ts: datetime) -> None:
-        """Atualiza preço médio de entrada com execuções (possivelmente parciais)."""
+    def record_entry_fill(self, trade_id: int, shares: float, price: float, ts: datetime,
+                          commission: float = 0.0) -> None:
+        """Atualiza preço médio de entrada com execuções (possivelmente parciais); a comissão
+        entra logo no P&L líquido (``pnl``), ficando ``gross_pnl`` sem custos."""
         trade = self._query("SELECT * FROM trades WHERE id=?", (trade_id,))[0]
         filled = float(trade["filled_qty"] or 0)
         prev_price = float(trade["entry_price"] or 0)
         new_filled = filled + shares
         avg = (prev_price * filled + price * shares) / new_filled if new_filled else price
         self._execute(
-            "UPDATE trades SET filled_qty=?, entry_price=?, entry_ts=COALESCE(entry_ts, ?) WHERE id=?",
-            (new_filled, avg, iso(ts), trade_id),
+            """UPDATE trades SET filled_qty=?, entry_price=?, entry_ts=COALESCE(entry_ts, ?),
+               commission=commission+?, pnl=pnl-? WHERE id=?""",
+            (new_filled, avg, iso(ts), commission, commission, trade_id),
         )
 
     def record_exit_fill(self, trade_id: int, shares: float, price: float, ts: datetime,
-                         reason: str) -> dict[str, Any]:
+                         reason: str, commission: float = 0.0) -> dict[str, Any]:
         trade = self._query("SELECT * FROM trades WHERE id=?", (trade_id,))[0]
         direction = int(trade["direction"])
         entry = float(trade["entry_price"] or price)
-        pnl_increment = (price - entry) * shares * direction
+        gross_increment = (price - entry) * shares * direction
         exit_qty = float(trade["exit_qty"] or 0) + shares
         status = "CLOSED" if exit_qty >= float(trade["filled_qty"] or trade["qty"]) - 1e-9 else "OPEN"
         self._execute(
-            """UPDATE trades SET exit_qty=?, exit_price=?, exit_ts=?, exit_reason=?, pnl=pnl+?, status=?
-               WHERE id=?""",
-            (exit_qty, price, iso(ts), reason, pnl_increment, status, trade_id),
+            """UPDATE trades SET exit_qty=?, exit_price=?, exit_ts=?, exit_reason=?, gross_pnl=gross_pnl+?,
+               pnl=pnl+?-?, commission=commission+?, status=? WHERE id=?""",
+            (exit_qty, price, iso(ts), reason, gross_increment, gross_increment, commission, commission, status, trade_id),
         )
+        return self._query("SELECT * FROM trades WHERE id=?", (trade_id,))[0]
+
+    def apply_commission_delta(self, trade_id: int, delta: float) -> dict[str, Any]:
+        """Corrige a comissão de um trade quando chega o CommissionReport real da IBKR."""
+        self._execute("UPDATE trades SET commission=commission+?, pnl=pnl-? WHERE id=?", (delta, delta, trade_id))
         return self._query("SELECT * FROM trades WHERE id=?", (trade_id,))[0]
 
     def trades_since(self, since: datetime) -> list[dict[str, Any]]:
@@ -561,16 +572,37 @@ class Database:
         )
 
     def insert_fill(self, *, exec_id: str, order_id: int, symbol: str, side: str,
-                    shares: float, price: float, ts: datetime) -> bool:
+                    shares: float, price: float, ts: datetime, commission: float = 0.0,
+                    commission_estimated: bool = True) -> bool:
         """Devolve False se a execução já estava registada (ib_async pode repetir eventos)."""
         try:
             self._execute(
-                "INSERT INTO fills (ts, exec_id, order_id, symbol, side, shares, price) VALUES (?,?,?,?,?,?,?)",
-                (iso(ts), exec_id, order_id, symbol, side, shares, price),
+                """INSERT INTO fills (ts, exec_id, order_id, symbol, side, shares, price, commission, commission_estimated)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (iso(ts), exec_id, order_id, symbol, side, shares, price, commission, int(commission_estimated)),
             )
             return True
         except sqlite3.IntegrityError:
             return False
+
+    def fill_by_exec(self, exec_id: str) -> Optional[dict[str, Any]]:
+        rows = self._query("SELECT * FROM fills WHERE exec_id=?", (exec_id,))
+        return rows[0] if rows else None
+
+    def set_fill_commission(self, exec_id: str, commission: float) -> Optional[float]:
+        """Substitui a comissão estimada pela real; devolve a diferença (real − estimada) ou None."""
+        row = self.fill_by_exec(exec_id)
+        if row is None:
+            return None
+        if not row["commission_estimated"] and abs(float(row["commission"] or 0) - commission) < 1e-9:
+            return 0.0
+        delta = commission - float(row["commission"] or 0.0)
+        self._execute("UPDATE fills SET commission=?, commission_estimated=0 WHERE exec_id=?", (commission, exec_id))
+        return delta
+
+    def commissions_since(self, since: datetime) -> float:
+        rows = self._query("SELECT COALESCE(SUM(commission), 0) AS c FROM fills WHERE ts >= ?", (iso(since),))
+        return float(rows[0]["c"] or 0.0)
 
     # ---------------------------------------------------------------- P&L
     def snapshot_pnl(self, *, net_liq: Optional[float], cash: Optional[float],
@@ -603,6 +635,8 @@ class Database:
             "avg_loss": round(sum(t["pnl"] for t in losses) / len(losses), 2) if losses else 0.0,
             "stop_hits": sum(1 for t in trades if (t["exit_reason"] or "") == "SL"),
             "tp_hits": sum(1 for t in trades if (t["exit_reason"] or "") == "TP"),
+            "gross_pnl": round(sum(float(t.get("gross_pnl") or 0) for t in trades), 2),
+            "commissions": round(sum(float(t.get("commission") or 0) for t in trades), 2),
         }
 
     # ------------------------------------------------------------- prompts

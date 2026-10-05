@@ -242,7 +242,9 @@ class Analytics:
         probs = [float(r["calibrated_prob"] if r.get("calibrated_prob") is not None else r["confidence"]) for r in settled]
         outcomes = [int(r["correct"]) for r in settled]
         closed = self.db.closed_trades_between(since)
-        pnls = [float(t["pnl"]) for t in closed]
+        pnls = [float(t["pnl"]) for t in closed]  # líquidos de comissões
+        commissions = sum(float(t.get("commission") or 0) for t in closed)
+        gross = sum(float(t.get("gross_pnl") or 0) for t in closed)
         equity = [v for _, v in self.db.daily_equity(since)]
         current_equity = equity[-1] if equity else 0.0
         n_trials = self.db.experiment_count()
@@ -256,7 +258,8 @@ class Analytics:
             "ts": now.isoformat(), "window_days": since_days,
             "calibration": calibration_metrics(probs, outcomes),
             "permutation": permutation_hit_rate(settled),
-            "trades": trade_metrics(pnls),
+            "trades": {**trade_metrics(pnls), "commissions": round(commissions, 2), "gross_pnl": round(gross, 2),
+                       "cost_share_of_gross": round(commissions / gross, 3) if gross > 0 else None},
             "monte_carlo": monte_carlo_ruin(pnls, current_equity, self.s.max_drawdown_pct * 3),
             "equity": equity_metrics(equity, n_trials),
             "wfe": walk_forward_efficiency(pnls),
@@ -305,7 +308,9 @@ class Analytics:
                   f"p-value {perm.get('p_value')}"]
         lines += ["", "## Trades fechados",
                   f"- n = {tr.get('n', 0)}, win-rate {tr.get('win_rate')}, expectancy {tr.get('expectancy')} USD, "
-                  f"profit factor {tr.get('profit_factor')}, Kelly {tr.get('kelly')}, P&L {tr.get('total_pnl')} USD, "
+                  f"profit factor {tr.get('profit_factor')}, Kelly {tr.get('kelly')}, P&L líquido {tr.get('total_pnl')} USD "
+                  f"(bruto {tr.get('gross_pnl')}, comissões {tr.get('commissions')} USD = "
+                  f"{tr.get('cost_share_of_gross') if tr.get('cost_share_of_gross') is not None else 'n/a'} do bruto), "
                   f"max DD {tr.get('max_drawdown_abs')} USD",
                   f"- Monte Carlo: ruína (DD ≥ {mc.get('ruin_threshold_pct')}%) = {mc.get('ruin_probability')}, "
                   f"DD mediano {mc.get('median_max_dd_pct')}%, p95 {mc.get('p95_max_dd_pct')}%"]

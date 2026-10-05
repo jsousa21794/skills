@@ -36,7 +36,7 @@ from .lessons import LessonEngine
 from .market_data import EventData
 from .ollama_brain import Decision, DecisionOutcome, OllamaBrain
 from .retrospective import Retrospective
-from .risk import PositionSizer, RiskGate, round_trip_cost
+from .risk import PositionSizer, RiskGate, commission as estimate_commission, round_trip_cost
 from .sentiment import SentimentScorer
 from .settlement import Settler
 from .ui_bus import UIBus
@@ -93,7 +93,8 @@ class TradingEngine:
         self.bus = bus
         self.brain = brain
         self.ibkr = IBKRClient(settings, on_bar=self._on_bar, on_fill=self._on_fill,
-                               on_order_status=self._on_order_status, on_disconnect=self._on_disconnect)
+                               on_order_status=self._on_order_status, on_disconnect=self._on_disconnect,
+                               on_commission=self._on_commission)
         self.events = EventData(db, settings.finnhub_api_key, settings.news_source)
         self.sizer = PositionSizer(settings)
         self.gate = RiskGate(settings, db, self.events)
@@ -375,6 +376,8 @@ class TradingEngine:
                     pos["stop"] = trade["stop_price"] if trade else None
                     pos["tp"] = trade["tp_price"] if trade else None
                 self.gate.update_day_baseline(state.get("net_liq"), now)
+                day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                state["commissions_today"] = round(self.db.commissions_since(day_start), 2)
                 pct = self.gate.day_pnl_pct(state.get("net_liq"))
                 state["day_pnl_pct"] = round(pct, 3) if pct is not None else None
                 self.bus.emit("portfolio", **state)
@@ -487,6 +490,7 @@ class TradingEngine:
 
         decision = outcome.decision
         position_qty = self.ibkr.position_qty(symbol)
+        cost_pct = self._estimated_cost_pct(ctx, state)
         signals = ConfidenceSignals(decision.confianca, outcome.agree_frac, outcome.margin, outcome.action_logprob)
         calibrated = self.calibrator.probability(signals) if decision.acao in ("BUY", "SELL") else None
         decision_id = self.db.insert_decision(
@@ -499,7 +503,8 @@ class TradingEngine:
                    "n_samples": len(outcome.samples), "samples_json": outcome.samples, "prompt_hash": outcome.prompt_hash,
                    "dynamics_json": ctx.dynamics.to_dict() if ctx.dynamics else None, "atr": ctx.atr,
                    "sentiment": sentiment[0] if sentiment else None, "vol_forecast": vol_width,
-                   "review": int(outcome.review), "hour_ny": ctx.hour_ny, "regime": ctx.snapshot.trend_label()},
+                   "review": int(outcome.review), "hour_ny": ctx.hour_ny, "regime": ctx.snapshot.trend_label(),
+                   "cost_pct": cost_pct},
         )
         level = logging.ERROR if outcome.review else (logging.INFO if decision.parse_ok else logging.WARNING)
         log.log(level, "[%s] %s verbal=%.2f acordo=%.0f%% p=%s (%.0fs, %d amostras%s) | RSI=%s ATR=%s%% | %s",
@@ -599,12 +604,7 @@ class TradingEngine:
             return skip("ATR indisponível para dimensionar")
         if sizing.qty < 1:
             return skip("quantidade < 1 ação com o risco configurado")
-        cost_gate = self.gate.check_costs(qty=sizing.qty, price=ctx.snapshot.price,
-                                          tp_distance=abs(sizing.tp_price - ctx.snapshot.price))
-        if not cost_gate.allowed:
-            return skip(cost_gate.reason)
-
-        # Limiar de probabilidade: break-even do bracket + margem (ou piso enquanto não calibrado).
+        # Limiar de probabilidade: break-even do bracket COM custos + margem (ou piso enquanto não calibrado).
         cost = round_trip_cost(sizing.qty, ctx.snapshot.price, self.settings)
         rr = abs(sizing.tp_price - ctx.snapshot.price) / max(sizing.stop_distance, 1e-9)
         threshold = execution_threshold(self.settings, reward_risk_ratio=rr, cost=cost, risk_amount=sizing.risk_amount,
@@ -612,7 +612,12 @@ class TradingEngine:
         self.db.update_decision(decision_id, threshold_used=threshold)
         prob = calibrated if calibrated is not None else 0.0
         if prob < threshold:
-            return skip(f"p={prob:.2f} < limiar {threshold:.2f} (break-even R:R {rr:.1f})")
+            return skip(f"p={prob:.2f} < limiar {threshold:.2f} (break-even R:R {rr:.1f} com custo {cost:.2f} USD)")
+        cost_gate = self.gate.check_costs(qty=sizing.qty, price=ctx.snapshot.price,
+                                          tp_distance=abs(sizing.tp_price - ctx.snapshot.price),
+                                          stop_distance=sizing.stop_distance, probability=prob)
+        if not cost_gate.allowed:
+            return skip(cost_gate.reason)
 
         result = await self.ibkr.place_bracket(symbol, action, sizing.qty, ctx.snapshot.price,
                                                stop_price=sizing.stop_price, tp_price=sizing.tp_price,
@@ -630,13 +635,23 @@ class TradingEngine:
                            risk_amount=sizing.risk_amount)
         self.db.mark_decision(decision_id, executed=True)
         self.bus.emit("decision_result", decision_id=decision_id, executed=True,
-                      reason=f"{action} x{sizing.qty} SL {sizing.stop_price:.2f} TP {sizing.tp_price:.2f}")
+                      reason=f"{action} x{sizing.qty} SL {sizing.stop_price:.2f} TP {sizing.tp_price:.2f} · "
+                             f"custo {cost:.2f} USD · ganho líquido no TP {sizing.qty * abs(sizing.tp_price - ctx.snapshot.price) - cost:.2f} USD")
         self._persistence[symbol] = []
         log.warning("[%s] EXECUTADO %s x%d @~%.2f | SL %.2f | TP %.2f | risco %.0f USD (%.2f%% ×%.2f, ATR %.2f) | "
                     "p=%.2f ≥ %.2f | %s",
                     symbol, action, sizing.qty, ctx.snapshot.price, sizing.stop_price, sizing.tp_price,
                     sizing.risk_amount, risk_pct * 100, multiplier, sizing.atr_used, prob, threshold,
                     "; ".join(sizing.notes + cost_gate.notes + global_gate.notes), extra={"category": "ordem"})
+
+    def _estimated_cost_pct(self, ctx: DecisionContext, state: dict[str, Any]) -> Optional[float]:
+        """Custo ida+volta em % do notional para a quantidade que o sizer daria agora."""
+        equity = state.get("net_liq")
+        if not equity or ctx.snapshot.price <= 0:
+            return None
+        sizing = self.sizer.size(action="BUY", price=ctx.snapshot.price, equity=equity, bars=ctx.agg_bars)
+        qty = sizing.qty if sizing and sizing.qty >= 1 else 1
+        return round(round_trip_cost(qty, ctx.snapshot.price, self.settings) / (qty * ctx.snapshot.price) * 100.0, 4)
 
     def _last_sentiment(self, decision_id: int) -> tuple[Optional[float], int]:
         row = self.db._query("SELECT sentiment FROM decisions WHERE id=?", (decision_id,))
@@ -691,12 +706,19 @@ class TradingEngine:
         ts = execution.time if isinstance(execution.time, datetime) else datetime.now(timezone.utc)
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
+        report = getattr(fill, "commissionReport", None)
+        real = getattr(report, "commission", None) if report is not None else None
+        estimated = real is None or real == 0.0
+        commission_value = estimate_commission(int(execution.shares), float(execution.price), self.settings) \
+            if estimated else float(real)
         new = self.db.insert_fill(exec_id=execution.execId, order_id=execution.orderId, symbol=symbol,
-                                  side=execution.side, shares=float(execution.shares), price=float(execution.price), ts=ts)
+                                  side=execution.side, shares=float(execution.shares), price=float(execution.price), ts=ts,
+                                  commission=commission_value, commission_estimated=estimated)
         if not new:
             return
-        log.info("Execução %s %s x%g @ %.2f (ordem %d)", symbol, execution.side, execution.shares,
-                 execution.price, execution.orderId, extra={"category": "ordem"})
+        log.info("Execução %s %s x%g @ %.2f (ordem %d) · comissão %.2f USD%s", symbol, execution.side, execution.shares,
+                 execution.price, execution.orderId, commission_value, " (estimada)" if estimated else "",
+                 extra={"category": "ordem"})
         group = self.db.group_for_order(execution.orderId)
         if not group:
             return
@@ -708,10 +730,11 @@ class TradingEngine:
             else:
                 trade_id = trade_row["id"]
             if execution.orderId == group["parent_order_id"]:
-                self.db.record_entry_fill(trade_id, float(execution.shares), float(execution.price), ts)
+                self.db.record_entry_fill(trade_id, float(execution.shares), float(execution.price), ts, commission_value)
             else:
                 reason = "TP" if execution.orderId == group["tp_order_id"] else "SL"
-                updated = self.db.record_exit_fill(trade_id, float(execution.shares), float(execution.price), ts, reason)
+                updated = self.db.record_exit_fill(trade_id, float(execution.shares), float(execution.price), ts, reason,
+                                                   commission_value)
                 self._announce_close(updated, reason)
         elif group["role"] == "CLOSE":
             remaining = float(execution.shares)
@@ -721,17 +744,46 @@ class TradingEngine:
                 portion = min(remaining, float(row["filled_qty"] or row["qty"]) - float(row["exit_qty"] or 0))
                 if portion <= 0:
                     continue
-                updated = self.db.record_exit_fill(row["id"], portion, float(execution.price), ts, "SIGNAL")
+                share = commission_value * portion / max(float(execution.shares), 1e-9)
+                updated = self.db.record_exit_fill(row["id"], portion, float(execution.price), ts, "SIGNAL", share)
                 remaining -= portion
                 self._announce_close(updated, "SIGNAL")
             self._pending_close.pop(symbol, None)
 
+    def _on_commission(self, trade: Any, fill: Any, report: Any) -> None:
+        """CommissionReport real da IBKR: substitui a estimativa e corrige o P&L líquido do trade."""
+        commission_value = getattr(report, "commission", None)
+        exec_id = getattr(getattr(fill, "execution", None), "execId", None)
+        if commission_value is None or not exec_id:
+            return
+        delta = self.db.set_fill_commission(exec_id, float(commission_value))
+        if delta is None or abs(delta) < 1e-9:
+            return
+        group = self.db.group_for_order(fill.execution.orderId)
+        if not group:
+            return
+        if group["role"] == "ENTRY":
+            trade_row = self.db.trade_for_group(group["id"])
+            if trade_row:
+                self.db.apply_commission_delta(trade_row["id"], delta)
+        else:
+            rows = self.db._query("SELECT id FROM trades WHERE symbol=? ORDER BY id DESC LIMIT 1", (fill.contract.symbol,))
+            if rows:
+                self.db.apply_commission_delta(rows[0]["id"], delta)
+        log.info("Comissão real %s: %.2f USD (ajuste %+.2f)", fill.contract.symbol, float(commission_value), delta,
+                 extra={"category": "ordem"})
+
     def _announce_close(self, trade_row: dict[str, Any], reason: str) -> None:
         if trade_row["status"] == "CLOSED":
             pnl = float(trade_row["pnl"])
+            gross = float(trade_row.get("gross_pnl") or 0.0)
+            comm = float(trade_row.get("commission") or 0.0)
             log.log(logging.INFO if pnl >= 0 else logging.WARNING,
-                    "Trade #%d %s fechado por %s: P&L %+.2f USD", trade_row["id"], trade_row["symbol"], reason, pnl,
-                    extra={"category": "ordem"})
+                    "Trade #%d %s fechado por %s: P&L líquido %+.2f USD (bruto %+.2f, comissões %.2f)",
+                    trade_row["id"], trade_row["symbol"], reason, pnl, gross, comm, extra={"category": "ordem"})
+            if gross > 0 >= pnl:
+                log.warning("Trade #%d: lucro bruto comido pelas comissões (%.2f de %.2f). O gate de custos deve "
+                            "ter recusado isto; verifica min_net_gain_multiple.", trade_row["id"], comm, gross)
             self.bus.emit("trade_closed", trade=trade_row)
 
     # ------------------------------------------------------------- helpers

@@ -69,3 +69,19 @@ def test_lessons_extract_failure_pattern_programmatically():
     assert len(top) == 2 and "sobrecompra" in top[0] + top[1]
     assert rsi_regime(80) == "sobrecompra" and rsi_regime(20) == "sobrevenda"
     assert len(db.active_lessons()) == len(lessons)
+
+
+def test_settlement_counts_moves_below_cost_as_wrong():
+    s = Settings()
+    s.settlement_horizon_minutes = 30
+    db = Database(":memory:")
+    now = datetime.now(timezone.utc)
+    did = _seed(db, now, "AAPL", "BUY", 0.8, 100.0, 55, 60)
+    db.update_decision(did, cost_pct=0.6)  # custo ida+volta de 0,6% do notional
+    Settler(s, db, lambda symbol, when: 100.3).run(now)  # +0,3% não cobre o custo
+    row = db._query("SELECT settled_return, correct FROM decisions WHERE id=?", (did,))[0]
+    assert row["settled_return"] == 0.3 and row["correct"] is None  # neutro: nem acerto nem erro
+    did2 = _seed(db, now, "AAPL", "BUY", 0.8, 100.0, 55, 61)
+    db.update_decision(did2, cost_pct=0.6)
+    Settler(s, db, lambda symbol, when: 101.0).run(now)
+    assert db._query("SELECT correct FROM decisions WHERE id=?", (did2,))[0]["correct"] == 1

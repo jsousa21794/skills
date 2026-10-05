@@ -286,16 +286,32 @@ class RiskGate:
         return start <= minutes < end
 
     # ---------------------------------------------------------------- custos
-    def check_costs(self, *, qty: int, price: float, tp_distance: float) -> GateResult:
+    def check_costs(self, *, qty: int, price: float, tp_distance: float,
+                    stop_distance: Optional[float] = None, probability: Optional[float] = None) -> GateResult:
+        """Recusa operações em que a comissão come o lucro.
+
+        Regras: (1) notional mínimo; (2) custo ida+volta <= fração do ganho bruto no TP;
+        (3) ganho LÍQUIDO no TP tem de ser pelo menos ``min_net_gain_multiple`` × custo;
+        (4) se houver probabilidade calibrada, o valor esperado líquido tem de ser positivo.
+        """
         result = GateResult(True)
         notional = qty * price
         if notional < self.s.min_position_notional:
             return result.block(f"notional {notional:.0f} USD < mínimo {self.s.min_position_notional:.0f}")
         cost = round_trip_cost(qty, price, self.s)
-        expected_gain = qty * tp_distance
-        if expected_gain <= 0 or cost > expected_gain * self.s.max_cost_fraction_of_tp:
-            return result.block(f"custo ida+volta {cost:.2f} USD > {self.s.max_cost_fraction_of_tp:.0%} do ganho alvo {expected_gain:.2f}")
-        result.notes.append(f"custo estimado {cost:.2f} USD ({cost / max(notional, 1e-9) * 100:.2f}%)")
+        gross_gain = qty * tp_distance
+        net_gain = gross_gain - cost
+        if gross_gain <= 0 or cost > gross_gain * self.s.max_cost_fraction_of_tp:
+            return result.block(f"custo ida+volta {cost:.2f} USD > {self.s.max_cost_fraction_of_tp:.0%} do ganho bruto no TP ({gross_gain:.2f} USD)")
+        if net_gain < cost * self.s.min_net_gain_multiple:
+            return result.block(f"ganho líquido no TP {net_gain:.2f} USD < {self.s.min_net_gain_multiple:.0f}× o custo ({cost:.2f} USD)")
+        if probability is not None and stop_distance:
+            net_loss = qty * stop_distance + cost
+            ev = probability * net_gain - (1 - probability) * net_loss
+            if ev <= 0:
+                return result.block(f"valor esperado líquido {ev:+.2f} USD com p={probability:.2f} (ganho {net_gain:.2f} / perda {net_loss:.2f})")
+            result.notes.append(f"EV líquido {ev:+.2f} USD")
+        result.notes.append(f"custo {cost:.2f} USD ({cost / max(notional, 1e-9) * 100:.2f}%), ganho líquido no TP {net_gain:.2f} USD")
         return result
 
     # -------------------------------------------------------------- fase 3

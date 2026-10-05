@@ -50,6 +50,7 @@ class IBKRClient:
         on_fill: Optional[FillCallback] = None,
         on_order_status: Optional[StatusCallback] = None,
         on_disconnect: Optional[Callable[[], None]] = None,
+        on_commission: Optional[Callable[[Trade, Fill, Any], None]] = None,
     ) -> None:
         self.settings = settings
         self.ib: Optional[IB] = None
@@ -59,6 +60,7 @@ class IBKRClient:
         self._on_fill = on_fill
         self._on_order_status = on_order_status
         self._on_disconnect = on_disconnect
+        self._on_commission = on_commission
         self._connecting = False
         self._disconnect_handled = False
         self.data_delayed: Optional[bool] = None  # True quando o feed é atrasado (paper sem subscrição)
@@ -83,6 +85,7 @@ class IBKRClient:
                 self.ib.disconnectedEvent += self._handle_disconnected
                 self.ib.execDetailsEvent += self._handle_exec
                 self.ib.orderStatusEvent += self._handle_order_status
+                self.ib.commissionReportEvent += self._handle_commission
             await self.ib.connectAsync(
                 self.settings.ib_host, self.settings.ib_port,
                 clientId=self.settings.ib_client_id, timeout=15,
@@ -147,6 +150,13 @@ class IBKRClient:
                 self._on_fill(trade, fill)
             except Exception as exc:  # noqa: BLE001
                 log.exception("Erro no callback de execução: %s", exc)
+
+    def _handle_commission(self, trade: Trade, fill: Fill, report: Any) -> None:
+        if self._on_commission:
+            try:
+                self._on_commission(trade, fill, report)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Erro no callback de comissão: %s", exc)
 
     def _handle_order_status(self, trade: Trade) -> None:
         if self._on_order_status:

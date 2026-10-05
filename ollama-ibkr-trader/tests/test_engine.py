@@ -121,7 +121,31 @@ def test_opposite_signal_closes_and_fills_settle_pnl(monkeypatch):
     fill(engine, close_group["parent_order_id"], "AAPL", "SLD", qty, 102.0, "e2")
     closed = db.trades_since(datetime(2000, 1, 1, tzinfo=timezone.utc))[0]
     assert closed["status"] == "CLOSED" and closed["exit_reason"] == "SIGNAL"
-    assert closed["pnl"] == pytest.approx(2.0 * qty)
+    assert closed["gross_pnl"] == pytest.approx(2.0 * qty)
+    assert closed["commission"] > 0
+    assert closed["pnl"] == pytest.approx(2.0 * qty - closed["commission"])
+
+
+def test_commission_report_replaces_estimate_and_adjusts_net_pnl(monkeypatch):
+    engine, db, _ = make_engine()
+    monkeypatch.setattr("trader.trading_engine.datetime", _FixedDatetime)
+    run_exec(engine, db, outcome("BUY"))
+    qty = engine.ibkr.brackets[0][2]
+    fill(engine, 100, "AAPL", "BOT", qty, 100.0, "e1")
+    trade = db.open_trades("AAPL")[0]
+    estimated = trade["commission"]
+    assert estimated == pytest.approx(max(1.0, qty * 0.005))
+    report = SimpleNamespace(commission=estimated + 0.75)
+    engine._on_commission(SimpleNamespace(), SimpleNamespace(execution=SimpleNamespace(execId="e1", orderId=100),
+                                                            contract=SimpleNamespace(symbol="AAPL")), report)
+    trade = db.open_trades("AAPL")[0]
+    assert trade["commission"] == pytest.approx(estimated + 0.75)
+    assert trade["pnl"] == pytest.approx(-(estimated + 0.75))
+    assert db.fill_by_exec("e1")["commission_estimated"] == 0
+    # repetição do mesmo relatório não duplica
+    engine._on_commission(SimpleNamespace(), SimpleNamespace(execution=SimpleNamespace(execId="e1", orderId=100),
+                                                            contract=SimpleNamespace(symbol="AAPL")), report)
+    assert db.open_trades("AAPL")[0]["commission"] == pytest.approx(estimated + 0.75)
 
 
 def test_reconcile_closes_orphans_and_protects_naked_positions():

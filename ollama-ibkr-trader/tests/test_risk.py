@@ -140,3 +140,28 @@ def test_vix_and_earnings_gates():
     s.event_data_fail_closed = True
     gate_none = RiskGate(s, db, _Events(blackout=None))
     assert "fail-closed" in gate_none.check_symbol(symbol="AAPL", now=now).reason
+
+
+def test_cost_gate_rejects_commission_eating_profit():
+    """1 USD de comissão por lado contra 0,50 USD de lucro esperado é prejuízo, não trade."""
+    s = Settings()
+    s.min_position_notional = 0
+    gate = RiskGate(s, Database(":memory:"))
+    # 10 ações a 50 USD, TP a 0,05 USD de distância -> ganho bruto 0,50; custo ida+volta 2,20
+    res = gate.check_costs(qty=10, price=50.0, tp_distance=0.05)
+    assert not res.allowed and "custo" in res.reason
+    # ganho bruto 4 USD, custo 2,20 -> recusado (custo > 20% do bruto)
+    res2 = gate.check_costs(qty=10, price=50.0, tp_distance=0.40)
+    assert not res2.allowed and "custo" in res2.reason
+    # custo 2,20 = 18% do bruto 12 USD, mas líquido 9,8 > 3x custo -> passa; com múltiplo 5x recusa pelo líquido
+    assert gate.check_costs(qty=10, price=50.0, tp_distance=1.2).allowed
+    s.min_net_gain_multiple = 5.0
+    res3 = gate.check_costs(qty=10, price=50.0, tp_distance=1.2)
+    assert not res3.allowed and "ganho líquido" in res3.reason
+    s.min_net_gain_multiple = 3.0
+    # 200 ações, TP a 1 USD: bruto 200, custo 2+4=6 -> ok; com p=0,30 e stop 0,5 o EV líquido é negativo
+    assert gate.check_costs(qty=200, price=50.0, tp_distance=1.0).allowed
+    bad_ev = gate.check_costs(qty=200, price=50.0, tp_distance=1.0, stop_distance=0.5, probability=0.30)
+    assert not bad_ev.allowed and "valor esperado" in bad_ev.reason
+    good_ev = gate.check_costs(qty=200, price=50.0, tp_distance=1.0, stop_distance=0.5, probability=0.45)
+    assert good_ev.allowed and any("EV líquido" in n for n in good_ev.notes)

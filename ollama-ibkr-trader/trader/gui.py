@@ -585,7 +585,10 @@ class TraderApp(ctk.CTk):
 
         self.c_cash.set(money(p.get("cash")))
         self.c_unreal.set(*signed(p.get("unrealized")))
-        self.c_real.set(*signed(p.get("realized")))
+        realized_text, realized_color = signed(p.get("realized"))
+        comm = p.get("commissions_today")
+        self.c_real.set(realized_text, realized_color,
+                        note=f"comissões hoje: {comm:.2f} USD" if comm is not None else "")
         positions = p.get("positions", [])
         self.c_pos.set(f"{len(positions)} / {self.settings.max_open_positions}",
                        note="máximo configurado")

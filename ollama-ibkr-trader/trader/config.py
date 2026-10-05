@@ -112,7 +112,8 @@ class Settings:
     commission_max_pct: float = 0.01
     slippage_ticks: int = 1
     tick_size: float = 0.01
-    max_cost_fraction_of_tp: float = 0.25  # custo ida+volta <= 25% do ganho esperado
+    max_cost_fraction_of_tp: float = 0.20  # custo ida+volta <= 20% do ganho bruto no TP
+    min_net_gain_multiple: float = 3.0  # ganho líquido no TP >= 3× o custo ida+volta
     min_position_notional: float = 200.0
     earnings_blackout_days_before: int = 1
     earnings_blackout_days_after: int = 1
