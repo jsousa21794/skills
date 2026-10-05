@@ -44,10 +44,10 @@ def app_data_dir() -> Path:
 class Settings:
     # ---- Interactive Brokers -------------------------------------------------
     ib_host: str = "127.0.0.1"
-    trading_mode: str = "paper"  # "paper" | "live"
+    trading_mode: str = "live"  # "live" (predefinido, porta 7496) | "paper" (7497)
     ib_port_paper: int = 7497  # TWS Paper (Gateway Paper: 4002)
     ib_port_live: int = 7496  # TWS Real (Gateway Real: 4001)
-    live_confirmed: bool = False  # confirmado na GUI (escrever REAL) antes de ligar em modo real
+    live_confirmed: bool = False  # confirmação única na GUI (escrever REAL); fica guardada
     ui_always_on_top: bool = False
     ib_client_id: int = 17
     market_data_type: int = 3  # 1 = tempo real, 3 = atrasado (funciona sem subscrição)

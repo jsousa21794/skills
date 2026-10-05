@@ -199,6 +199,10 @@ class TradingEngine:
     async def start_trading(self) -> None:
         if self.trading_enabled:
             return
+        if self.settings.is_live and not self.settings.live_confirmed:
+            log.error("Modo REAL sem confirmação: confirma na GUI (escrever REAL) antes de iniciar.")
+            self._emit_status()
+            return
         self.trading_enabled = True
         log.info("Ciclo de trading INICIADO. Ativos: %s", ", ".join(self.settings.symbols))
         await self._ensure_connected()
@@ -227,11 +231,15 @@ class TradingEngine:
                 await self.ibkr.subscribe_bars(symbol)
 
     async def set_mode(self, mode: str, confirmed: bool = False) -> bool:
-        """Alterna entre paper (7497) e real (7496). Modo real exige confirmação explícita."""
+        """Alterna entre real (7496, predefinido) e paper (7497). Modo real exige confirmação única."""
         mode = "live" if mode == "live" else "paper"
         if mode == self.settings.trading_mode and self.ibkr.connected:
             return True
-        if mode == "live" and not confirmed:
+        if mode == self.settings.trading_mode and mode == "live" and confirmed and not self.ibkr.connected:
+            self.settings.live_confirmed = True
+            self.settings.save()
+            return True
+        if mode == "live" and not confirmed and not self.settings.live_confirmed:
             log.error("Modo REAL recusado: falta confirmação explícita.")
             return False
         was_trading = self.trading_enabled
@@ -244,6 +252,8 @@ class TradingEngine:
         self.settings.save()
         self.db.record_experiment("config", f"mode={mode}")
         if mode == "live":
+            self.settings.live_confirmed = True
+            self.settings.save()
             log.critical("MODO REAL ATIVADO (porta %d). Ordens com dinheiro real. Camada de risco: %.2f%%/trade, "
                          "kill-switch %.0f%%/dia, StoplossGuard %d stops.", self.settings.ib_port,
                          self.settings.risk_per_trade_pct * 100, self.settings.daily_loss_limit_pct * 100,

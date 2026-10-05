@@ -15,6 +15,9 @@ escuro).
 > capital são as regras de risco, não o modelo. Nunca apontes isto para uma
 > conta real sem passar os gates estatísticos descritos abaixo.
 
+> O modo predefinido é a conta **real**. O risco por trade arranca em 0,5% do
+> equity, com kill-switch diário de 3%; ajusta em `config.json` se quiseres.
+
 ## Princípio: o LLM propõe, o código decide
 
 ```
@@ -180,14 +183,15 @@ aceitar adaptadores LoRA (só GGUF já fundidos). O que existe e é usável:
   conhecido** com a hora, lido do histórico em SQLite; o título da janela
   repete o valor para ficar visível na barra de tarefas. Interruptor "Janela
   sempre visível" (always-on-top).
-- **Conta**: seletor *Paper* / *Real* na barra lateral. *Real* liga à porta
-  7496 (TWS) e exige escrever `REAL` numa caixa de confirmação; o distintivo
-  no cabeçalho passa a vermelho. Ao ligar, o bot confirma o tipo de conta pelo
-  identificador (`DU…` = paper): em modo paper com conta real desliga-se por
-  segurança; em modo real com conta paper avisa. Não é preciso passar por
-  paper: a camada de risco, o kill-switch e os brackets funcionam igual em
-  ambos os modos, e os gates estatísticos apenas decidem se o risco por trade
-  é 0,5% ou 1%.
+- **Conta**: o modo predefinido é **Real** (porta 7496, TWS). Na primeira
+  vez que carregas em *Iniciar trading* é pedida uma confirmação única
+  (escrever `REAL`), que fica guardada no `config.json` (`live_confirmed`).
+  O seletor *Paper* / *Real* na barra lateral permite mudar para paper (7497)
+  se a tiveres. Ao ligar, o bot confirma o tipo de conta pelo identificador
+  (`DU…` = paper): em modo paper com conta real desliga-se por segurança; em
+  modo real com conta paper avisa. A camada de risco, o kill-switch e os
+  brackets funcionam igual em ambos os modos; os gates estatísticos apenas
+  decidem se o risco por trade é 0,5% ou 1%.
 - **Separadores**: *Visão geral* (cartões, gráfico do valor da carteira nas
   últimas 48 h, posições com stop e take-profit), *Decisões* (cada proposta do
   LLM com confiança verbal, acordo, probabilidade calibrada e o veredicto da
@@ -206,8 +210,8 @@ python main.py
 Requisitos:
 - Python 3.10+ (exigido pelo `ib_async`) com Tk (`sudo apt install python3-tk` no Linux).
 - **TWS ou IB Gateway** com API ativa: *Configure → API → Settings*:
-  ✔ Enable ActiveX and Socket Clients, ✘ Read-Only API, porta **7497**
-  (paper) ou **7496** (real), 127.0.0.1 nos Trusted IPs. Sem subscrição, o paper usa dados com
+  ✔ Enable ActiveX and Socket Clients, ✘ Read-Only API, porta **7496**
+  (real, predefinido) ou **7497** (paper), 127.0.0.1 nos Trusted IPs. Sem subscrição, o paper usa dados com
   15 min de atraso; o bot avisa e as métricas de qualidade do LLM não são válidas.
 - **Ollama** (`ollama serve`) com pelo menos um modelo; o dropdown lista `/api/tags`.
 

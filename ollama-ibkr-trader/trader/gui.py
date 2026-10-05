@@ -153,7 +153,8 @@ class ConfirmLiveDialog(ctk.CTkToplevel):
                      text_color=C["red"]).pack(pady=(22, 6))
         ctk.CTkLabel(self, text=(f"O bot vai ligar-se à porta {port} (TWS/Gateway em conta real) e colocar ordens\n"
                                  "reais de forma autónoma. A camada de risco (kill-switch diário, StoplossGuard,\n"
-                                 "sizing por ATR, brackets) mantém-se ativa, mas o capital é real.\n\n"
+                                 "sizing por ATR, brackets) mantém-se ativa, mas o capital é real.\n"
+                                 "Esta confirmação é pedida uma única vez e fica guardada.\n\n"
                                  "Escreve REAL para confirmar:"),
                      justify="center", text_color=C["text"], font=ctk.CTkFont(FONT, 12)).pack(pady=(0, 10))
         self.entry = ctk.CTkEntry(self, width=200, justify="center", font=ctk.CTkFont(FONT, 14, "bold"))
@@ -247,7 +248,10 @@ class TraderApp(ctk.CTk):
         brand = ctk.CTkFrame(header, fg_color="transparent")
         brand.grid(row=0, column=0, sticky="w", padx=20, pady=16)
         ctk.CTkLabel(brand, text="◆  Ollama × IBKR", font=ctk.CTkFont(FONT, 18, "bold")).pack(anchor="w")
-        self.mode_badge = ctk.CTkLabel(brand, text="PAPER", fg_color=C["green_dim"], text_color=C["green"],
+        live0 = self.settings.is_live
+        self.mode_badge = ctk.CTkLabel(brand, text="CONTA REAL" if live0 else "PAPER",
+                                       fg_color=C["red_dim"] if live0 else C["green_dim"],
+                                       text_color=C["red"] if live0 else C["green"],
                                        corner_radius=8, font=ctk.CTkFont(FONT, 11, "bold"), width=90, height=24)
         self.mode_badge.pack(anchor="w", pady=(6, 0))
 
@@ -446,6 +450,18 @@ class TraderApp(ctk.CTk):
 
     # ------------------------------------------------------------- comandos
     def _start(self) -> None:
+        if self.settings.is_live and not self.settings.live_confirmed:
+            ConfirmLiveDialog(self, self.settings.ib_port_live, on_confirm=self._confirm_live_and_start,
+                              on_cancel=lambda: None)
+            return
+        self.engine.call(self.engine.start_trading())
+        self.btn_start.configure(state="disabled")
+        self.btn_stop.configure(state="normal")
+
+    def _confirm_live_and_start(self) -> None:
+        self.settings.live_confirmed = True
+        self.settings.save()
+        self.engine.call(self.engine.set_mode("live", confirmed=True))
         self.engine.call(self.engine.start_trading())
         self.btn_start.configure(state="disabled")
         self.btn_stop.configure(state="normal")
