@@ -216,6 +216,19 @@ Configuração em `~/.ollamaibkrtrader/config.json`; base de dados, log e
 
 ## Executável único (PyInstaller)
 
+**Transferir**: os executáveis compilados pelo GitHub Actions estão na página de
+Releases do repositório (`OllamaIBKRTrader-windows-x64.exe`,
+`OllamaIBKRTrader-macos`, `OllamaIBKRTrader-linux-x64`). Para gerar uma nova
+versão, corre o workflow "Build Ollama IBKR Trader" em *Actions → Run
+workflow* com um `release_tag` (ex.: `trader-v1.0.1`); cada push ao branch
+também compila e guarda os binários como artefactos durante 90 dias.
+
+No Windows o SmartScreen pode avisar por o executável não estar assinado:
+*Mais informações → Executar mesmo assim*. Os dados ficam em
+`%USERPROFILE%\.ollamaibkrtrader\`.
+
+**Compilar localmente**:
+
 ```bash
 ./build.sh          # Linux/macOS
 build.bat           # Windows
