@@ -72,7 +72,8 @@ class PositionSizer:
         return max(current, floor) if floor else current
 
     def size(self, *, action: str, price: float, equity: float, bars: list[Bar],
-             risk_pct: Optional[float] = None, multiplier: float = 1.0) -> Optional[SizingResult]:
+             risk_pct: Optional[float] = None, multiplier: float = 1.0,
+             available_funds: Optional[float] = None) -> Optional[SizingResult]:
         if price <= 0 or equity <= 0:
             return None
         notes: list[str] = []
@@ -93,9 +94,11 @@ class PositionSizer:
         # jesse.utils.risk_to_qty: qty = risco / distância ao stop
         qty = math.floor(risk_amount / stop_distance)
         max_notional = equity * self.s.max_position_notional_pct
+        if available_funds is not None and available_funds >= 0:
+            max_notional = min(max_notional, available_funds)
         if qty * price > max_notional:
             qty = math.floor(max_notional / price)
-            notes.append(f"limitado a {self.s.max_position_notional_pct:.0%} do equity")
+            notes.append(f"limitado pelos fundos disponíveis/teto ({max_notional:,.0f} USD)")
         if qty < 1:
             return SizingResult(0, 0.0, 0.0, stop_distance, risk_amount, atr_used, notes + ["quantidade < 1"])
         sign = 1 if action == "BUY" else -1
@@ -177,10 +180,19 @@ class RiskGate:
 
     # ------------------------------------------------------------- global
     def check_global(self, *, equity: Optional[float], now: datetime) -> GateResult:
-        """Gates que não dependem do ativo. Chamado uma vez por ciclo."""
+        """Gates que não dependem do ativo. Chamado uma vez por ciclo.
+
+        Com ``relax_limits_when_in_profit`` e o dia em lucro, o limite de entradas, o
+        StoplossGuard e o travão de perdas seguidas não se aplicam: só o kill-switch, a
+        regra PDT da corretora, o drawdown multi-dia e os fundos disponíveis limitam.
+        """
         result = GateResult(True)
         today = now.date()
         self.update_day_baseline(equity, now)
+        day_pct = self.day_pnl_pct(equity)
+        in_profit = bool(self.s.relax_limits_when_in_profit and day_pct is not None and day_pct > 0)
+        if in_profit:
+            result.notes.append(f"dia em lucro ({day_pct:+.2f}%): limites de entradas relaxados")
 
         # Kill-switch diário.
         if self._halted_day == today:
@@ -198,20 +210,21 @@ class RiskGate:
             if ":" not in key:  # pausas globais
                 return result.block(f"pausa {key} até {until.astimezone().strftime('%H:%M')}")
 
-        # StoplossGuard: N stops numa janela.
-        window_start = now - timedelta(minutes=self.s.stoploss_guard_window_minutes)
-        stops = self.db.recent_stop_count(window_start)
-        if stops >= self.s.stoploss_guard_count:
-            until = now + timedelta(minutes=self.s.stoploss_guard_pause_minutes)
-            self.pause("stoploss_guard", until, f"{stops} stops em {self.s.stoploss_guard_window_minutes} min")
-            return result.block("StoplossGuard")
+        if not in_profit:
+            # StoplossGuard: N stops numa janela.
+            window_start = now - timedelta(minutes=self.s.stoploss_guard_window_minutes)
+            stops = self.db.recent_stop_count(window_start)
+            if stops >= self.s.stoploss_guard_count:
+                until = now + timedelta(minutes=self.s.stoploss_guard_pause_minutes)
+                self.pause("stoploss_guard", until, f"{stops} stops em {self.s.stoploss_guard_window_minutes} min")
+                return result.block("StoplossGuard")
 
-        # Perdas consecutivas.
-        losses = self.db.consecutive_losses()
-        if losses >= self.s.consecutive_loss_halt:
-            until = datetime.combine(today + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
-            self.pause("consecutive_losses", until, f"{losses} perdas seguidas")
-            return result.block("perdas consecutivas")
+            # Perdas consecutivas.
+            losses = self.db.consecutive_losses()
+            if losses >= self.s.consecutive_loss_halt:
+                until = datetime.combine(today + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
+                self.pause("consecutive_losses", until, f"{losses} perdas seguidas")
+                return result.block("perdas consecutivas")
 
         # Drawdown multi-dia (pico-vale do equity nos últimos N dias).
         dd = self.recent_drawdown_pct(now)
@@ -225,10 +238,16 @@ class RiskGate:
                 result.size_multiplier *= 0.5
                 result.notes.append(f"zona amarela: drawdown {dd:.2f}% -> tamanho a metade")
 
-        # Limite de entradas por dia.
+        # Limite de entradas por dia (0 = ilimitado; não se aplica em lucro).
         day_start = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc)
-        if self.db.entries_today(day_start) >= self.s.max_trades_per_day:
-            return result.block(f"máximo de {self.s.max_trades_per_day} entradas/dia")
+        if self.s.max_trades_per_day > 0 and not in_profit and self.db.entries_today(day_start) >= self.s.max_trades_per_day:
+            return result.block(f"máximo de {self.s.max_trades_per_day} entradas/dia (dia em perda)")
+
+        # Regra PDT da corretora: contas abaixo do limiar só podem fazer N day trades em 5 dias úteis.
+        if self.s.pdt_guard_enabled and equity is not None and equity < self.s.pdt_equity_threshold:
+            count = self.db.day_trades_since(now - timedelta(days=7))
+            if count >= self.s.pdt_max_day_trades:
+                return result.block(f"regra PDT: {count} day trades em 5 dias úteis com equity < {self.s.pdt_equity_threshold:,.0f} USD")
 
         # VIX.
         if self.events is not None:
@@ -262,9 +281,9 @@ class RiskGate:
         for key, until in self.active_pauses(now).items():
             if key.endswith(f":{symbol}"):
                 return result.block(f"pausa {key.split(':')[0]} até {until.astimezone().strftime('%H:%M')}")
-        last_exit = self.db.last_exit_ts(symbol)
-        if last_exit and now - last_exit < timedelta(minutes=self.s.cooldown_minutes):
-            return result.block(f"cooldown após saída ({self.s.cooldown_minutes} min)")
+        last_exit = self.db.last_exit(symbol)
+        if last_exit and last_exit[1] < 0 and now - last_exit[0] < timedelta(minutes=self.s.cooldown_minutes):
+            return result.block(f"cooldown após saída em perda ({self.s.cooldown_minutes} min)")
         if self.events is not None:
             blackout = self.events.in_earnings_blackout(
                 symbol, self.s.earnings_blackout_days_before, self.s.earnings_blackout_days_after)

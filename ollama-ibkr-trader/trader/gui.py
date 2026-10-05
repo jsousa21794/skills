@@ -652,8 +652,8 @@ class TraderApp(ctk.CTk):
         prot = ["🛑 KILL-SWITCH DIÁRIO ATIVO: sem novas entradas hoje" if p.get("halted") else "✅ Kill-switch diário: inativo"]
         prot += [f"⏸ {k} em pausa até {v}" for k, v in pauses.items()] or ["✅ Sem pausas de proteção ativas"]
         rs = p.get("risk_summary") or {}
-        prot.append(f"Limite diário {rs.get('daily_loss', 0):.0%} · StoplossGuard {rs.get('stoploss_guard')} stops · "
-                    f"cooldown {rs.get('cooldown')} min · máx. {rs.get('max_positions')} posições")
+        prot.append(f"Kill-switch {rs.get('daily_loss', 0):.0%}/dia (para o ciclo) · StoplossGuard {rs.get('stoploss_guard')} stops e "
+                    f"cooldown {rs.get('cooldown')} min só em perda · entradas ilimitadas em lucro (regra PDT e fundos disponíveis mandam)")
         self.risk_protections.configure(text="\n".join(prot))
 
         self._render_gates(p.get("gates_detail"), risk_pct=p.get("risk_pct"))

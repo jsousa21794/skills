@@ -72,34 +72,38 @@ class Settings:
     decision_bar_minutes: int = 5  # indicadores/ATR sobre velas agregadas de N min
     min_confidence: float = 0.65  # piso enquanto não há calibração (confiança composta)
     edge_margin: float = 0.08  # margem acima do break-even do bracket para executar
-    max_open_positions: int = 4
+    max_open_positions: int = 10  # o verdadeiro limite são os fundos disponíveis na corretora
     allow_short: bool = True
     trade_only_rth: bool = True  # só decide em horário regular (09:30-16:00 NY)
     skip_open_minutes: int = 15  # não abre posições nos primeiros N min da sessão
     skip_close_minutes: int = 10  # nem nos últimos N min
     max_bar_age_seconds: int = 180  # ignora dados mais velhos que isto
-    max_trades_per_day: int = 6
+    max_trades_per_day: int = 0  # 0 = sem limite (aplica-se só quando o dia está em perda)
+    relax_limits_when_in_profit: bool = True  # em lucro no dia: sem limite de entradas, sem StoplossGuard, sem travão de perdas seguidas
+    pdt_guard_enabled: bool = True  # contas < 25k USD: máx. 3 day trades em 5 dias úteis (regra da corretora)
+    pdt_equity_threshold: float = 25_000.0
+    pdt_max_day_trades: int = 3
     benchmark_symbol: str = "SPY"  # para alpha no settlement (não é negociado)
 
     # ---- Risco: dimensionamento por volatilidade ---------------------------------
-    risk_per_trade_pct: float = 0.005  # 0,5% do equity por trade (fase de aprendizagem)
-    risk_per_trade_pct_validated: float = 0.01  # 1% quando os gates estatísticos passam
+    risk_per_trade_pct: float = 0.10  # até 10% do equity por trade (limitado pelos fundos disponíveis)
+    risk_per_trade_pct_validated: float = 0.10
     atr_period: int = 14
     atr_stop_multiple: float = 2.0  # stop = k × ATR
     reward_risk_ratio: float = 2.0  # TP = R × distância do stop
     atr_floor_percentile: float = 5.0  # piso de volatilidade (pysystemtrade)
-    max_position_notional_pct: float = 0.30  # máx. 30% do equity num ativo
+    max_position_notional_pct: float = 1.0  # até 100% do equity num ativo; os fundos disponíveis da corretora mandam
     stop_mode: str = "atr"  # "atr" | "fixed"
     stop_loss_pct: float = 0.02  # usados só em stop_mode="fixed"
     take_profit_pct: float = 0.05
     use_trailing_stop: bool = False  # TRAIL em vez de STP no filho de stop
 
     # ---- Risco: protections (freqtrade-style) ------------------------------------
-    daily_loss_limit_pct: float = 0.03  # kill-switch diário
+    daily_loss_limit_pct: float = 0.20  # kill-switch diário: a -20% para o ciclo automaticamente
     stoploss_guard_count: int = 3  # N stops numa janela -> pausa
     stoploss_guard_window_minutes: int = 120
     stoploss_guard_pause_minutes: int = 60
-    cooldown_minutes: int = 30  # por ativo, após qualquer saída
+    cooldown_minutes: int = 30  # por ativo, só após uma saída em perda
     max_drawdown_pct: float = 0.06  # pico-vale do equity nos últimos N dias -> pausa
     max_drawdown_lookback_days: int = 5
     max_drawdown_pause_sessions: int = 1

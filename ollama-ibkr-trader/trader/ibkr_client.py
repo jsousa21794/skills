@@ -304,7 +304,7 @@ class IBKRClient:
 
     def portfolio_state(self) -> dict[str, Any]:
         if not self.connected:
-            return {"connected": False, "net_liq": None, "cash": None,
+            return {"connected": False, "net_liq": None, "cash": None, "available_funds": None, "buying_power": None,
                     "unrealized": None, "realized": None, "positions": []}
         assert self.ib is not None
         positions = []
@@ -324,6 +324,8 @@ class IBKRClient:
             "connected": True,
             "net_liq": self._account_value("NetLiquidation"),
             "cash": self._account_value("TotalCashValue"),
+            "available_funds": self._account_value("AvailableFunds"),
+            "buying_power": self._account_value("BuyingPower"),
             "unrealized": self._account_value("UnrealizedPnL"),
             "realized": self._account_value("RealizedPnL"),
             "positions": positions,

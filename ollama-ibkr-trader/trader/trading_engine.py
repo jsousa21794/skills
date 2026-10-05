@@ -446,6 +446,14 @@ class TradingEngine:
         state = self.ibkr.portfolio_state()
         global_gate = self.gate.check_global(equity=state.get("net_liq"), now=now)
         state["day_pnl_pct"] = self.gate.day_pnl_pct(state.get("net_liq"))
+        if self.gate.halted and self.trading_enabled:
+            # Kill-switch: para o ciclo automaticamente; posições abertas mantêm TP/SL na corretora.
+            self.trading_enabled = False
+            log.critical("Ciclo de trading PARADO automaticamente pelo kill-switch diário (%.0f%%). "
+                         "Posições abertas mantêm os brackets. Reinicia manualmente amanhã.",
+                         self.settings.daily_loss_limit_pct * 100)
+            self._emit_status()
+            return
         for symbol in list(self.settings.symbols):
             if not self.trading_enabled or not self.ibkr.connected:
                 return
@@ -609,7 +617,8 @@ class TradingEngine:
         risk_pct = self.settings.risk_per_trade_pct_validated if self.gates_passed else self.settings.risk_per_trade_pct
         multiplier = global_gate.size_multiplier * sym_gate.size_multiplier
         sizing = self.sizer.size(action=action, price=ctx.snapshot.price, equity=equity, bars=ctx.agg_bars,
-                                 risk_pct=risk_pct, multiplier=multiplier)
+                                 risk_pct=risk_pct, multiplier=multiplier,
+                                 available_funds=state.get("available_funds"))
         if sizing is None:
             return skip("ATR indisponível para dimensionar")
         if sizing.qty < 1:

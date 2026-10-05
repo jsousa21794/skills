@@ -339,6 +339,30 @@ class Database:
         )
         return datetime.fromisoformat(rows[0]["exit_ts"]) if rows else None
 
+    def last_exit(self, symbol: str) -> Optional[tuple[datetime, float]]:
+        rows = self._query(
+            "SELECT exit_ts, pnl FROM trades WHERE symbol=? AND exit_ts IS NOT NULL ORDER BY exit_ts DESC LIMIT 1",
+            (symbol,),
+        )
+        return (datetime.fromisoformat(rows[0]["exit_ts"]), float(rows[0]["pnl"] or 0.0)) if rows else None
+
+    def day_trades_since(self, since: datetime) -> int:
+        """Round-trips abertos e fechados no mesmo dia (data NY) desde ``since`` (regra PDT)."""
+        from zoneinfo import ZoneInfo
+
+        ny = ZoneInfo("America/New_York")
+        rows = self._query(
+            "SELECT entry_ts, exit_ts FROM trades WHERE entry_ts IS NOT NULL AND exit_ts IS NOT NULL AND exit_ts >= ?",
+            (iso(since),),
+        )
+        n = 0
+        for r in rows:
+            e = datetime.fromisoformat(r["entry_ts"]).astimezone(ny).date()
+            x = datetime.fromisoformat(r["exit_ts"]).astimezone(ny).date()
+            if e == x:
+                n += 1
+        return n
+
     def consecutive_losses(self) -> int:
         rows = self._query("SELECT pnl FROM trades WHERE status='CLOSED' ORDER BY exit_ts DESC LIMIT 50")
         n = 0

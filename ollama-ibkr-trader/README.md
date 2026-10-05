@@ -15,8 +15,12 @@ escuro).
 > capital são as regras de risco, não o modelo. Nunca apontes isto para uma
 > conta real sem passar os gates estatísticos descritos abaixo.
 
-> O modo predefinido é a conta **real**. O risco por trade arranca em 0,5% do
-> equity, com kill-switch diário de 3%; ajusta em `config.json` se quiseres.
+> O modo predefinido é a conta **real**. Risco por trade até **10%** do equity
+> (limitado pelos fundos disponíveis da corretora), **entradas ilimitadas
+> enquanto o dia está em lucro** (só a regra PDT e os fundos disponíveis
+> limitam) e **kill-switch a -20% no dia, que para o ciclo automaticamente**.
+> Em dia de perda aplicam-se o StoplossGuard, o travão de perdas seguidas e o
+> cooldown após saída em perda. Tudo ajustável em `config.json`.
 
 ## Princípio: o LLM propõe, o código decide
 
@@ -83,12 +87,15 @@ trader.spec, build.sh/.bat   PyInstaller
 
 **Fase 1 — risco em código (zero inferência)**
 - Tamanho por volatilidade: `qty = equity × risco% / (k × ATR)` com piso de ATR
-  no 5.º percentil (pysystemtrade) e teto de 30% do equity por ativo; risco
-  0,5% em aprendizagem, 1% quando os gates passam. Stop = 2×ATR, TP = 2× o stop.
-- Protections: StoplossGuard (3 stops/2 h → pausa 1 h), cooldown 30 min por
-  ativo, MaxDrawdown multi-dia (6% em 5 dias → pausa 1 sessão; 3% → tamanho a
-  metade), 5 perdas seguidas → pausa até ao dia seguinte, 6 entradas/dia,
-  kill-switch −3%/dia.
+  no 5.º percentil (pysystemtrade); risco até 10% do equity, com o notional
+  limitado aos fundos disponíveis reportados pela IBKR (`AvailableFunds`).
+  Stop = 2×ATR, TP = 2× o stop.
+- Protections: kill-switch −20%/dia (para o ciclo; posições mantêm TP/SL),
+  MaxDrawdown multi-dia (6% em 5 dias → pausa 1 sessão; 3% → tamanho a
+  metade), regra PDT para contas < 25k USD (3 day trades/5 dias). Só em dia
+  de perda: StoplossGuard (3 stops/2 h → pausa 1 h), 5 perdas seguidas →
+  pausa até ao dia seguinte, cooldown de 30 min após saída em perda. Em dia
+  de lucro as entradas são ilimitadas.
 - Gate de custos (comissão IBKR 0,005/ação mín. 1 USD + slippage ≤ 25% do
   ganho alvo; notional ≥ 200 USD) e de horário (sem entradas nos primeiros 15
   e últimos 10 min).
