@@ -14,7 +14,7 @@ for pkg in ("customtkinter", "ib_async", "eventkit"):
     binaries += b
     hiddenimports += h
 hiddenimports += collect_submodules("trader")
-hiddenimports += ["nest_asyncio", "tzdata", "zoneinfo", "sqlite3", "requests", "darkdetect"]
+hiddenimports += ["nest_asyncio", "tzdata", "zoneinfo", "sqlite3", "requests", "darkdetect", "yfinance"]
 
 a = Analysis(
     ["main.py"],
@@ -24,7 +24,7 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     runtime_hooks=[],
-    excludes=["matplotlib", "scipy", "IPython", "notebook", "PyQt5", "PySide2"],
+    excludes=["matplotlib", "scipy", "IPython", "notebook", "PyQt5", "PySide2", "torch", "transformers", "chronos"],
     noarchive=False,
 )
 pyz = PYZ(a.pure)

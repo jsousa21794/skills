@@ -1,98 +1,59 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
 
+from trader.analytics import Analytics
+from trader.calibration import Calibrator
 from trader.config import Settings
 from trader.database import Database
+from trader.lessons import LessonEngine
 from trader.ollama_brain import OllamaBrain
-from trader.retrospective import Retrospective, classify
+from trader.retrospective import Retrospective
+from trader.settlement import Settler
 
 
-class FakeBrain(OllamaBrain):
-    """OllamaBrain sem rede: o resumo LLM devolve uma lição fixa."""
-
-    def chat(self, system, user, *, json_mode=True, temperature=None):  # noqa: D401
-        return '["Nunca compres TSLA nos primeiros 5 minutos após a abertura."]'
-
-
-def _seed(db, now, symbol, action, conf, price, rsi, sma_fast, sma_slow, minutes_ago):
-    did = db.insert_decision(
-        symbol=symbol, model="m", action=action, confidence=conf, reason="r",
-        snapshot={"price": price, "rsi": rsi, "sma_fast": sma_fast, "sma_slow": sma_slow, "ema": price,
-                  "change_5m_pct": 0, "change_30m_pct": 0},
-        position_qty=0, net_liq=10000, prompt_version=0, parse_ok=True, raw_response="{}",
-    )
-    ts = (now - timedelta(minutes=minutes_ago)).astimezone(timezone.utc).isoformat()
-    db._execute("UPDATE decisions SET ts=? WHERE id=?", (ts, did))
+def _seed(db, now, action, rsi, conf, minutes_ago):
+    did = db.insert_decision(symbol="TSLA", model="m", action=action, confidence=conf, reason="r",
+                             snapshot={"price": 100.0, "rsi": rsi, "sma_fast": 100, "sma_slow": 100}, position_qty=0,
+                             net_liq=1e5, prompt_version=0, parse_ok=True, raw_response="",
+                             extra={"verbal_conf": conf, "agree_frac": 0.8, "atr": 0.3, "hour_ny": 11, "regime": "alta"})
+    db._execute("UPDATE decisions SET ts=? WHERE id=?", ((now - timedelta(minutes=minutes_ago)).isoformat(), did))
     return did
 
 
-def test_classify():
-    assert classify("BUY", 0.5) == "correct"
-    assert classify("BUY", -0.5) == "wrong"
-    assert classify("BUY", 0.05) == "neutral"
-    assert classify("SELL", -0.3) == "correct"
-    assert classify("SELL", 0.3) == "wrong"
-    assert classify("HOLD", 1.5) == "missed"
-    assert classify("HOLD", 0.2) == "correct"
-
-
-def test_retrospective_builds_lessons_and_raises_threshold(tmp_path):
-    settings = Settings()
-    settings.min_confidence = 0.65
-    settings.retro_use_llm_summary = True
+def test_retrospective_settles_builds_lessons_and_reports():
+    s = Settings()
+    s.calibration_min_samples = 10_000  # não ajusta aqui
     db = Database(":memory:")
-    brain = FakeBrain(settings, db)
+    brain = OllamaBrain(s, db)
     now = datetime.now(timezone.utc)
+    ids = []
+    for i in range(16):
+        ids.append(_seed(db, now, "BUY", 80, 0.9, 120 + i * 5))  # sobrecompra, preço cai -> erradas
+    for i in range(16):
+        ids.append(_seed(db, now, "BUY", 50, 0.7, 400 + i * 5))  # neutras, preço sobe -> certas
 
-    # Série de preços sintética: TSLA cai 2% ao longo de 2h.
-    series = [(now - timedelta(minutes=120 - i), 200.0 * (1 - 0.02 * i / 120)) for i in range(121)]
+    def price_at(symbol, when):
+        # decisões antigas (>= 400 min) sobem; recentes caem
+        age = (now - when).total_seconds() / 60
+        return 101.0 if age > 300 else 99.0
 
-    # Dois BUYs errados em sobrecompra, com confiança alta, contra a tendência.
-    _seed(db, now, "TSLA", "BUY", 0.9, 200.0, 78, 198, 197, 110)
-    _seed(db, now, "TSLA", "BUY", 0.85, 199.0, 74, 199.5, 200.5, 90)
-    # Um SELL certo com confiança menor.
-    _seed(db, now, "TSLA", "SELL", 0.7, 198.5, 55, 199.5, 200.5, 70)
-    # Resposta inválida registada.
-    did = _seed(db, now, "TSLA", "HOLD", 0.0, 198.0, 50, 199, 200, 60)
-    db._execute("UPDATE decisions SET parse_ok=0 WHERE id=?", (did,))
-
-    async def fetcher(symbol):
-        return series
-
-    retro = Retrospective(settings, db, brain, price_fetcher=fetcher)
+    settler = Settler(s, db, price_at)
+    retro = Retrospective(s, db, brain, settler, LessonEngine(s, db), Calibrator(s, db), Analytics(s, db))
     report = asyncio.run(retro.run(now))
-
     assert not report["skipped"]
-    stats = report["stats"]
-    assert stats["wrong"] == 2 and stats["correct"] >= 1
-    assert stats["wrong_buy_overbought"] == 2  # RSI 78 e 74, ambos >= 70 e o preço caiu
-    lessons = report["active_lessons"]
-    assert any("confiança" in l.lower() for l in lessons)
-    assert any("JSON" in l for l in lessons)
-    assert any("TSLA" in l for l in lessons)  # lição do LLM falso ou do pior ativo
-    assert report["min_confidence"] > 0.65
-    assert settings.min_confidence == report["min_confidence"]
+    assert report["stats"]["settled_now"] == 32
+    assert any("sobrecompra" in l for l in report["new_lessons"])
+    assert "terminad" not in " ".join(report["new_lessons"]).lower()
     assert brain.prompt_version == report["prompt_version"]
-    assert "LIÇÕES DA RETROSPETIVA" in brain.system_prompt()
-    assert len(lessons) <= settings.retro_max_lessons
+    assert "PADRÕES MEDIDOS" in brain.system_prompt()
+    assert report["gates"]["all_passed"] is False and report["report_markdown"].startswith("# Relatório")
+    assert db.latest_prompt_version()["lessons"] == report["active_lessons"]
 
 
-def test_retrospective_without_decisions_is_skipped():
-    settings = Settings()
+def test_retrospective_without_data_is_graceful():
+    s = Settings()
     db = Database(":memory:")
-    brain = FakeBrain(settings, db)
-    report = asyncio.run(Retrospective(settings, db, brain).run())
-    assert report["skipped"]
-
-
-def test_retrospective_falls_back_to_decision_prices():
-    settings = Settings()
-    settings.retro_use_llm_summary = False
-    db = Database(":memory:")
-    brain = FakeBrain(settings, db)
-    now = datetime.now(timezone.utc)
-    _seed(db, now, "AAPL", "BUY", 0.8, 100.0, 50, 99, 98, 90)
-    _seed(db, now, "AAPL", "HOLD", 0.3, 101.0, 55, 99, 98, 50)  # +1% depois de 40 min -> BUY correto
-    report = asyncio.run(Retrospective(settings, db, brain).run(now))
-    assert report["stats"]["decisions_evaluated"] >= 1
-    assert report["stats"]["correct"] == 1
+    brain = OllamaBrain(s, db)
+    retro = Retrospective(s, db, brain, Settler(s, db, lambda *_: None), LessonEngine(s, db), Calibrator(s, db), Analytics(s, db))
+    report = asyncio.run(retro.run(full_report=False))
+    assert report["stats"]["decisions_total"] == 0 and report["new_lessons"] == []

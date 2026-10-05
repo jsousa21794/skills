@@ -149,7 +149,10 @@ class TraderApp(ctk.CTk):
 
         ctk.CTkButton(panel, text="🧠  Retrospetiva agora", fg_color=COLORS["panel_alt"],
                       hover_color=COLORS["border"], command=self._retro).grid(
-            row=7, column=0, sticky="ew", padx=16, pady=(0, 14))
+            row=7, column=0, sticky="ew", padx=16, pady=(0, 6))
+        ctk.CTkButton(panel, text="📊  Relatório estatístico", fg_color=COLORS["panel_alt"],
+                      hover_color=COLORS["border"], command=self._report).grid(
+            row=11, column=0, sticky="ew", padx=16, pady=(0, 14))
 
         status = ctk.CTkFrame(panel, fg_color="transparent")
         status.grid(row=8, column=0, sticky="ew", padx=16)
@@ -161,18 +164,29 @@ class TraderApp(ctk.CTk):
         self.dot_cycle.pack(anchor="w", pady=2)
         self.dot_kill = StatusDot(status, "Kill-switch: inativo")
         self.dot_kill.pack(anchor="w", pady=2)
+        self.dot_data = StatusDot(status, "Dados: a verificar…")
+        self.dot_data.pack(anchor="w", pady=2)
+        self.dot_calib = StatusDot(status, "Calibração: heurística")
+        self.dot_calib.pack(anchor="w", pady=2)
+        self.dot_gates = StatusDot(status, "Gates: em aprendizagem")
+        self.dot_gates.pack(anchor="w", pady=2)
 
         self.lbl_meta = ctk.CTkLabel(panel, text="", text_color=COLORS["muted"], justify="left",
                                      font=ctk.CTkFont(size=11), anchor="w")
         self.lbl_meta.grid(row=9, column=0, sticky="ew", padx=16, pady=(12, 0))
 
-        risk = (f"Risco: SL {self.settings.stop_loss_pct:.0%} · TP {self.settings.take_profit_pct:.0%} · "
-                f"{self.settings.risk_fraction_per_trade:.0%} NetLiq/entrada\n"
-                f"Kill-switch diário: -{self.settings.daily_loss_limit_pct:.0%}\n"
-                f"IBKR {self.settings.ib_host}:{self.settings.ib_port} (clientId {self.settings.ib_client_id})")
+        s = self.settings
+        stop_desc = (f"stop {s.atr_stop_multiple:.1f}×ATR({s.atr_period}) · R:R {s.reward_risk_ratio:.1f}"
+                     if s.stop_mode == "atr" else f"SL {s.stop_loss_pct:.0%} · TP {s.take_profit_pct:.0%}")
+        risk = (f"Risco: {s.risk_per_trade_pct:.2%} do equity/trade · {stop_desc}\n"
+                f"Kill-switch -{s.daily_loss_limit_pct:.0%}/dia · StoplossGuard {s.stoploss_guard_count} stops/"
+                f"{s.stoploss_guard_window_minutes} min · cooldown {s.cooldown_minutes} min\n"
+                f"LLM: a cada {s.llm_interval_minutes} min · {s.llm_samples} amostras · "
+                f"{'2 etapas' if s.llm_two_stage else '1 etapa'} · persistência {s.signal_persistence_cycles} ciclos\n"
+                f"IBKR {s.ib_host}:{s.ib_port} (clientId {s.ib_client_id})")
         ctk.CTkLabel(panel, text=risk, text_color=COLORS["muted"], justify="left",
-                     font=ctk.CTkFont(size=11), anchor="w").grid(row=10, column=0, sticky="ew", padx=16, pady=(8, 16))
-        panel.grid_rowconfigure(11, weight=1)
+                     font=ctk.CTkFont(size=11), anchor="w").grid(row=10, column=0, sticky="ew", padx=16, pady=(8, 10))
+        panel.grid_rowconfigure(12, weight=1)
 
     def _build_portfolio_panel(self) -> None:
         panel = ctk.CTkFrame(self, fg_color=COLORS["panel"], corner_radius=12)
@@ -252,6 +266,9 @@ class TraderApp(ctk.CTk):
     def _refresh_models(self) -> None:
         self.engine.call(self.engine.refresh_models())
 
+    def _report(self) -> None:
+        self.engine.call(self.engine.run_statistical_report())
+
     def _on_model_change(self, model: str) -> None:
         self.engine.call(self.engine.set_model(model))
 
@@ -291,9 +308,15 @@ class TraderApp(ctk.CTk):
             self._update_models(p["models"], p["current"])
         elif event.kind == "decision":
             d, s = p["decision"], p["snapshot"]
+            cal = p.get("calibrated")
             self.lbl_last_decision.configure(
-                text=f"Última decisão: {p['symbol']} → {d['acao']} (conf {d['confianca']:.2f}) "
-                     f"@ {s['price']:.2f} · {d['razao'][:120]}")
+                text=f"Última decisão: {p['symbol']} → {d['acao']} (verbal {d['confianca']:.2f} · acordo "
+                     f"{p.get('agree_frac', 0) * 100:.0f}%{' · p=%.2f' % cal if cal is not None else ''}) "
+                     f"@ {s['price']:.2f} · {d['razao'][:110]}")
+        elif event.kind == "report":
+            for line in p["markdown"].splitlines()[:6]:
+                if line.strip():
+                    self.append_log("INFO", line, "ollama")
         elif event.kind == "retrospective":
             report = p["report"]
             if report.get("skipped"):
@@ -301,6 +324,8 @@ class TraderApp(ctk.CTk):
             else:
                 for lesson in report.get("new_lessons", []):
                     self.append_log("WARNING", f"LIÇÃO: {lesson}", "ollama")
+                if not report.get("new_lessons"):
+                    self.append_log("INFO", "Retrospetiva: sem padrões de falha com suporte suficiente.")
 
     def append_log(self, level: str, message: str, category: str = "") -> None:
         stamp = datetime.now().strftime("%H:%M:%S")
@@ -348,11 +373,25 @@ class TraderApp(ctk.CTk):
         self.dot_ibkr.set(p["ibkr_connected"], "IBKR: ligado (Paper)" if p["ibkr_connected"] else "IBKR: desligado")
         self.dot_ollama.set(p["ollama_ok"], f"Ollama: {p['model']}" if p["ollama_ok"] else "Ollama: indisponível")
         self.dot_cycle.set(p["trading_enabled"] or None, "Ciclo: ativo" if p["trading_enabled"] else "Ciclo: parado")
-        self.dot_kill.set(not p["halted"] if p["halted"] else None,
-                          "Kill-switch: ATIVADO (sem novas entradas hoje)" if p["halted"] else "Kill-switch: inativo")
+        pauses = p.get("pauses") or {}
+        if p["halted"]:
+            self.dot_kill.set(False, "Kill-switch: ATIVADO (sem novas entradas hoje)")
+        elif pauses:
+            self.dot_kill.set(False, "Protections: " + ", ".join(f"{k} até {v}" for k, v in pauses.items()))
+        else:
+            self.dot_kill.set(None, "Kill-switch/protections: inativos")
+        delayed = p.get("data_delayed")
+        self.dot_data.set(None if delayed is None else (not delayed),
+                          "Dados: a verificar…" if delayed is None else ("Dados: ATRASADOS 15 min" if delayed else "Dados: tempo real"))
+        self.dot_calib.set(True if p.get("calibrated") else None,
+                           f"Calibração: Platt ({p.get('calibration_n', 0)} amostras)" if p.get("calibrated")
+                           else f"Calibração: heurística ({p.get('calibration_n', 0)} settled)")
+        self.dot_gates.set(True if p.get("gates_passed") else None,
+                           "Gates: PASSAM" if p.get("gates_passed") else "Gates: em aprendizagem")
         self.lbl_meta.configure(
-            text=f"Prompt v{p['prompt_version']} · {p['lessons']} lições ativas\n"
-                 f"Limiar de confiança: {p['min_confidence']:.2f}\nAtivos: {', '.join(p['symbols'])}")
+            text=f"Prompt v{p['prompt_version']} · {p['lessons']} lições ativas · N experiências {p.get('n_trials', 1)}\n"
+                 f"Risco/trade {p.get('risk_pct', 0):.2%} · piso de confiança {p['min_confidence']:.2f}\n"
+                 f"Ativos: {', '.join(p['symbols'])}")
         if p["trading_enabled"]:
             self.btn_start.configure(state="disabled")
             self.btn_stop.configure(state="normal")

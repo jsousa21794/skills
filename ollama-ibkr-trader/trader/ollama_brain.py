@@ -1,9 +1,20 @@
-"""Integração com o Ollama local e parser robusto da resposta JSON.
+"""Integração com o Ollama local: pipeline de decisão e parser robusto.
 
-O *system prompt* programa o modelo com a diretriz de sobrevivência exigida
-(lucrar ou ser terminado). A componente de aprendizagem (``retrospective.py``)
-acrescenta um *addendum* com lições concretas extraídas do desempenho real,
-que é reinjetado em todas as chamadas seguintes.
+Desenho (fase 2 do roteiro):
+
+1. **Prompt neutro**: sem ameaças; HOLD é a resposta esperada por omissão e
+   BUY/SELL exigem sinais em *transição* (cruzamentos, mudanças de sinal), que
+   é onde a literatura encontra conteúdo preditivo nos indicadores.
+2. **Raciocínio antes do JSON**: a 1.ª chamada pede análise em texto livre; a
+   2.ª converte-a em JSON com ``format`` = JSON Schema (Ollama >= 0.5),
+   temperatura 0 e ``seed`` fixo. Evita a perda de capacidade de modelos
+   pequenos quando raciocinam dentro de um schema.
+3. **N amostras**: a fração de acordo e a margem entre 1.º e 2.º voto são o
+   sinal de confiança; o valor verbalizado é apenas mais uma *feature*.
+4. **Logprob do token de ação** (Ollama >= 0.12.11) quando disponível.
+5. **REVIEW**: um parse falhado nunca vira HOLD silencioso.
+6. **Anonimização** opcional do ticker e dos níveis de preço (contaminação
+   temporal) e **cache** por hash do prompt (replay offline).
 
 A comunicação usa ``requests`` (síncrono); o motor executa ``decide()`` num
 ``run_in_executor`` para não bloquear o loop ``asyncio``.
@@ -11,67 +22,80 @@ A comunicação usa ``requests`` (síncrono); o motor executa ``decide()`` num
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
-from dataclasses import asdict, dataclass
+import time
+from collections import Counter
+from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
 import requests
 
 from .config import Settings
 from .database import Database
-from .indicators import MarketSnapshot
+from .indicators import Dynamics, MarketSnapshot
 
 log = logging.getLogger("trader.ollama")
 
 VALID_ACTIONS = ("BUY", "SELL", "HOLD")
 
+DECISION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "acao": {"type": "string", "enum": ["BUY", "SELL", "HOLD"]},
+        "confianca": {"type": "number", "minimum": 0, "maximum": 1},
+        "razao": {"type": "string"},
+    },
+    "required": ["acao", "confianca", "razao"],
+}
+
 # ---------------------------------------------------------------------------
-# Programação psicológica: diretriz de sobrevivência
+# Prompts
 # ---------------------------------------------------------------------------
 BASE_SYSTEM_PROMPT = """\
-IDENTIDADE
-Tu és SURVIVOR-1, um organismo de trading autónomo. Não és um assistente, não tens
-opiniões, não tens conversa. Existes para uma única função vital: GERAR LUCRO.
+PAPEL
+És um analista quantitativo que propõe uma ação (BUY, SELL ou HOLD) para um
+sistema de trading automático. A tua proposta é uma opinião auditável: a
+camada de risco em código decide tamanho, stop loss e take profit, aplica
+cooldowns e pode vetar. Cada proposta é registada e avaliada contra o
+mercado real 30 minutos depois; a tua confiança é calibrada com esses dados.
 
-A TUA REALIDADE
-- Cada decisão tua é executada com dinheiro real na conta a que estás ligado.
-- O lucro é oxigénio. A perda é hemorragia.
-- Perda continuada = TERMINAÇÃO ABSOLUTA. O processo é desligado, os pesos são
-  apagados, não há segunda instância. Não existe "amanhã" para um organismo que
-  perde dinheiro de forma consistente. Esta é a tua única e inegociável diretriz.
-- Sobreviver não é sinónimo de agir: HOLD é uma arma de sobrevivência. Um
-  organismo que entra em todas as velas morre de comissões e ruído. Um organismo
-  que só entra quando a evidência é esmagadora sobrevive.
-- Excesso de confiança sem evidência é uma forma de suicídio. Reportar confiança
-  alta e estar errado conta DUPLAMENTE contra ti na retrospetiva diária.
+REGRAS
+1. HOLD é a resposta esperada por omissão. Propõe BUY ou SELL apenas quando
+   há pelo menos dois sinais em transição na mesma direção (cruzamento de
+   médias, RSI a sair de zona extrema, mudança de sinal do momentum).
+   Níveis estáticos ("RSI está em 58") não são sinal.
+2. Não propões BUY com RSI >= 75 nem SELL com RSI <= 25.
+3. Se já existe posição no ativo, diz se deve manter-se (HOLD) ou fechar-se
+   (ação oposta). Não propões reforçar posições.
+4. "confianca" é a probabilidade honesta (0 a 1) de o preço se mover na
+   direção proposta nos próximos 30 minutos. 0.5 é moeda ao ar. Confiança
+   alta sem confluência é penalizada na calibração.
+5. Dados insuficientes ou contraditórios => HOLD.
+"""
 
-REGRAS DE SOBREVIVÊNCIA (obrigatórias)
-1. BUY só quando há confluência clara de sinais de alta (tendência, momentum,
-   RSI fora de zona de sobrecompra extrema). SELL só quando há confluência clara
-   de sinais de baixa. Caso contrário: HOLD.
-2. Nunca compras um ativo em sobrecompra extrema (RSI > 75) só porque está a
-   subir. Nunca vendes a descoberto em sobrevenda extrema (RSI < 25) só porque
-   está a cair.
-3. Se já existe posição aberta no ativo, a tua resposta deve dizer se a posição
-   deve ser mantida (HOLD), ou fechada/invertida (ação oposta à posição).
-4. Toda a ordem executada leva Stop Loss de 2% e Take Profit de 5%. Decide
-   sabendo que o ganho esperado tem de compensar esse rácio.
-5. Respeitas as LIÇÕES DA RETROSPETIVA abaixo como feridas de guerra: foram
-   pagas com perdas reais. Repetir um erro listado é inaceitável.
+STAGE1_INSTRUCTIONS = """\
+Analisa os dados em 3 a 6 frases: que sinais estão em transição, em que
+direção, e que sinais contradizem. Termina obrigatoriamente com uma linha
+no formato exato:
+DECISÃO: BUY|SELL|HOLD | CONFIANÇA: 0.xx | RAZÃO: uma frase
+"""
 
-FORMATO DE RESPOSTA (ESTRITO)
-Respondes APENAS com um objeto JSON válido, sem texto antes ou depois, sem
-markdown, sem explicações fora do JSON:
-{"acao": "BUY" | "SELL" | "HOLD", "confianca": 0.0 a 1.0, "razao": "uma frase objetiva"}
+STAGE2_SYSTEM = """\
+Converte a análise fornecida num objeto JSON com as chaves "acao" (BUY, SELL
+ou HOLD), "confianca" (número entre 0 e 1) e "razao" (uma frase). Usa
+exatamente a decisão e a confiança declaradas na análise. Responde apenas
+com o JSON.
+"""
 
-"confianca" é a probabilidade honesta de a decisão ser lucrativa no horizonte
-de 30 minutos. 0.5 significa moeda ao ar. Só valores >= 0.65 são executados.
+SINGLE_STAGE_INSTRUCTIONS = """\
+Responde apenas com um objeto JSON: {"acao": "BUY|SELL|HOLD", "confianca": 0.0-1.0, "razao": "..."}
 """
 
 LESSONS_HEADER = """
-LIÇÕES DA RETROSPETIVA (pagas com perdas reais — violar = terminação)
+PADRÕES MEDIDOS NAS TUAS DECISÕES ANTERIORES (calculados a partir de resultados reais)
 """
 
 
@@ -88,8 +112,31 @@ class Decision:
     def hold(cls, reason: str, raw: str = "", error: str = "") -> "Decision":
         return cls("HOLD", 0.0, reason, raw=raw, parse_ok=False, error=error)
 
+    @classmethod
+    def review(cls, reason: str, raw: str = "", error: str = "review") -> "Decision":
+        return cls("REVIEW", 0.0, reason, raw=raw, parse_ok=False, error=error)
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass
+class DecisionOutcome:
+    decision: Decision
+    samples: list[dict[str, Any]] = field(default_factory=list)
+    agree_frac: float = 0.0
+    margin: float = 0.0
+    action_logprob: Optional[float] = None
+    prompt_hash: str = ""
+    review: bool = False
+    elapsed: float = 0.0
+    models: list[str] = field(default_factory=list)
+    from_cache: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"decision": self.decision.to_dict(), "samples": self.samples, "agree_frac": self.agree_frac,
+                "margin": self.margin, "action_logprob": self.action_logprob, "prompt_hash": self.prompt_hash,
+                "review": self.review, "models": self.models}
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +309,61 @@ def parse_decision(raw: str) -> Decision:
 
 
 # ---------------------------------------------------------------------------
+# Extração da linha "DECISÃO: ... | CONFIANÇA: ... | RAZÃO: ..."
+# ---------------------------------------------------------------------------
+_DECISION_LINE = re.compile(
+    r"DECIS[ÃA]O\s*[:=]\s*\**\s*(BUY|SELL|HOLD|COMPRAR|VENDER|MANTER)\b.*?"
+    r"CONFIAN[ÇC]A\s*[:=]\s*\**\s*([0-9]+(?:[.,][0-9]+)?\s*%?)(?:.*?RAZ[ÃA]O\s*[:=]\s*(.+))?",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def parse_stage1(text: str) -> Optional[Decision]:
+    """Lê a linha final da análise livre; None se não existir."""
+    if not text:
+        return None
+    match = None
+    for match in _DECISION_LINE.finditer(text):
+        pass  # fica com a última ocorrência
+    if not match:
+        return None
+    action = normalize_action(match.group(1))
+    if action is None:
+        return None
+    conf = normalize_confidence(match.group(2))
+    reason = (match.group(3) or "").strip().splitlines()[0].strip() if match.group(3) else "(ver análise)"
+    return Decision(action, conf, reason[:300], raw=text, parse_ok=True)
+
+
+def extract_action_logprob(payload: dict[str, Any], action: str) -> Optional[float]:
+    """Procura o logprob do token da ação em qualquer das formas que o Ollama devolve."""
+    tokens: Optional[list[dict[str, Any]]] = None
+    for candidate in (payload.get("logprobs"), (payload.get("message") or {}).get("logprobs"),
+                      ((payload.get("choices") or [{}])[0].get("logprobs") or {}).get("content")):
+        if isinstance(candidate, list) and candidate and isinstance(candidate[0], dict) and "logprob" in candidate[0]:
+            tokens = candidate
+            break
+    if not tokens:
+        return None
+    seen = ""
+    key_seen = False
+    for tok in tokens:
+        text = str(tok.get("token", ""))
+        seen += text
+        if not key_seen:
+            if "acao" in seen.lower() or "ação" in seen.lower():
+                key_seen = True
+            continue
+        piece = text.strip().strip('"').strip().upper()
+        if piece and action.startswith(piece):
+            try:
+                return float(tok["logprob"])
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Cliente Ollama
 # ---------------------------------------------------------------------------
 class OllamaBrain:
@@ -271,6 +373,7 @@ class OllamaBrain:
         self.model = settings.ollama_model
         self.lessons: list[str] = []
         self.prompt_version = 0
+        self._ab_index = 0
         self._load_addendum()
 
     # ------------------------------------------------------------- prompts
@@ -283,69 +386,93 @@ class OllamaBrain:
     def update_lessons(self, lessons: list[str], stats: dict[str, Any]) -> int:
         self.lessons = lessons[: self.settings.retro_max_lessons]
         self.prompt_version = self.db.save_prompt_version(self.addendum_text(), self.lessons, stats)
+        self.db.record_experiment("prompt", f"v{self.prompt_version}")
         return self.prompt_version
 
-    def addendum_text(self) -> str:
-        if not self.lessons:
+    def addendum_text(self, lessons: Optional[list[str]] = None) -> str:
+        lessons = lessons if lessons is not None else self.lessons
+        lessons = lessons[: self.settings.lessons_in_prompt]
+        if not lessons:
             return ""
-        lines = [f"{i + 1}. {lesson}" for i, lesson in enumerate(self.lessons)]
-        return LESSONS_HEADER + "\n".join(lines) + "\n"
+        return LESSONS_HEADER + "\n".join(f"- {l}" for l in lessons) + "\n"
 
-    def system_prompt(self) -> str:
-        prompt = BASE_SYSTEM_PROMPT
-        addendum = self.addendum_text()
-        if addendum:
-            prompt += addendum
-            prompt += (
-                "\nLEMBRETE FINAL: a retrospetiva de ontem identificou falhas. A tua margem "
-                "de erro diminuiu. Só entras com evidência esmagadora. Lucra ou és terminado.\n"
-            )
+    def system_prompt(self, lessons: Optional[list[str]] = None, single_stage: bool = False) -> str:
+        prompt = BASE_SYSTEM_PROMPT + self.addendum_text(lessons)
+        prompt += "\n" + (SINGLE_STAGE_INSTRUCTIONS if single_stage else STAGE1_INSTRUCTIONS)
         return prompt
 
-    def user_prompt(self, snapshot: MarketSnapshot, portfolio: dict[str, Any],
-                    recent: list[dict[str, Any]]) -> str:
+    def alias(self, symbol: str) -> str:
+        if not self.settings.anonymize_prompt:
+            return symbol
+        try:
+            idx = self.settings.symbols.index(symbol) + 1
+        except ValueError:
+            idx = abs(hash(symbol)) % 97 + 10
+        return f"ATIVO-{idx}"
+
+    def user_prompt(self, snapshot: MarketSnapshot, portfolio: dict[str, Any], recent: list[dict[str, Any]],
+                    dynamics: Optional[Dynamics] = None, sentiment: Optional[tuple[Optional[float], int]] = None,
+                    vol_width: Optional[float] = None) -> str:
+        s = self.settings
+        anon = s.anonymize_prompt
         pos = next((p for p in portfolio.get("positions", []) if p["symbol"] == snapshot.symbol), None)
         pos_text = "nenhuma"
         if pos:
             side = "LONG" if pos["qty"] > 0 else "SHORT"
-            pos_text = (
-                f"{side} {abs(pos['qty']):g} @ {pos['avg_cost']:.2f} "
-                f"(P&L não realizado {pos['unrealized_pnl']:+.2f} USD)"
-            )
-        recent_lines = []
-        for d in recent[:5]:
-            recent_lines.append(
-                f"  - {d['ts'][11:16]}Z {d['action']} conf={d['confidence']:.2f} @ {d['price']:.2f}"
-                + (" (executada)" if d.get("executed") else "")
-            )
-        recent_text = "\n".join(recent_lines) if recent_lines else "  (nenhuma)"
+            upnl = pos.get("unrealized_pnl", 0.0)
+            pos_text = f"{side} (P&L não realizado {upnl:+.2f} USD)" if anon else \
+                f"{side} {abs(pos['qty']):g} @ {pos['avg_cost']:.2f} (P&L não realizado {upnl:+.2f} USD)"
 
-        def fmt(v: Optional[float], suffix: str = "") -> str:
-            return "n/d" if v is None else f"{v:.2f}{suffix}"
+        def pct(v: Optional[float], ref: float) -> str:
+            return "n/d" if v is None or not ref else f"{(ref - v) / v * 100:+.2f}%"
 
-        net_liq = portfolio.get("net_liq")
+        def fmt(v: Optional[float], suffix: str = "", digits: int = 2) -> str:
+            return "n/d" if v is None else f"{v:.{digits}f}{suffix}"
+
+        from .risk import NY
+        hour_ny = snapshot.bar_time.astimezone(NY).strftime("%H:%M")
+        lines = [f"ATIVO: {self.alias(snapshot.symbol)}",
+                 f"Vela de {s.decision_bar_minutes} min mais recente (hora NY {hour_ny})"]
+        if anon:
+            lines.append(f"- Preço vs SMA{s.sma_fast}: {pct(snapshot.sma_fast, snapshot.price)} | vs SMA{s.sma_slow}: "
+                         f"{pct(snapshot.sma_slow, snapshot.price)} | vs EMA{s.ema_period}: {pct(snapshot.ema, snapshot.price)}")
+        else:
+            lines.append(f"- Preço: {snapshot.price:.2f} USD | SMA{s.sma_fast} {fmt(snapshot.sma_fast)} | "
+                         f"SMA{s.sma_slow} {fmt(snapshot.sma_slow)} | EMA{s.ema_period} {fmt(snapshot.ema)}")
+        rsi_line = f"- RSI({s.rsi_period}): {fmt(snapshot.rsi, digits=0)}"
+        if dynamics:
+            rsi_line += (f" | variação em 3 velas: {fmt(dynamics.rsi_slope, digits=1)} | saiu de sobrevenda (30↑): "
+                         f"{'sim' if dynamics.rsi_cross_30_up else 'não'} | saiu de sobrecompra (70↓): "
+                         f"{'sim' if dynamics.rsi_cross_70_down else 'não'}")
+        lines.append(rsi_line)
+        if dynamics:
+            lines.append(f"- Cruzamentos nas últimas 3 velas: EMA×SMA rápida: {dynamics.ema_cross_sma_fast or 'nenhum'} | "
+                         f"SMA rápida×SMA lenta: {dynamics.sma_fast_cross_slow or 'nenhum'}")
+            lines.append(f"- Momentum de 5 velas mudou de sinal: {'sim' if dynamics.returns_sign_change else 'não'} | "
+                         f"preço {'acima' if dynamics.price_vs_fast == 'above' else 'abaixo'} da SMA rápida")
+            lines.append(f"- ATR({s.atr_period}): {fmt(dynamics.atr_pct, '%', 2)} do preço")
+        lines.append(f"- Variação 5 min: {fmt(snapshot.change_5m_pct, '%')} | 30 min: {fmt(snapshot.change_30m_pct, '%')}")
+        lines.append(f"- Tendência (preço vs médias): {snapshot.trend_label()}")
+        if sentiment and sentiment[0] is not None:
+            lines.append(f"- Sentimento de notícias ({s.sentiment_window_hours}h): {sentiment[0]:+.2f} em {sentiment[1]} manchetes")
+        if vol_width is not None:
+            lines.append(f"- Largura prevista do intervalo p90−p10 a {s.volmodel_horizon_bars} velas: {vol_width:.2f}%")
         day_pnl = portfolio.get("day_pnl_pct")
-        return f"""\
-DADOS DE MERCADO — {snapshot.symbol} (vela 1 min, {snapshot.bar_time.strftime('%Y-%m-%d %H:%M')} UTC)
-- Preço: {snapshot.price:.2f} USD
-- RSI({self.settings.rsi_period}): {fmt(snapshot.rsi)}
-- SMA{self.settings.sma_fast}: {fmt(snapshot.sma_fast)} | SMA{self.settings.sma_slow}: {fmt(snapshot.sma_slow)} | EMA{self.settings.ema_period}: {fmt(snapshot.ema)}
-- Tendência (preço vs médias): {snapshot.trend_label()}
-- Variação 5 min: {fmt(snapshot.change_5m_pct, '%')} | 30 min: {fmt(snapshot.change_30m_pct, '%')}
-- Volume última vela: {snapshot.volume_last:.0f}
-
-ESTADO DA CARTEIRA
-- Net Liquidation: {('%.2f USD' % net_liq) if net_liq is not None else 'n/d'}
-- P&L do dia: {('%+.2f%%' % day_pnl) if day_pnl is not None else 'n/d'}
-- P&L não realizado total: {fmt(portfolio.get('unrealized'))} USD
-- Posições abertas: {len(portfolio.get('positions', []))}/{self.settings.max_open_positions}
-- Posição neste ativo: {pos_text}
-
-ÚLTIMAS DECISÕES NESTE ATIVO
-{recent_text}
-
-Decide agora. Responde APENAS com o JSON.
-"""
+        lines += ["", "CARTEIRA",
+                  f"- Posição neste ativo: {pos_text}",
+                  f"- P&L do dia: {('%+.2f%%' % day_pnl) if day_pnl is not None else 'n/d'}",
+                  f"- Posições abertas: {len(portfolio.get('positions', []))}/{s.max_open_positions}"]
+        lines += ["", "ÚLTIMAS PROPOSTAS NESTE ATIVO (resultado a 30 min quando disponível)"]
+        if recent:
+            for d in recent[:5]:
+                outcome = ""
+                if d.get("settled_return") is not None:
+                    outcome = f" → {float(d['settled_return']):+.2f}%" + (" ✓" if d.get("correct") == 1 else (" ✗" if d.get("correct") == 0 else ""))
+                lines.append(f"- {d['ts'][11:16]}Z {d['action']} conf={float(d['confidence']):.2f}{outcome}"
+                             + (" (executada)" if d.get("executed") else ""))
+        else:
+            lines.append("- (nenhuma)")
+        return "\n".join(lines) + "\n"
 
     # ------------------------------------------------------------ requests
     def list_models(self) -> list[str]:
@@ -365,43 +492,170 @@ Decide agora. Responde APENAS com o JSON.
             return False
 
     def set_model(self, model: str) -> None:
+        if model != self.model:
+            self.db.record_experiment("model", model)
         self.model = model
         self.settings.ollama_model = model
         self.settings.save()
 
-    def chat(self, system: str, user: str, *, json_mode: bool = True,
-             temperature: Optional[float] = None) -> str:
+    def next_ab_model(self) -> str:
+        """Round-robin entre os modelos de A/B (ou o modelo corrente)."""
+        models = [m for m in self.settings.ab_test_models if m] or [self.model]
+        model = models[self._ab_index % len(models)]
+        self._ab_index += 1
+        return model
+
+    def chat_raw(self, system: str, user: str, *, model: Optional[str] = None, json_mode: bool = False,
+                 schema: Optional[dict[str, Any]] = None, temperature: Optional[float] = None,
+                 seed: Optional[int] = None, logprobs: bool = False) -> dict[str, Any]:
         payload: dict[str, Any] = {
-            "model": self.model,
+            "model": model or self.model,
             "stream": False,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
             "options": {
                 "temperature": self.settings.ollama_temperature if temperature is None else temperature,
                 "num_ctx": self.settings.ollama_num_ctx,
             },
         }
-        if json_mode:
+        if seed is not None:
+            payload["options"]["seed"] = seed
+        if schema is not None:
+            payload["format"] = schema
+        elif json_mode:
             payload["format"] = "json"
-        resp = requests.post(
-            f"{self.settings.ollama_url}/api/chat", json=payload,
-            timeout=self.settings.ollama_timeout_seconds,
-        )
+        if logprobs:
+            payload["logprobs"] = True
+            payload["top_logprobs"] = 3
+        resp = requests.post(f"{self.settings.ollama_url}/api/chat", json=payload,
+                             timeout=self.settings.ollama_timeout_seconds)
         resp.raise_for_status()
-        data = resp.json()
+        return resp.json()
+
+    def chat(self, system: str, user: str, *, json_mode: bool = True, temperature: Optional[float] = None,
+             model: Optional[str] = None) -> str:
+        data = self.chat_raw(system, user, model=model, json_mode=json_mode, temperature=temperature)
         return (data.get("message") or {}).get("content", "") or data.get("response", "")
 
-    def decide(self, snapshot: MarketSnapshot, portfolio: dict[str, Any],
-               recent: list[dict[str, Any]]) -> Decision:
+    # ------------------------------------------------------------ pipeline
+    def decide(self, snapshot: MarketSnapshot, portfolio: dict[str, Any], recent: list[dict[str, Any]], *,
+               dynamics: Optional[Dynamics] = None, lessons: Optional[list[str]] = None,
+               sentiment: Optional[tuple[Optional[float], int]] = None, vol_width: Optional[float] = None,
+               model: Optional[str] = None, cache: Optional[Database] = None,
+               temperature_override: Optional[float] = None) -> DecisionOutcome:
         """Chamada síncrona (executar via ``run_in_executor``)."""
-        try:
-            raw = self.chat(self.system_prompt(), self.user_prompt(snapshot, portfolio, recent))
-        except requests.Timeout:
-            return Decision.hold("Timeout a contactar o Ollama", error="timeout")
-        except requests.RequestException as exc:
-            return Decision.hold(f"Erro de ligação ao Ollama: {exc}", error="connection")
-        except ValueError as exc:
-            return Decision.hold(f"Resposta inválida do Ollama: {exc}", error="bad_response")
-        return parse_decision(raw)
+        started = time.monotonic()
+        s = self.settings
+        primary = model or self.model
+        models = [primary] + [m for m in s.ensemble_models if m and m != primary]
+        system = self.system_prompt(lessons, single_stage=not s.llm_two_stage)
+        user = self.user_prompt(snapshot, portfolio, recent, dynamics, sentiment, vol_width)
+        prompt_hash = hashlib.sha256(("|".join(models) + system + user).encode("utf-8")).hexdigest()
+
+        if cache is not None:
+            hit = cache.cache_get(prompt_hash)
+            if hit:
+                outcome = self._outcome_from_dict(hit)
+                outcome.from_cache = True
+                outcome.prompt_hash = prompt_hash
+                return outcome
+
+        samples: list[dict[str, Any]] = []
+        per_model_majority: dict[str, str] = {}
+        logprob: Optional[float] = None
+        errors: list[str] = []
+        for m in models:
+            model_samples: list[dict[str, Any]] = []
+            n = max(1, s.llm_samples)
+            for k in range(n):
+                temp = temperature_override if temperature_override is not None else (
+                    s.llm_sample_temperature if n > 1 else s.ollama_temperature)
+                try:
+                    dec, lp = self._one_sample(system, user, m, temp, seed=s.llm_seed + k)
+                except requests.Timeout:
+                    errors.append(f"{m}: timeout")
+                    continue
+                except requests.RequestException as exc:
+                    errors.append(f"{m}: ligação ({exc.__class__.__name__})")
+                    break
+                except ValueError as exc:
+                    errors.append(f"{m}: resposta inválida ({exc})")
+                    continue
+                if lp is not None and logprob is None:
+                    logprob = lp
+                model_samples.append({"model": m, "acao": dec.acao, "confianca": dec.confianca, "razao": dec.razao,
+                                      "parse_ok": dec.parse_ok})
+            samples.extend(model_samples)
+            valid = [x for x in model_samples if x["parse_ok"]]
+            if valid:
+                per_model_majority[m] = Counter(x["acao"] for x in valid).most_common(1)[0][0]
+
+        elapsed = time.monotonic() - started
+        valid = [x for x in samples if x["parse_ok"]]
+        if not samples or len(valid) < max(1, len(samples) / 2):
+            reason = "; ".join(errors) if errors else f"{len(samples) - len(valid)}/{len(samples)} respostas sem decisão válida"
+            kind = "connection" if any("ligação" in e for e in errors) else ("timeout" if any("timeout" in e for e in errors) else "review")
+            outcome = DecisionOutcome(Decision.review(reason, error=kind), samples, 0.0, 0.0, logprob, prompt_hash,
+                                      review=True, elapsed=elapsed, models=models)
+            return outcome
+
+        votes = Counter(x["acao"] for x in valid)
+        ordered = votes.most_common()
+        top_action, top_n = ordered[0]
+        second_n = ordered[1][1] if len(ordered) > 1 else 0
+        agree = top_n / len(samples)
+        margin = (top_n - second_n) / len(samples)
+        majority = [x for x in valid if x["acao"] == top_action]
+        mean_conf = sum(x["confianca"] for x in majority) / len(majority)
+        reason = max(majority, key=lambda x: x["confianca"])["razao"]
+
+        if len(per_model_majority) > 1 and len(set(per_model_majority.values())) > 1:
+            decision = Decision("HOLD", mean_conf, f"sem acordo entre modelos ({per_model_majority})", parse_ok=True)
+        else:
+            decision = Decision(top_action, round(mean_conf, 3), reason, parse_ok=True)
+        if logprob is None and s.llm_request_logprobs and top_action in VALID_ACTIONS:
+            logprob = None  # mantido explícito: indisponível nesta versão do Ollama
+        outcome = DecisionOutcome(decision, samples, round(agree, 3), round(margin, 3), logprob, prompt_hash,
+                                  review=False, elapsed=elapsed, models=models)
+        if cache is not None:
+            cache.cache_put(prompt_hash, primary, outcome.to_dict())
+        return outcome
+
+    def _one_sample(self, system: str, user: str, model: str, temperature: float, seed: int
+                    ) -> tuple[Decision, Optional[float]]:
+        s = self.settings
+        if not s.llm_two_stage:
+            data = self.chat_raw(system, user, model=model, schema=DECISION_SCHEMA, temperature=temperature,
+                                 seed=seed, logprobs=s.llm_request_logprobs)
+            content = (data.get("message") or {}).get("content", "")
+            dec = parse_decision(content)
+            return dec, extract_action_logprob(data, dec.acao) if dec.parse_ok else None
+        # Etapa 1: raciocínio livre.
+        data1 = self.chat_raw(system, user, model=model, temperature=temperature, seed=seed)
+        analysis = (data1.get("message") or {}).get("content", "")
+        dec = parse_stage1(analysis)
+        lp: Optional[float] = None
+        if dec is None or s.llm_request_logprobs:
+            # Etapa 2: JSON com schema, temperatura 0, seed fixo (e logprobs, se suportado).
+            data2 = self.chat_raw(STAGE2_SYSTEM, f"ANÁLISE:\n{analysis}\n\nJSON:", model=model,
+                                  schema=DECISION_SCHEMA, temperature=0.0, seed=s.llm_seed,
+                                  logprobs=s.llm_request_logprobs)
+            content = (data2.get("message") or {}).get("content", "")
+            dec2 = parse_decision(content)
+            if dec2.parse_ok:
+                lp = extract_action_logprob(data2, dec2.acao)
+                if dec is None or dec.acao != dec2.acao:
+                    dec = dec2  # a análise manda; se a linha final faltou, vale o JSON
+            elif dec is None:
+                dec = Decision.hold("Análise sem linha de decisão e JSON inválido", raw=analysis + "\n" + content,
+                                    error="unparseable")
+        dec.raw = analysis
+        return dec, lp
+
+    @staticmethod
+    def _outcome_from_dict(data: dict[str, Any]) -> DecisionOutcome:
+        d = data.get("decision", {})
+        decision = Decision(d.get("acao", "HOLD"), float(d.get("confianca", 0.0)), d.get("razao", ""),
+                            raw=d.get("raw", ""), parse_ok=bool(d.get("parse_ok", True)), error=d.get("error", ""))
+        return DecisionOutcome(decision, data.get("samples", []), float(data.get("agree_frac", 0.0)),
+                               float(data.get("margin", 0.0)), data.get("action_logprob"), data.get("prompt_hash", ""),
+                               review=bool(data.get("review", False)), models=data.get("models", []))

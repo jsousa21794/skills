@@ -23,11 +23,12 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
 
 try:  # ib_async é o fork mantido do ib_insync (arquivado em 2024); mesma API.
-    from ib_async import IB, BarDataList, Contract, Fill, LimitOrder, MarketOrder, Stock, StopOrder, Trade
+    from ib_async import IB, BarDataList, Contract, Fill, LimitOrder, MarketOrder, Order, Stock, StopOrder, Trade
 except ImportError:  # pragma: no cover - instalação antiga com ib_insync
-    from ib_insync import IB, BarDataList, Contract, Fill, LimitOrder, MarketOrder, Stock, StopOrder, Trade  # type: ignore
+    from ib_insync import IB, BarDataList, Contract, Fill, LimitOrder, MarketOrder, Order, Stock, StopOrder, Trade  # type: ignore
 
 from .config import Settings
+from .indicators import Bar
 
 log = logging.getLogger("trader.ibkr")
 
@@ -59,6 +60,10 @@ class IBKRClient:
         self._on_order_status = on_order_status
         self._on_disconnect = on_disconnect
         self._connecting = False
+        self._disconnect_handled = False
+        self.data_delayed: Optional[bool] = None  # True quando o feed é atrasado (paper sem subscrição)
+        self._hist_times: list[float] = []  # pacing de pedidos históricos
+        self._hist_lock: Optional[asyncio.Lock] = None
 
     # ----------------------------------------------------------- ligação
     @property
@@ -82,6 +87,7 @@ class IBKRClient:
                 clientId=self.settings.ib_client_id, timeout=15,
             )
             self.ib.reqMarketDataType(self.settings.market_data_type)
+            self._disconnect_handled = False
             accounts = self.ib.managedAccounts()
             log.info("IBKR ligado (%s:%s) conta(s): %s",
                      self.settings.ib_host, self.settings.ib_port, ", ".join(accounts) or "?")
@@ -113,6 +119,10 @@ class IBKRClient:
         log.warning("IBKR erro %s (req %s): %s", errorCode, reqId, errorString)
 
     def _handle_disconnected(self) -> None:
+        # ib_async 2.1 dispara disconnectedEvent duas vezes (issue #207): handler idempotente.
+        if self._disconnect_handled:
+            return
+        self._disconnect_handled = True
         log.error("Ligação à IBKR perdida.")
         self._bars.clear()
         if self._on_disconnect:
@@ -153,6 +163,7 @@ class IBKRClient:
         contract = await self.qualify(symbol)
         if contract is None:
             return False
+        await self._pace_historical()
         bars = await self.ib.reqHistoricalDataAsync(
             contract,
             endDateTime="",
@@ -177,7 +188,62 @@ class IBKRClient:
 
         bars.updateEvent += _relay
         log.info("Subscrito %s: %d velas de %s carregadas", symbol, len(bars), self.settings.bar_size)
+        if self.data_delayed is None:
+            await self._check_market_data_type(contract)
         return True
+
+    async def _check_market_data_type(self, contract: Contract) -> None:
+        """Verifica se o feed é atrasado (paper sem subscrição: 15 min para ações US)."""
+        assert self.ib is not None
+        try:
+            ticker = self.ib.reqMktData(contract, "", False, False)
+            await asyncio.sleep(2.0)
+            mdt = getattr(ticker, "marketDataType", None)
+            self.ib.cancelMktData(contract)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("Não foi possível verificar marketDataType: %s", exc)
+            return
+        if mdt in (3, 4):
+            self.data_delayed = True
+            log.warning("ATENÇÃO: dados de mercado ATRASADOS (marketDataType=%s, ~15 min). Métricas de qualidade "
+                        "do LLM medidas com este feed não são válidas; subscreva dados em tempo real para avaliar.", mdt)
+        elif mdt in (1, 2):
+            self.data_delayed = False
+            log.info("Dados de mercado em tempo real (marketDataType=%s).", mdt)
+
+    async def _pace_historical(self) -> None:
+        """Pacing IBKR: <= 60 pedidos históricos por 10 min e >= 2 s entre pedidos."""
+        import time as _time
+
+        if self._hist_lock is None:
+            self._hist_lock = asyncio.Lock()
+        async with self._hist_lock:
+            now = _time.monotonic()
+            self._hist_times = [t for t in self._hist_times if now - t < 600]
+            if len(self._hist_times) >= 58:
+                wait = 600 - (now - self._hist_times[0]) + 1
+                log.warning("Pacing IBKR: a aguardar %.0fs antes de novo pedido histórico.", wait)
+                await asyncio.sleep(wait)
+            elif self._hist_times and now - self._hist_times[-1] < 2.0:
+                await asyncio.sleep(2.0 - (now - self._hist_times[-1]))
+            self._hist_times.append(_time.monotonic())
+
+    def bars_as_list(self, symbol: str) -> list[Bar]:
+        raw = self._bars.get(symbol)
+        if not raw:
+            return []
+        return [Bar(self.bar_time_utc(b), float(b.open), float(b.high), float(b.low), float(b.close), float(b.volume))
+                for b in raw]
+
+    def price_at(self, symbol: str, when: datetime) -> Optional[float]:
+        """Fecho da primeira vela em memória com tempo >= ``when`` (para settlement)."""
+        raw = self._bars.get(symbol)
+        if not raw:
+            return None
+        for b in raw:
+            if self.bar_time_utc(b) >= when:
+                return float(b.close)
+        return None
 
     def bars(self, symbol: str) -> Optional[BarDataList]:
         return self._bars.get(symbol)
@@ -190,6 +256,7 @@ class IBKRClient:
         contract = await self.qualify(symbol)
         if contract is None:
             return []
+        await self._pace_historical()
         bars = await self.ib.reqHistoricalDataAsync(
             contract, endDateTime="", durationStr=duration, barSizeSetting=bar_size,
             whatToShow="TRADES", useRTH=False, formatDate=2, keepUpToDate=False,
@@ -256,12 +323,13 @@ class IBKRClient:
 
     # ------------------------------------------------------------ ordens
     async def place_bracket(
-        self, symbol: str, action: str, quantity: int, ref_price: float,
-        stop_loss_pct: float, take_profit_pct: float,
+        self, symbol: str, action: str, quantity: int, ref_price: float, *,
+        stop_price: float, tp_price: float, trailing: bool = False,
     ) -> Optional[dict[str, Any]]:
-        """Entrada a MERCADO com filhos TP (limit) e SL (stop) ligados por ``parentId``.
+        """Entrada a MERCADO com filhos TP (limit) e SL (stop ou trailing) ligados por ``parentId``.
 
-        Os filhos são OCA (um cancela o outro) por partilharem o mesmo parent.
+        Os filhos partilham um ``ocaGroup`` (um cancela o outro) e são GTC explícitos:
+        o default de ``tif`` cai em DAY e deixaria a posição sem proteção overnight.
         """
         if not self.connected or quantity <= 0:
             return None
@@ -271,32 +339,38 @@ class IBKRClient:
             return None
         action = action.upper()
         reverse = "SELL" if action == "BUY" else "BUY"
-        if action == "BUY":
-            tp_price = round_tick(ref_price * (1 + take_profit_pct))
-            sl_price = round_tick(ref_price * (1 - stop_loss_pct))
-        else:
-            tp_price = round_tick(ref_price * (1 - take_profit_pct))
-            sl_price = round_tick(ref_price * (1 + stop_loss_pct))
+        tp_price = round_tick(tp_price)
+        stop_price = round_tick(stop_price)
 
         parent = MarketOrder(action, quantity)
         parent.orderId = self.ib.client.getReqId()
         parent.transmit = False
-        parent.tif = "GTC"
+        parent.tif = "DAY"  # a entrada é só para hoje
+        oca = f"OCA-{symbol}-{parent.orderId}"
         take_profit = LimitOrder(reverse, quantity, tp_price)
         take_profit.orderId = self.ib.client.getReqId()
         take_profit.parentId = parent.orderId
         take_profit.transmit = False
         take_profit.tif = "GTC"
-        stop_loss = StopOrder(reverse, quantity, sl_price)
+        take_profit.ocaGroup = oca
+        take_profit.ocaType = 1
+        if trailing:
+            trail_amount = abs(ref_price - stop_price)
+            stop_loss = Order(action=reverse, totalQuantity=quantity, orderType="TRAIL", auxPrice=round_tick(trail_amount),
+                              trailStopPrice=stop_price)
+        else:
+            stop_loss = StopOrder(reverse, quantity, stop_price)
         stop_loss.orderId = self.ib.client.getReqId()
         stop_loss.parentId = parent.orderId
         stop_loss.transmit = True  # transmite o grupo inteiro
         stop_loss.tif = "GTC"
+        stop_loss.ocaGroup = oca
+        stop_loss.ocaType = 1
 
         trades = [self.ib.placeOrder(contract, o) for o in (parent, take_profit, stop_loss)]
         log.info(
-            "Bracket %s %s x%d @~%.2f | TP %.2f | SL %.2f (ids %d/%d/%d)",
-            action, symbol, quantity, ref_price, tp_price, sl_price,
+            "Bracket %s %s x%d @~%.2f | TP %.2f | SL %.2f%s (ids %d/%d/%d)",
+            action, symbol, quantity, ref_price, tp_price, stop_price, " TRAIL" if trailing else "",
             parent.orderId, take_profit.orderId, stop_loss.orderId,
         )
         return {
@@ -304,9 +378,48 @@ class IBKRClient:
             "tp_order_id": take_profit.orderId,
             "sl_order_id": stop_loss.orderId,
             "tp_price": tp_price,
-            "sl_price": sl_price,
+            "sl_price": stop_price,
             "trades": trades,
         }
+
+    async def ensure_protection(self, symbol: str, *, stop_price: float, tp_price: float) -> Optional[dict[str, Any]]:
+        """Coloca TP+SL (OCA, GTC) numa posição que ficou sem ordens de proteção."""
+        if not self.connected:
+            return None
+        assert self.ib is not None
+        qty = self.position_qty(symbol)
+        if qty == 0:
+            return None
+        if self.has_protective_orders(symbol):
+            return None
+        contract = await self.qualify(symbol)
+        if contract is None:
+            return None
+        reverse = "SELL" if qty > 0 else "BUY"
+        n = abs(int(qty))
+        oca = f"OCA-{symbol}-FIX-{self.ib.client.getReqId()}"
+        take_profit = LimitOrder(reverse, n, round_tick(tp_price))
+        stop_loss = StopOrder(reverse, n, round_tick(stop_price))
+        for o in (take_profit, stop_loss):
+            o.orderId = self.ib.client.getReqId()
+            o.tif = "GTC"
+            o.ocaGroup = oca
+            o.ocaType = 1
+            o.transmit = True
+        trades = [self.ib.placeOrder(contract, o) for o in (take_profit, stop_loss)]
+        log.warning("Posição %s x%d SEM proteção: colocados TP %.2f / SL %.2f (ids %d/%d).",
+                    symbol, n, tp_price, stop_price, take_profit.orderId, stop_loss.orderId)
+        return {"tp_order_id": take_profit.orderId, "sl_order_id": stop_loss.orderId, "qty": n,
+                "direction": 1 if qty > 0 else -1, "trades": trades}
+
+    def has_protective_orders(self, symbol: str) -> bool:
+        return any(t.order.orderType in ("STP", "TRAIL", "STP LMT") and t.orderStatus.status not in ("Cancelled", "Filled", "Inactive")
+                   for t in self.open_trades_for(symbol))
+
+    def has_pending_entry(self, symbol: str) -> bool:
+        return any(t.order.parentId == 0 and t.order.orderType == "MKT"
+                   and t.orderStatus.status in ("PreSubmitted", "Submitted", "PendingSubmit")
+                   for t in self.open_trades_for(symbol))
 
     async def close_position(self, symbol: str) -> Optional[dict[str, Any]]:
         """Cancela ordens pendentes do ativo e fecha a posição a mercado."""

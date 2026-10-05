@@ -62,18 +62,83 @@ class Settings:
     ollama_num_ctx: int = 4096
 
     # ---- Ciclo de trading -------------------------------------------------------
-    cycle_seconds: int = 60  # frequência do ciclo de decisão
-    min_confidence: float = 0.65  # confiança mínima para executar
-    risk_fraction_per_trade: float = 0.05  # % do NetLiq alocada por entrada
+    cycle_seconds: int = 60  # frequência do ciclo (gestão de risco, settlement, UI)
+    llm_interval_minutes: int = 15  # cadência máxima de consulta ao LLM por ativo
+    signal_persistence_cycles: int = 2  # BUY/SELL só executa se se mantiver N ciclos LLM seguidos
+    decision_bar_minutes: int = 5  # indicadores/ATR sobre velas agregadas de N min
+    min_confidence: float = 0.65  # piso enquanto não há calibração (confiança composta)
+    edge_margin: float = 0.08  # margem acima do break-even do bracket para executar
     max_open_positions: int = 4
     allow_short: bool = True
     trade_only_rth: bool = True  # só decide em horário regular (09:30-16:00 NY)
+    skip_open_minutes: int = 15  # não abre posições nos primeiros N min da sessão
+    skip_close_minutes: int = 10  # nem nos últimos N min
     max_bar_age_seconds: int = 180  # ignora dados mais velhos que isto
-    daily_loss_limit_pct: float = 0.03  # kill-switch diário (3% do NetLiq inicial)
+    max_trades_per_day: int = 6
+    benchmark_symbol: str = "SPY"  # para alpha no settlement (não é negociado)
 
-    # ---- Gestão de risco (Bracket) ---------------------------------------------
-    stop_loss_pct: float = 0.02
+    # ---- Risco: dimensionamento por volatilidade ---------------------------------
+    risk_per_trade_pct: float = 0.005  # 0,5% do equity por trade (fase de aprendizagem)
+    risk_per_trade_pct_validated: float = 0.01  # 1% quando os gates estatísticos passam
+    atr_period: int = 14
+    atr_stop_multiple: float = 2.0  # stop = k × ATR
+    reward_risk_ratio: float = 2.0  # TP = R × distância do stop
+    atr_floor_percentile: float = 5.0  # piso de volatilidade (pysystemtrade)
+    max_position_notional_pct: float = 0.30  # máx. 30% do equity num ativo
+    stop_mode: str = "atr"  # "atr" | "fixed"
+    stop_loss_pct: float = 0.02  # usados só em stop_mode="fixed"
     take_profit_pct: float = 0.05
+    use_trailing_stop: bool = False  # TRAIL em vez de STP no filho de stop
+
+    # ---- Risco: protections (freqtrade-style) ------------------------------------
+    daily_loss_limit_pct: float = 0.03  # kill-switch diário
+    stoploss_guard_count: int = 3  # N stops numa janela -> pausa
+    stoploss_guard_window_minutes: int = 120
+    stoploss_guard_pause_minutes: int = 60
+    cooldown_minutes: int = 30  # por ativo, após qualquer saída
+    max_drawdown_pct: float = 0.06  # pico-vale do equity nos últimos N dias -> pausa
+    max_drawdown_lookback_days: int = 5
+    max_drawdown_pause_sessions: int = 1
+    reduce_size_drawdown_pct: float = 0.03  # zona amarela: tamanho a metade
+    consecutive_loss_halt: int = 5  # N trades perdedores seguidos -> pausa até ao próximo dia
+
+    # ---- Risco: custos e eventos ---------------------------------------------------
+    commission_per_share: float = 0.005
+    commission_min: float = 1.0
+    commission_max_pct: float = 0.01
+    slippage_ticks: int = 1
+    tick_size: float = 0.01
+    max_cost_fraction_of_tp: float = 0.25  # custo ida+volta <= 25% do ganho esperado
+    min_position_notional: float = 200.0
+    earnings_blackout_days_before: int = 1
+    earnings_blackout_days_after: int = 1
+    vix_reduce_threshold: float = 25.0  # acima: tamanho a metade
+    vix_block_threshold: float = 35.0  # acima: sem novas entradas
+    event_data_fail_closed: bool = False  # True: sem dados de resultados -> não entra
+
+    # ---- LLM: pipeline de decisão --------------------------------------------------
+    llm_two_stage: bool = True  # raciocínio livre -> JSON com schema
+    llm_samples: int = 5  # N amostras para fração de acordo
+    llm_sample_temperature: float = 0.7
+    llm_request_logprobs: bool = True
+    llm_seed: int = 7
+    llm_min_agreement: float = 0.6  # acordo mínimo entre amostras
+    ensemble_models: list[str] = field(default_factory=list)  # ex.: ["llama3", "qwen2.5:7b"]
+    ab_test_models: list[str] = field(default_factory=list)  # round-robin para A/B
+    anonymize_prompt: bool = True  # ticker e níveis de preço ocultados ao LLM
+    lessons_in_prompt: int = 3
+    review_retry_temperature: float = 0.0
+
+    # ---- Calibração e gates estatísticos -----------------------------------------
+    settlement_horizon_minutes: int = 30
+    calibration_min_samples: int = 200
+    calibration_refit_every_hours: int = 24
+    gate_min_closed_trades: int = 100
+    gate_max_ece: float = 0.05
+    gate_min_psr: float = 0.95
+    gate_min_wfe: float = 0.5
+    gate_max_ruin_prob: float = 0.05
+    weekly_report_weekday: int = 4  # sexta-feira
 
     # ---- Indicadores -------------------------------------------------------------
     rsi_period: int = 14
@@ -84,8 +149,23 @@ class Settings:
     # ---- Retrospetiva (aprendizagem) -------------------------------------------
     retro_time_local: str = "21:30"  # hora local para a retrospetiva diária
     retro_lookahead_minutes: int = 30  # horizonte para avaliar cada decisão
-    retro_max_lessons: int = 8  # nº máximo de lições injetadas no prompt
-    retro_use_llm_summary: bool = True
+    retro_max_lessons: int = 8  # nº máximo de lições guardadas
+    retro_use_llm_summary: bool = False  # lições são calculadas em código (Honest Lying)
+
+    # ---- Fase 3: módulos opcionais ------------------------------------------------
+    sentiment_enabled: bool = False  # FinBERT (requer transformers/onnxruntime)
+    sentiment_model: str = "ProsusAI/finbert"
+    sentiment_window_hours: int = 2
+    sentiment_veto_threshold: float = -0.4
+    sentiment_veto_min_news: int = 3
+    news_source: str = "yfinance"  # "yfinance" | "finnhub"
+    finnhub_api_key: str = ""
+    volmodel_enabled: bool = False  # Chronos-Bolt / TTM (requer chronos-forecasting)
+    volmodel_name: str = "amazon/chronos-bolt-small"
+    volmodel_horizon_bars: int = 6
+    volmodel_block_width_pct: float = 0.03  # p90-p10 previsto acima disto -> sem entrada
+    alpaca_api_key: str = ""
+    alpaca_api_secret: str = ""
 
     # ---- UI ------------------------------------------------------------------------
     ui_poll_ms: int = 100

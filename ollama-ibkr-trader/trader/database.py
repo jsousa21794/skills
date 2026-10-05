@@ -112,7 +112,83 @@ CREATE TABLE IF NOT EXISTS kv (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+
+CREATE TABLE IF NOT EXISTS lessons (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    key TEXT UNIQUE NOT NULL,       -- ex.: rsi_regime:overbought:BUY
+    symbol TEXT,                    -- NULL = global
+    text TEXT NOT NULL,
+    support INTEGER NOT NULL,       -- nº de decisões que suportam a lição
+    effect REAL NOT NULL,           -- desvio face à taxa base (z-score)
+    importance REAL NOT NULL,
+    last_confirmed TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS decisions_cache (
+    prompt_hash TEXT PRIMARY KEY,
+    model TEXT NOT NULL,
+    ts TEXT NOT NULL,
+    response_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS experiments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    kind TEXT NOT NULL,             -- prompt | model | threshold | config
+    description TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS protection_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    name TEXT NOT NULL,
+    symbol TEXT,
+    until TEXT,
+    reason TEXT
+);
+
+CREATE TABLE IF NOT EXISTS event_cache (
+    key TEXT PRIMARY KEY,
+    ts TEXT NOT NULL,
+    value_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    report_json TEXT NOT NULL
+);
 """
+
+# Colunas acrescentadas à tabela decisions depois da v1.0 (migração idempotente).
+DECISION_COLUMNS = {
+    "verbal_conf": "REAL",
+    "agree_frac": "REAL",
+    "action_logprob": "REAL",
+    "calibrated_prob": "REAL",
+    "threshold_used": "REAL",
+    "n_samples": "INTEGER",
+    "samples_json": "TEXT",
+    "prompt_hash": "TEXT",
+    "dynamics_json": "TEXT",
+    "atr": "REAL",
+    "sentiment": "REAL",
+    "vol_forecast": "REAL",
+    "review": "INTEGER NOT NULL DEFAULT 0",
+    "horizon_min": "INTEGER",
+    "settled_ts": "TEXT",
+    "settled_price": "REAL",
+    "settled_return": "REAL",
+    "bench_return": "REAL",
+    "alpha": "REAL",
+    "correct": "INTEGER",
+    "hour_ny": "INTEGER",
+    "regime": "TEXT",
+}
+TRADE_COLUMNS = {"decision_action": "TEXT", "stop_price": "REAL", "tp_price": "REAL", "risk_amount": "REAL"}
 
 
 def utc_now() -> datetime:
@@ -132,6 +208,16 @@ class Database:
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.executescript(SCHEMA)
+            self._conn.commit()
+        self._migrate()
+
+    def _migrate(self) -> None:
+        with self._lock:
+            for table, columns in (("decisions", DECISION_COLUMNS), ("trades", TRADE_COLUMNS)):
+                existing = {row[1] for row in self._conn.execute(f"PRAGMA table_info({table})")}
+                for name, decl in columns.items():
+                    if name not in existing:
+                        self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
             self._conn.commit()
 
     # ------------------------------------------------------------------ util
@@ -165,6 +251,7 @@ class Database:
         prompt_version: int,
         parse_ok: bool,
         raw_response: str,
+        extra: Optional[dict[str, Any]] = None,
     ) -> int:
         cur = self._execute(
             """INSERT INTO decisions (ts, symbol, model, action, confidence, reason, price, rsi,
@@ -179,7 +266,185 @@ class Database:
                 int(parse_ok), raw_response[:4000],
             ),
         )
+        decision_id = int(cur.lastrowid)
+        if extra:
+            self.update_decision(decision_id, **extra)
+        return decision_id
+
+    def update_decision(self, decision_id: int, **fields: Any) -> None:
+        cols = [k for k in fields if k in DECISION_COLUMNS or k in ("executed", "skip_reason")]
+        if not cols:
+            return
+        assignments = ", ".join(f"{c}=?" for c in cols)
+        values = [json.dumps(fields[c], ensure_ascii=False, default=str) if isinstance(fields[c], (dict, list)) else fields[c]
+                  for c in cols]
+        self._execute(f"UPDATE decisions SET {assignments} WHERE id=?", (*values, decision_id))
+
+    # ------------------------------------------------------- settlement
+    def unsettled_decisions(self, before: datetime) -> list[dict[str, Any]]:
+        return self._query(
+            "SELECT * FROM decisions WHERE settled_ts IS NULL AND review=0 AND price IS NOT NULL AND ts <= ? ORDER BY ts",
+            (iso(before),),
+        )
+
+    def settle_decision(self, decision_id: int, *, settled_price: float, settled_return: float,
+                        bench_return: Optional[float], alpha: Optional[float], correct: Optional[int],
+                        horizon_min: int) -> None:
+        self._execute(
+            """UPDATE decisions SET settled_ts=?, settled_price=?, settled_return=?, bench_return=?, alpha=?,
+               correct=?, horizon_min=? WHERE id=?""",
+            (iso(utc_now()), settled_price, settled_return, bench_return, alpha, correct, horizon_min, decision_id),
+        )
+
+    def settled_decisions(self, since: Optional[datetime] = None, symbol: Optional[str] = None,
+                          directional_only: bool = False) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM decisions WHERE settled_ts IS NOT NULL"
+        params: list[Any] = []
+        if since:
+            sql += " AND ts >= ?"
+            params.append(iso(since))
+        if symbol:
+            sql += " AND symbol = ?"
+            params.append(symbol)
+        if directional_only:
+            sql += " AND action IN ('BUY','SELL')"
+        return self._query(sql + " ORDER BY ts", params)
+
+    def count_settled(self) -> int:
+        return int(self._query("SELECT COUNT(*) AS n FROM decisions WHERE settled_ts IS NOT NULL")[0]["n"])
+
+    # -------------------------------------------------------- protections
+    def closed_trades_between(self, since: datetime, until: Optional[datetime] = None) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM trades WHERE status='CLOSED' AND exit_ts >= ?"
+        params: list[Any] = [iso(since)]
+        if until:
+            sql += " AND exit_ts <= ?"
+            params.append(iso(until))
+        return self._query(sql + " ORDER BY exit_ts", params)
+
+    def recent_stop_count(self, since: datetime) -> int:
+        rows = self._query(
+            "SELECT COUNT(*) AS n FROM trades WHERE status='CLOSED' AND exit_reason='SL' AND exit_ts >= ?",
+            (iso(since),),
+        )
+        return int(rows[0]["n"])
+
+    def last_exit_ts(self, symbol: str) -> Optional[datetime]:
+        rows = self._query(
+            "SELECT exit_ts FROM trades WHERE symbol=? AND exit_ts IS NOT NULL ORDER BY exit_ts DESC LIMIT 1",
+            (symbol,),
+        )
+        return datetime.fromisoformat(rows[0]["exit_ts"]) if rows else None
+
+    def consecutive_losses(self) -> int:
+        rows = self._query("SELECT pnl FROM trades WHERE status='CLOSED' ORDER BY exit_ts DESC LIMIT 50")
+        n = 0
+        for r in rows:
+            if float(r["pnl"]) < 0:
+                n += 1
+            else:
+                break
+        return n
+
+    def entries_today(self, day_start: datetime) -> int:
+        rows = self._query("SELECT COUNT(*) AS n FROM order_groups WHERE role='ENTRY' AND ts >= ?", (iso(day_start),))
+        return int(rows[0]["n"])
+
+    def equity_series(self, since: datetime) -> list[tuple[datetime, float]]:
+        rows = self._query(
+            "SELECT ts, net_liq FROM pnl_snapshots WHERE ts >= ? AND net_liq IS NOT NULL ORDER BY ts", (iso(since),)
+        )
+        return [(datetime.fromisoformat(r["ts"]), float(r["net_liq"])) for r in rows]
+
+    def daily_equity(self, since: datetime) -> list[tuple[str, float]]:
+        """Último NetLiq de cada dia (UTC) desde ``since``."""
+        rows = self._query(
+            """SELECT substr(ts, 1, 10) AS day, net_liq FROM pnl_snapshots
+               WHERE ts >= ? AND net_liq IS NOT NULL AND id IN (
+                   SELECT MAX(id) FROM pnl_snapshots WHERE ts >= ? GROUP BY substr(ts, 1, 10))
+               ORDER BY day""",
+            (iso(since), iso(since)),
+        )
+        return [(r["day"], float(r["net_liq"])) for r in rows]
+
+    def add_protection_event(self, name: str, symbol: Optional[str], until: Optional[datetime], reason: str) -> None:
+        self._execute(
+            "INSERT INTO protection_events (ts, name, symbol, until, reason) VALUES (?,?,?,?,?)",
+            (iso(utc_now()), name, symbol, iso(until) if until else None, reason),
+        )
+
+    def active_protections(self, now: datetime) -> list[dict[str, Any]]:
+        return self._query(
+            "SELECT * FROM protection_events WHERE until IS NOT NULL AND until > ? ORDER BY until DESC", (iso(now),)
+        )
+
+    # ------------------------------------------------------------- lessons
+    def upsert_lesson(self, *, key: str, symbol: Optional[str], text: str, support: int, effect: float,
+                      importance: float) -> None:
+        now = iso(utc_now())
+        self._execute(
+            """INSERT INTO lessons (ts, key, symbol, text, support, effect, importance, last_confirmed, active)
+               VALUES (?,?,?,?,?,?,?,?,1)
+               ON CONFLICT(key) DO UPDATE SET text=excluded.text, support=excluded.support, effect=excluded.effect,
+               importance=excluded.importance, last_confirmed=excluded.last_confirmed, active=1""",
+            (now, key, symbol, text, support, effect, importance, now),
+        )
+
+    def deactivate_lessons_except(self, keys: list[str]) -> None:
+        if keys:
+            placeholders = ",".join("?" for _ in keys)
+            self._execute(f"UPDATE lessons SET active=0 WHERE key NOT IN ({placeholders})", keys)
+        else:
+            self._execute("UPDATE lessons SET active=0")
+
+    def active_lessons(self) -> list[dict[str, Any]]:
+        return self._query("SELECT * FROM lessons WHERE active=1 ORDER BY importance DESC")
+
+    # --------------------------------------------------------------- cache
+    def cache_get(self, prompt_hash: str) -> Optional[dict[str, Any]]:
+        rows = self._query("SELECT response_json FROM decisions_cache WHERE prompt_hash=?", (prompt_hash,))
+        return json.loads(rows[0]["response_json"]) if rows else None
+
+    def cache_put(self, prompt_hash: str, model: str, response: dict[str, Any]) -> None:
+        self._execute(
+            "INSERT OR REPLACE INTO decisions_cache (prompt_hash, model, ts, response_json) VALUES (?,?,?,?)",
+            (prompt_hash, model, iso(utc_now()), json.dumps(response, ensure_ascii=False, default=str)),
+        )
+
+    # --------------------------------------------------------- experiments
+    def record_experiment(self, kind: str, description: str) -> int:
+        rows = self._query("SELECT description FROM experiments WHERE kind=? ORDER BY id DESC LIMIT 1", (kind,))
+        if rows and rows[0]["description"] == description:
+            return self.experiment_count()
+        self._execute("INSERT INTO experiments (ts, kind, description) VALUES (?,?,?)", (iso(utc_now()), kind, description))
+        return self.experiment_count()
+
+    def experiment_count(self) -> int:
+        return max(1, int(self._query("SELECT COUNT(*) AS n FROM experiments")[0]["n"]))
+
+    def event_cache_get(self, key: str, max_age_hours: float) -> Optional[Any]:
+        rows = self._query("SELECT ts, value_json FROM event_cache WHERE key=?", (key,))
+        if not rows:
+            return None
+        age = (utc_now() - datetime.fromisoformat(rows[0]["ts"])).total_seconds() / 3600
+        if age > max_age_hours:
+            return None
+        return json.loads(rows[0]["value_json"])
+
+    def event_cache_put(self, key: str, value: Any) -> None:
+        self._execute(
+            "INSERT OR REPLACE INTO event_cache (key, ts, value_json) VALUES (?,?,?)",
+            (key, iso(utc_now()), json.dumps(value, ensure_ascii=False, default=str)),
+        )
+
+    def save_report(self, kind: str, report: dict[str, Any]) -> int:
+        cur = self._execute("INSERT INTO reports (ts, kind, report_json) VALUES (?,?,?)",
+                            (iso(utc_now()), kind, json.dumps(report, ensure_ascii=False, default=str)))
         return int(cur.lastrowid)
+
+    def latest_report(self, kind: str) -> Optional[dict[str, Any]]:
+        rows = self._query("SELECT report_json FROM reports WHERE kind=? ORDER BY id DESC LIMIT 1", (kind,))
+        return json.loads(rows[0]["report_json"]) if rows else None
 
     def mark_decision(self, decision_id: int, *, executed: bool, skip_reason: str = "") -> None:
         self._execute(
@@ -239,13 +504,18 @@ class Database:
         return rows[0] if rows else None
 
     def open_trade(self, *, symbol: str, decision_id: Optional[int], group_id: int,
-                   direction: int, qty: float) -> int:
+                   direction: int, qty: float, stop_price: Optional[float] = None,
+                   tp_price: Optional[float] = None, risk_amount: Optional[float] = None) -> int:
         cur = self._execute(
-            """INSERT INTO trades (symbol, decision_id, group_id, direction, qty, status)
-               VALUES (?,?,?,?,?,'OPEN')""",
-            (symbol, decision_id, group_id, direction, qty),
+            """INSERT INTO trades (symbol, decision_id, group_id, direction, qty, status, stop_price, tp_price, risk_amount)
+               VALUES (?,?,?,?,?,'OPEN',?,?,?)""",
+            (symbol, decision_id, group_id, direction, qty, stop_price, tp_price, risk_amount),
         )
         return int(cur.lastrowid)
+
+    def close_trade_reconciled(self, trade_id: int, reason: str = "RECONCILED") -> None:
+        self._execute("UPDATE trades SET status='CLOSED', exit_ts=?, exit_reason=? WHERE id=? AND status='OPEN'",
+                      (iso(utc_now()), reason, trade_id))
 
     def trade_for_group(self, group_id: int) -> Optional[dict[str, Any]]:
         rows = self._query("SELECT * FROM trades WHERE group_id=? ORDER BY id DESC LIMIT 1", (group_id,))

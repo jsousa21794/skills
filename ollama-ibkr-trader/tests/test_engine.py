@@ -1,165 +1,151 @@
-"""Testa o motor com um cliente IBKR falso (sem rede, sem TWS)."""
+"""Motor com cliente IBKR falso: camada de risco, execução, fills, reconciliação."""
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
 
+from trader.calibration import ConfidenceSignals
 from trader.config import Settings
 from trader.database import Database
-from trader.indicators import MarketSnapshot
-from trader.ollama_brain import Decision, OllamaBrain
-from trader.trading_engine import TradingEngine, in_regular_hours
+from trader.ollama_brain import Decision, DecisionOutcome, OllamaBrain
+from trader.risk import GateResult
+from trader.trading_engine import TradingEngine, build_decision_context, in_regular_hours
 from trader.ui_bus import UIBus
+from tests.helpers import FakeIBKR, make_bars, NY_OPEN_UTC
 
 
-class FakeIBKR:
-    def __init__(self):
-        self.connected = True
-        self.positions = {}
-        self.brackets = []
-        self.closes = []
-        self._next_id = 100
-
-    def position_qty(self, symbol):
-        return self.positions.get(symbol, 0.0)
-
-    def open_trades_for(self, symbol):
-        return []
-
-    def portfolio_state(self):
-        return {"connected": True, "net_liq": 100_000.0, "cash": 50_000.0, "unrealized": 0.0,
-                "realized": 0.0, "positions": [{"symbol": s, "qty": q} for s, q in self.positions.items() if q]}
-
-    async def place_bracket(self, symbol, action, quantity, ref_price, stop_loss_pct, take_profit_pct):
-        ids = [self._next_id, self._next_id + 1, self._next_id + 2]
-        self._next_id += 3
-        sign = 1 if action == "BUY" else -1
-        self.brackets.append((symbol, action, quantity, ref_price))
-        return {"parent_order_id": ids[0], "tp_order_id": ids[1], "sl_order_id": ids[2],
-                "tp_price": round(ref_price * (1 + sign * take_profit_pct), 2),
-                "sl_price": round(ref_price * (1 - sign * stop_loss_pct), 2), "trades": []}
-
-    async def close_position(self, symbol):
-        qty = self.positions.get(symbol, 0.0)
-        if not qty:
-            return None
-        self.closes.append(symbol)
-        oid = self._next_id
-        self._next_id += 1
-        return {"order_id": oid, "qty": abs(qty), "direction": 1 if qty > 0 else -1, "trade": None}
-
-
-def make_engine():
+def make_engine(bars=None):
     settings = Settings()
     settings.min_confidence = 0.65
+    settings.signal_persistence_cycles = 1
+    settings.llm_min_agreement = 0.6
+    settings.skip_open_minutes = 0
     db = Database(":memory:")
     engine = TradingEngine(settings, db, UIBus(), OllamaBrain(settings, db))
-    engine.ibkr = FakeIBKR()
+    engine.ibkr = FakeIBKR(bars or {"AAPL": make_bars(600, vol=0.2)})
+    engine.gate.events = None
     return engine, db, settings
 
 
-def snap(symbol="AAPL", price=200.0):
-    return MarketSnapshot(symbol, price, datetime.now(timezone.utc), 55.0, 199.0, 198.0, 199.5, 0.1, 0.4, 1000, 120)
+def ctx_for(engine, symbol="AAPL"):
+    ctx = build_decision_context(engine.settings, symbol, engine.ibkr.bars_as_list(symbol))
+    assert ctx is not None
+    return ctx
 
 
-def decide(engine, db, decision, symbol="AAPL", price=200.0, position=0.0):
-    s = snap(symbol, price)
-    state = engine.ibkr.portfolio_state()
-    did = db.insert_decision(symbol=symbol, model="m", action=decision.acao, confidence=decision.confianca,
-                             reason=decision.razao, snapshot=s.to_dict(), position_qty=position, net_liq=100_000,
-                             prompt_version=0, parse_ok=decision.parse_ok, raw_response="")
-    asyncio.run(engine._execute(decision, s, state, did, position))
+def outcome(action, conf=0.8, agree=1.0):
+    return DecisionOutcome(Decision(action, conf, "ok"), [{"acao": action}] * 5, agree, agree, -0.2, "h")
+
+
+def run_exec(engine, db, out, position=0.0, symbol="AAPL", state=None, gate=None):
+    ctx = ctx_for(engine, symbol)
+    state = state or engine.ibkr.portfolio_state()
+    cal = engine.calibrator.probability(ConfidenceSignals(out.decision.confianca, out.agree_frac, out.margin, out.action_logprob)) \
+        if out.decision.acao in ("BUY", "SELL") else None
+    did = db.insert_decision(symbol=symbol, model="m", action=out.decision.acao, confidence=out.decision.confianca,
+                             reason="r", snapshot=ctx.snapshot.to_dict(), position_qty=position, net_liq=state["net_liq"],
+                             prompt_version=0, parse_ok=out.decision.parse_ok, raw_response="",
+                             extra={"agree_frac": out.agree_frac, "atr": ctx.atr})
+    gate = gate or GateResult(True)
+    asyncio.run(engine._execute(out, cal, ctx, state, did, position, gate))
     return db._query("SELECT * FROM decisions WHERE id=?", (did,))[0]
 
 
 def fill(engine, order_id, symbol, side, shares, price, exec_id):
-    trade = SimpleNamespace()
-    f = SimpleNamespace(
-        contract=SimpleNamespace(symbol=symbol),
-        execution=SimpleNamespace(execId=exec_id, orderId=order_id, side=side, shares=shares, price=price,
-                                  time=datetime.now(timezone.utc)),
-    )
-    engine._on_fill(trade, f)
+    f = SimpleNamespace(contract=SimpleNamespace(symbol=symbol),
+                        execution=SimpleNamespace(execId=exec_id, orderId=order_id, side=side, shares=shares,
+                                                  price=price, time=datetime.now(timezone.utc)))
+    engine._on_fill(SimpleNamespace(), f)
 
 
-def test_buy_places_bracket_with_risk_sizing():
-    engine, db, settings = make_engine()
-    row = decide(engine, db, Decision("BUY", 0.8, "ok"))
-    assert row["executed"] == 1
-    symbol, action, qty, price = engine.ibkr.brackets[0]
-    assert (symbol, action, price) == ("AAPL", "BUY", 200.0)
-    assert qty == int(100_000 * settings.risk_fraction_per_trade / 200.0) == 25
-    group = db.group_for_order(100)
-    assert group["role"] == "ENTRY" and group["tp_price"] == 210.0 and group["sl_price"] == 196.0
-    assert db.open_trades("AAPL")
+def test_context_uses_aggregated_bars_and_dynamics():
+    engine, _, s = make_engine()
+    ctx = ctx_for(engine)
+    assert ctx.dynamics is not None and ctx.atr is not None and ctx.atr > 0
+    assert len(ctx.agg_bars) < 600 / s.decision_bar_minutes + 2
+    assert ctx.snapshot.bars_available == len(ctx.agg_bars)
 
 
-def test_low_confidence_hold_and_invalid_are_skipped():
+def test_buy_sizes_by_atr_and_places_bracket(monkeypatch):
+    engine, db, s = make_engine()
+    monkeypatch.setattr("trader.trading_engine.datetime", _FixedDatetime)
+    row = run_exec(engine, db, outcome("BUY", 0.9, 1.0))
+    assert row["executed"] == 1, row["skip_reason"]
+    symbol, action, qty, price, stop, tp = engine.ibkr.brackets[0]
+    assert action == "BUY" and stop < price < tp
+    risk = qty * (price - stop)
+    assert risk <= 100_000 * s.risk_per_trade_pct * 1.05
+    trade = db.open_trades("AAPL")[0]
+    assert trade["stop_price"] == stop and trade["risk_amount"] == pytest.approx(risk, rel=1e-2)
+    assert row["threshold_used"] >= s.min_confidence
+
+
+def test_low_agreement_low_confidence_hold_review_skipped(monkeypatch):
     engine, db, _ = make_engine()
-    assert decide(engine, db, Decision("BUY", 0.5, "fraco"))["executed"] == 0
-    assert decide(engine, db, Decision("HOLD", 0.9, "x"))["skip_reason"] == "HOLD"
-    assert decide(engine, db, Decision.hold("lixo", error="unparseable"))["executed"] == 0
+    monkeypatch.setattr("trader.trading_engine.datetime", _FixedDatetime)
+    assert "acordo" in run_exec(engine, db, outcome("BUY", 0.9, 0.4))["skip_reason"]
+    assert "limiar" in run_exec(engine, db, outcome("BUY", 0.2, 1.0))["skip_reason"]
+    assert run_exec(engine, db, outcome("HOLD"))["skip_reason"] == "HOLD"
     assert engine.ibkr.brackets == []
 
 
-def test_opposite_signal_closes_position_instead_of_reversing():
+def test_persistence_requires_consecutive_signals(monkeypatch):
+    engine, db, s = make_engine()
+    s.signal_persistence_cycles = 2
+    monkeypatch.setattr("trader.trading_engine.datetime", _FixedDatetime)
+    assert "persistente" in run_exec(engine, db, outcome("BUY"))["skip_reason"]
+    assert run_exec(engine, db, outcome("BUY"))["executed"] == 1
+    assert len(engine.ibkr.brackets) == 1
+
+
+def test_global_and_symbol_gates_block(monkeypatch):
     engine, db, _ = make_engine()
-    engine.ibkr.positions["AAPL"] = 25
-    row = decide(engine, db, Decision("SELL", 0.9, "inversão"), position=25)
-    assert row["executed"] == 1
-    assert engine.ibkr.closes == ["AAPL"] and engine.ibkr.brackets == []
-    # Enquanto o fecho está pendente, novas entradas no ativo são bloqueadas.
-    row2 = decide(engine, db, Decision("SELL", 0.9, "outra vez"), position=25)
-    assert "pendente" in row2["skip_reason"]
+    monkeypatch.setattr("trader.trading_engine.datetime", _FixedDatetime)
+    blocked = GateResult(False, "kill-switch diário")
+    assert run_exec(engine, db, outcome("BUY"), gate=blocked)["skip_reason"] == "kill-switch diário"
+    engine.ibkr.pending_entry = True
+    assert "pendente" in run_exec(engine, db, outcome("BUY"))["skip_reason"]
 
 
-def test_same_direction_and_short_disabled():
-    engine, db, settings = make_engine()
-    engine.ibkr.positions["AAPL"] = 10
-    assert "posicionado" in decide(engine, db, Decision("BUY", 0.9, "x"), position=10)["skip_reason"]
-    settings.allow_short = False
-    assert "short" in decide(engine, db, Decision("SELL", 0.9, "x"), symbol="TSLA")["skip_reason"]
-
-
-def test_fills_open_and_close_trade_with_pnl():
+def test_opposite_signal_closes_and_fills_settle_pnl(monkeypatch):
     engine, db, _ = make_engine()
-    decide(engine, db, Decision("BUY", 0.8, "ok"))
-    fill(engine, 100, "AAPL", "BOT", 25, 200.0, "x1")
-    fill(engine, 100, "AAPL", "BOT", 25, 200.0, "x1")  # duplicado ignorado
-    trade = db.open_trades("AAPL")[0]
-    assert trade["filled_qty"] == 25 and trade["entry_price"] == 200.0
-    fill(engine, 102, "AAPL", "SLD", 25, 196.0, "x2")  # stop loss
-    closed = db.trades_since(datetime(2000, 1, 1, tzinfo=timezone.utc))[0]
-    assert closed["status"] == "CLOSED" and closed["exit_reason"] == "SL"
-    assert closed["pnl"] == pytest.approx(-100.0)
-
-
-def test_signal_close_fill_closes_open_trade():
-    engine, db, _ = make_engine()
-    decide(engine, db, Decision("BUY", 0.8, "ok"))
-    fill(engine, 100, "AAPL", "BOT", 25, 200.0, "e1")
-    engine.ibkr.positions["AAPL"] = 25
-    decide(engine, db, Decision("SELL", 0.9, "sai"), position=25)
+    monkeypatch.setattr("trader.trading_engine.datetime", _FixedDatetime)
+    run_exec(engine, db, outcome("BUY"))
+    qty = engine.ibkr.brackets[0][2]
+    fill(engine, 100, "AAPL", "BOT", qty, 100.0, "e1")
+    engine.ibkr.positions["AAPL"] = qty
+    row = run_exec(engine, db, outcome("SELL", 0.9, 1.0), position=qty)
+    assert row["executed"] == 1 and engine.ibkr.closes == ["AAPL"]
     close_group = db._query("SELECT * FROM order_groups WHERE role='CLOSE'")[0]
-    fill(engine, close_group["parent_order_id"], "AAPL", "SLD", 25, 204.0, "e2")
+    fill(engine, close_group["parent_order_id"], "AAPL", "SLD", qty, 102.0, "e2")
     closed = db.trades_since(datetime(2000, 1, 1, tzinfo=timezone.utc))[0]
     assert closed["status"] == "CLOSED" and closed["exit_reason"] == "SIGNAL"
-    assert closed["pnl"] == pytest.approx(100.0)
-    assert "AAPL" not in engine._pending_close
+    assert closed["pnl"] == pytest.approx(2.0 * qty)
 
 
-def test_kill_switch_halts_new_entries():
-    engine, db, settings = make_engine()
-    settings.daily_loss_limit_pct = 0.03
-    engine._update_day_baseline({"net_liq": 100_000.0})
-    assert engine._check_kill_switch({"net_liq": 98_000.0}) is False
-    assert engine._check_kill_switch({"net_liq": 96_900.0}) is True
-    assert engine.halted_day is not None
-    assert engine._check_kill_switch({"net_liq": 100_000.0}) is True  # fica travado até ao dia seguinte
+def test_reconcile_closes_orphans_and_protects_naked_positions():
+    engine, db, _ = make_engine()
+    gid = db.insert_order_group(symbol="AAPL", decision_id=None, role="ENTRY", direction=1, qty=5, parent_order_id=1,
+                                tp_order_id=2, sl_order_id=3, ref_price=100, tp_price=104, sl_price=98)
+    tid = db.open_trade(symbol="AAPL", decision_id=None, group_id=gid, direction=1, qty=5)
+    db.record_entry_fill(tid, 5, 100.0, datetime.now(timezone.utc))
+    engine.ibkr.positions["TSLA"] = 10  # posição sem proteção e sem registo
+    asyncio.run(engine._reconcile())
+    assert db._query("SELECT status, exit_reason FROM trades WHERE id=?", (tid,))[0]["status"] == "CLOSED"
+    assert "TSLA" in engine.ibkr.protections
 
 
 def test_regular_hours():
-    assert in_regular_hours(datetime(2026, 10, 5, 14, 0, tzinfo=timezone.utc))      # 10:00 NY, segunda-feira
-    assert not in_regular_hours(datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc))  # 08:00 NY
-    assert not in_regular_hours(datetime(2026, 10, 3, 14, 0, tzinfo=timezone.utc))  # sábado
+    assert in_regular_hours(NY_OPEN_UTC + timedelta(minutes=30))
+    assert not in_regular_hours(NY_OPEN_UTC - timedelta(hours=1))
+    assert not in_regular_hours(datetime(2026, 10, 3, 14, 0, tzinfo=timezone.utc))
+
+
+class _FixedDatetime(datetime):
+    """datetime.now() fixo a meio da sessão de NY para os gates de horário."""
+
+    @classmethod
+    def now(cls, tz=None):
+        fixed = NY_OPEN_UTC + timedelta(hours=2)
+        return fixed.astimezone(tz) if tz else fixed.replace(tzinfo=None)

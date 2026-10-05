@@ -1,4 +1,10 @@
 ib_async>=2.0
 customtkinter>=5.2
 requests>=2.31
+yfinance>=0.2.40           # datas de resultados, VIX e notícias (blackout de eventos)
 tzdata>=2024.1 ; sys_platform == "win32"
+
+# Opcionais (fase 3 / relatórios). Instale só o que quiser usar:
+# transformers>=4.40 torch        -> FinBERT (sentiment_enabled)
+# chronos-forecasting>=1.4 torch  -> quantis de volatilidade (volmodel_enabled)
+# quantstats>=0.0.62 pandas       -> relatório HTML adicional

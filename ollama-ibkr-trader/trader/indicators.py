@@ -126,3 +126,174 @@ def build_snapshot(
 
 def _round(value: Optional[float], digits: int = 2) -> Optional[float]:
     return None if value is None else round(value, digits)
+
+
+# ---------------------------------------------------------------------------
+# Volatilidade, agregação e dinâmica (fase 1 do roteiro)
+# ---------------------------------------------------------------------------
+@dataclass
+class Bar:
+    time: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+
+
+def true_ranges(bars: Sequence[Bar]) -> list[float]:
+    out: list[float] = []
+    prev_close: Optional[float] = None
+    for b in bars:
+        if prev_close is None:
+            tr = b.high - b.low
+        else:
+            tr = max(b.high - b.low, abs(b.high - prev_close), abs(b.low - prev_close))
+        out.append(tr)
+        prev_close = b.close
+    return out
+
+
+def atr(bars: Sequence[Bar], period: int = 14) -> Optional[float]:
+    """ATR de Wilder. Devolve None sem ``period + 1`` velas."""
+    if period <= 0 or len(bars) < period + 1:
+        return None
+    trs = true_ranges(bars)[1:]
+    current = sum(trs[:period]) / period
+    for tr in trs[period:]:
+        current = (current * (period - 1) + tr) / period
+    return current
+
+
+def atr_series(bars: Sequence[Bar], period: int = 14) -> list[float]:
+    """ATR em cada vela (a partir da vela ``period``), para percentis/piso de vol."""
+    if period <= 0 or len(bars) < period + 1:
+        return []
+    trs = true_ranges(bars)[1:]
+    current = sum(trs[:period]) / period
+    out = [current]
+    for tr in trs[period:]:
+        current = (current * (period - 1) + tr) / period
+        out.append(current)
+    return out
+
+
+def percentile(values: Sequence[float], pct: float) -> Optional[float]:
+    if not values:
+        return None
+    ordered = sorted(values)
+    k = (len(ordered) - 1) * (max(0.0, min(100.0, pct)) / 100.0)
+    lo, hi = int(k), min(int(k) + 1, len(ordered) - 1)
+    frac = k - lo
+    return ordered[lo] + (ordered[hi] - ordered[lo]) * frac
+
+
+def aggregate_bars(bars: Sequence[Bar], minutes: int) -> list[Bar]:
+    """Agrega velas de 1 min em velas de ``minutes`` alinhadas ao relógio."""
+    if minutes <= 1:
+        return list(bars)
+    out: list[Bar] = []
+    bucket: list[Bar] = []
+    bucket_key: Optional[int] = None
+    for b in bars:
+        key = (b.time.hour * 60 + b.time.minute) // minutes
+        day_key = (b.time.date(), key)
+        if bucket and day_key != bucket_key:
+            out.append(_merge(bucket))
+            bucket = []
+        bucket.append(b)
+        bucket_key = day_key
+    if bucket:
+        out.append(_merge(bucket))
+    return out
+
+
+def _merge(bucket: list[Bar]) -> Bar:
+    return Bar(
+        time=bucket[0].time,
+        open=bucket[0].open,
+        high=max(b.high for b in bucket),
+        low=min(b.low for b in bucket),
+        close=bucket[-1].close,
+        volume=sum(b.volume for b in bucket),
+    )
+
+
+def ewma_volatility(closes: Sequence[float], span: int = 35, min_periods: int = 10) -> Optional[float]:
+    """Vol EWMA dos retornos (desenho pysystemtrade: span 35, mínimo 10 períodos)."""
+    if len(closes) < min_periods + 1:
+        return None
+    rets = [(closes[i] - closes[i - 1]) / closes[i - 1] for i in range(1, len(closes)) if closes[i - 1]]
+    if len(rets) < min_periods:
+        return None
+    alpha = 2.0 / (span + 1)
+    var = sum(r * r for r in rets[:min_periods]) / min_periods
+    for r in rets[min_periods:]:
+        var = alpha * r * r + (1 - alpha) * var
+    return var ** 0.5
+
+
+@dataclass
+class Dynamics:
+    """Dinâmica dos indicadores: o que tem conteúdo preditivo não são os níveis."""
+
+    rsi_slope: Optional[float]  # variação do RSI nas últimas 3 velas
+    rsi_cross_30_up: bool  # RSI cruzou 30 para cima nas últimas 3 velas
+    rsi_cross_70_down: bool
+    ema_cross_sma_fast: Optional[str]  # "up" | "down" | None nas últimas 3 velas
+    sma_fast_cross_slow: Optional[str]
+    price_vs_fast: str  # "above" | "below"
+    returns_sign_change: bool  # momentum de 5 velas mudou de sinal
+    atr_pct: Optional[float]  # ATR / preço em %
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def compute_dynamics(closes: Sequence[float], bars: Optional[Sequence[Bar]] = None, *, rsi_period: int = 14,
+                     sma_fast_period: int = 20, sma_slow_period: int = 50, ema_period: int = 9,
+                     atr_period: int = 14, lookback: int = 3) -> Optional[Dynamics]:
+    n = len(closes)
+    if n < max(sma_slow_period, rsi_period + 1) + lookback:
+        return None
+    closes = list(closes)
+
+    def series(fn, period):
+        return [fn(closes[: n - i], period) for i in range(lookback, -1, -1)]
+
+    rsi_s = series(rsi, rsi_period)
+    ema_s = series(ema, ema_period)
+    fast_s = series(sma, sma_fast_period)
+    slow_s = series(sma, sma_slow_period)
+    if any(v is None for v in rsi_s + ema_s + fast_s + slow_s):
+        return None
+
+    def cross(a: list[float], b: list[float]) -> Optional[str]:
+        for i in range(1, len(a)):
+            if a[i - 1] <= b[i - 1] and a[i] > b[i]:
+                return "up"
+            if a[i - 1] >= b[i - 1] and a[i] < b[i]:
+                return "down"
+        return None
+
+    def level_cross(vals: list[float], level: float, upward: bool) -> bool:
+        for i in range(1, len(vals)):
+            if upward and vals[i - 1] < level <= vals[i]:
+                return True
+            if not upward and vals[i - 1] > level >= vals[i]:
+                return True
+        return False
+
+    mom_now = closes[-1] - closes[-6] if n > 6 else 0.0
+    mom_prev = closes[-1 - lookback] - closes[-6 - lookback] if n > 6 + lookback else mom_now
+    a = atr(bars, atr_period) if bars else None
+    return Dynamics(
+        rsi_slope=round(rsi_s[-1] - rsi_s[0], 2),
+        rsi_cross_30_up=level_cross(rsi_s, 30.0, True),
+        rsi_cross_70_down=level_cross(rsi_s, 70.0, False),
+        ema_cross_sma_fast=cross(ema_s, fast_s),
+        sma_fast_cross_slow=cross(fast_s, slow_s),
+        price_vs_fast="above" if closes[-1] > fast_s[-1] else "below",
+        returns_sign_change=(mom_now > 0) != (mom_prev > 0),
+        atr_pct=round(a / closes[-1] * 100.0, 3) if a and closes[-1] else None,
+    )
