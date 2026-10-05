@@ -106,3 +106,20 @@ def test_seed_lessons_import_is_idempotent_and_survives_rebuild(tmp_path):
     LessonEngine(s, db).rebuild()  # sem decisões: seeds continuam ativas
     assert len(db.active_lessons()) == 2
     assert LessonEngine(s, db).for_prompt("AAPL", k=1)
+
+
+def test_seed_lessons_file_imports_and_context_relevance_applies():
+    from pathlib import Path
+    from trader.lessons import import_seed_lessons
+    s = Settings()
+    db = Database(":memory:")
+    path = Path(__file__).resolve().parent.parent / "data" / "seed_lessons.json"
+    n = import_seed_lessons(db, str(path))
+    assert n >= 50
+    engine = LessonEngine(s, db)
+    at_open = engine.for_prompt("AAPL", rsi=50, hour_ny=9, regime="lateral", k=3)
+    assert any("abertura" in t.lower() for t in at_open)
+    downtrend = engine.for_prompt("AAPL", rsi=25, hour_ny=11, regime="baixa", k=3)
+    assert any("facas" in t.lower() for t in downtrend)
+    # o prompt nunca recebe mais do que k lições
+    assert len(engine.for_prompt("AAPL", k=3)) == 3

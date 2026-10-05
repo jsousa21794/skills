@@ -152,7 +152,7 @@ class LessonEngine:
         scored = []
         for l in lessons:
             relevance = 1.0
-            key = l["key"]
+            key = l["key"][5:] if l["key"].startswith("seed:") else l["key"]
             if l["symbol"] and l["symbol"] != symbol:
                 relevance *= 0.3
             if key.startswith("rsi:") and rsi is not None and rsi_regime(rsi) not in key:
@@ -161,6 +161,8 @@ class LessonEngine:
                 relevance *= 0.5
             if key.startswith("regime:") and regime and regime not in key:
                 relevance *= 0.5
+            if key.startswith(("hora:", "rsi:", "regime:")) and l["key"].startswith("seed:"):
+                relevance *= 1.6  # lição inicial contextual que bate certo com o momento: sobe
             scored.append((l["importance"] * relevance, l["text"]))
         scored.sort(key=lambda t: t[0], reverse=True)
         return [t for _, t in scored[:k]]

@@ -64,7 +64,7 @@ data/seed_lessons.json       lições iniciais com fonte (importadas uma vez)
   volmodel.py                Chronos-Bolt opcional com fallback EWMA (largura p90−p10)
   database.py                SQLite: decisões (c/ settlement), ordens, trades, fills, P&L,
                              lições, cache, experiências, protections, relatórios
-tests/                       75 testes offline (IBKR e Ollama simulados)
+tests/                       76 testes offline (IBKR e Ollama simulados)
 trader.spec, build.sh/.bat   PyInstaller
 ```
 
@@ -152,12 +152,16 @@ de features técnicas intradiárias → BUY/SELL/HOLD, nem adaptadores LoRA para
 isso em modelos compatíveis com o bot. O Ollama atual, além disso, deixou de
 aceitar adaptadores LoRA (só GGUF já fundidos). O que existe e é usável:
 
-- **`data/seed_lessons.json`**: 10 lições iniciais com fonte, derivadas da
-  literatura (volatilidade da abertura, dinâmica vs níveis, custos,
-  sobreconfiança, saídas mecânicas, volatilidade e tamanho). São importadas
-  uma vez no arranque (`seed_lessons_file`), têm importância baixa e são
-  ultrapassadas pelas lições medidas nas tuas decisões assim que houver
-  suporte estatístico.
+- **`data/seed_lessons.json`**: 55 lições iniciais em três camadas, todas
+  com o campo `source`: (1) 23 derivadas da literatura e de experiências de
+  LLMs ao vivo, com citação; (2) 32 de conhecimento geral de trading e
+  microestrutura escritas pelo assistente (hora do dia, eventos macro,
+  volatilidade, correlação com o índice, stops não garantidos, spread, SSR e
+  halts, regimes de RSI, VWAP, volume, processo), marcadas como não medidas.
+  As lições com chave `hora:`, `rsi:` ou `regime:` só entram no prompt quando
+  o contexto bate certo. Importadas uma vez no arranque (`seed_lessons_file`),
+  têm importância baixa e são ultrapassadas pelas lições medidas nas tuas
+  decisões assim que houver suporte estatístico.
 - **`python -m trader.lessons_offline`**: calcula lições reais a partir de
   velas de 1 minuto (CSV, ou Parquet dos datasets Hugging Face
   `Rrishab/OHLCV-1m` / `ggaddam/OHLCV-1m`), com os mesmos indicadores do bot,

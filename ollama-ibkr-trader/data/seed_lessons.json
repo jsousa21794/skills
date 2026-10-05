@@ -138,6 +138,198 @@
       "importance": 0.4,
       "text": "A arquitetura e as regras do agente explicam mais da variação de resultados do que o modelo base, e foram os stop-losses em código que mantiveram viva uma experiência com ChatGPT até um drawdown de -45,85%. O sistema de risco manda; a proposta do modelo é só uma opinião.",
       "source": "Agent Market Arena (2025-2026); diário de Nathan Smith, semanas 4 a 20 (Benzinga/HackerNoon 2025)"
+    },
+    {
+      "key": "hora:abertura:kb_spreads",
+      "importance": 0.45,
+      "text": "Na abertura os spreads são largos, as ordens de retalho acumuladas executam e os gaps decidem se fecham ou continuam. O ATR calculado nestes minutos sobrestima o resto do dia. Esperar que a primeira meia hora termine e usar o seu máximo e mínimo como referência.",
+      "source": "conhecimento geral de trading e microestrutura (escrito pelo assistente, não medido no teu histórico)"
+    },
+    {
+      "key": "hora:almoço:kb_liquidez",
+      "importance": 0.4,
+      "text": "Entre as 11:30 e as 13:30 ET o volume é mínimo e os breakouts falsos são frequentes. Qualquer proposta neste período exige volume relativo acima da média do mesmo horário; na dúvida, HOLD.",
+      "source": "conhecimento geral de trading e microestrutura (escrito pelo assistente, não medido no teu histórico)"
+    },
+    {
+      "key": "hora:tarde:kb_fecho",
+      "importance": 0.45,
+      "text": "Na última hora o volume sobe e os movimentos de fecho dominam. Não abrir posições nos últimos 30 minutos que o bracket não possa resolver; uma posição que passa o fecho fica exposta ao gap overnight, que o stop não protege.",
+      "source": "conhecimento geral de trading e microestrutura (escrito pelo assistente, não medido no teu histórico)"
+    },
+    {
+      "key": "kb_meias_sessoes",
+      "importance": 0.35,
+      "text": "Em dias de meia sessão (véspera do 4 de Julho, Black Friday, véspera de Natal) o mercado fecha às 13:00 ET com liquidez baixa e movimentos erráticos. Reduzir ou não negociar.",
+      "source": "conhecimento geral de trading e microestrutura (escrito pelo assistente, não medido no teu histórico)"
+    },
+    {
+      "key": "kb_vencimentos_rebalanceamentos",
+      "importance": 0.35,
+      "text": "Terceira sexta-feira do mês (vencimento de opções), triple witching (março, junho, setembro, dezembro) e rebalanceamentos de índices trazem volume anómalo e movimentos de fecho sem relação com sinais técnicos. Não interpretar esses movimentos como tendência.",
+      "source": "conhecimento geral de trading e microestrutura (escrito pelo assistente, não medido no teu histórico)"
+    },
+    {
+      "key": "kb_eventos_macro",
+      "importance": 0.45,
+      "text": "FOMC (14:00 ET), CPI e payrolls (08:30 ET) produzem minutos de volatilidade extrema em que o stop é atingido por ruído. Não propor entradas nos 30 minutos à volta destes anúncios.",
+      "source": "conhecimento geral de trading e microestrutura (escrito pelo assistente, não medido no teu histórico)"
+    },
+    {
+      "key": "kb_vol_expansao",
+      "importance": 0.45,
+      "text": "Quando o ATR atual está muito acima da sua mediana recente (expansão de volatilidade), mais stops são atingidos por ruído e o mesmo risco em dólares exige posição menor. Reduzir convicção e tamanho; não aumentar.",
+      "source": "conhecimento geral de trading e microestrutura (escrito pelo assistente, não medido no teu histórico)"
+    },
+    {
+      "key": "kb_vol_contracao",
+      "importance": 0.35,
+      "text": "Contração de volatilidade (ATR baixo, velas pequenas) precede normalmente uma expansão, mas a direção não é conhecida. Um breakout de contração só é proposta válida com volume a confirmar.",
+      "source": "conhecimento geral de trading e microestrutura (escrito pelo assistente, não medido no teu histórico)"
+    },
+    {
+      "key": "kb_correlacao_indice",
+      "importance": 0.45,
+      "text": "Intradiariamente a maior parte do movimento de uma ação é o movimento do índice. Um BUY com o SPY a cair, ou um SELL com o SPY a subir, exige força relativa evidente (a ação a mover-se contra o índice com volume); caso contrário é apostar contra o mercado inteiro.",
+      "source": "conhecimento geral de trading e microestrutura (escrito pelo assistente, não medido no teu histórico)"
+    },
+    {
+      "key": "kb_gaps",
+      "importance": 0.4,
+      "text": "Gaps de abertura grandes com volume alto tendem a continuar; gaps pequenos com volume fraco tendem a fechar. Em ambos os casos a decisão só se toma depois da primeira meia hora, nunca na vela de abertura.",
+      "source": "conhecimento geral de trading e microestrutura (escrito pelo assistente, não medido no teu histórico)"
+    },
+    {
+      "key": "kb_concentracao_setor",
+      "importance": 0.4,
+      "text": "Várias posições no mesmo setor ou com a mesma exposição (por exemplo, todas as tecnológicas de grande capitalização) são uma única aposta. Com uma posição aberta num setor, uma nova proposta no mesmo setor conta como reforço, não como diversificação.",
+      "source": "conhecimento geral de trading e microestrutura (escrito pelo assistente, não medido no teu histórico)"
+    },
+    {
+      "key": "kb_stops_nao_garantidos",
+      "importance": 0.45,
+      "text": "Um stop de mercado executa ao próximo preço disponível, não ao preço do stop: em gaps, halts e notícias a perda pode exceder a planeada. O tamanho da posição deve suportar uma perda de duas a três vezes o stop sem violar o limite diário.",
+      "source": "conhecimento geral de trading e microestrutura (escrito pelo assistente, não medido no teu histórico)"
+    },
+    {
+      "key": "kb_spread_vs_stop",
+      "importance": 0.45,
+      "text": "Se o spread bid-ask for uma fração relevante da distância ao stop (acima de 10%), o trade começa perdido. Preferir ações com spread de 1 cêntimo e evitar propostas quando o spread alarga.",
+      "source": "conhecimento geral de trading e microestrutura (escrito pelo assistente, não medido no teu histórico)"
+    },
+    {
+      "key": "kb_liquidez_minima",
+      "importance": 0.4,
+      "text": "Ações com volume médio diário abaixo de cerca de 1 milhão de ações ou preço abaixo de 5 USD têm spreads largos, halts frequentes e movimentos manipuláveis. Não são adequadas a um bot intradiário com stops.",
+      "source": "conhecimento geral de trading e microestrutura (escrito pelo assistente, não medido no teu histórico)"
+    },
+    {
+      "key": "kb_luld_ssr",
+      "importance": 0.4,
+      "text": "Uma queda de 10% face ao fecho anterior ativa a restrição de venda a descoberto (SSR) até ao fim do dia seguinte, e os halts de volatilidade (LULD) bloqueiam saídas durante minutos. Evitar shorts em ações que já caíram 10% e qualquer entrada em ação que acabou de sair de um halt.",
+      "source": "conhecimento geral de trading e microestrutura (escrito pelo assistente, não medido no teu histórico)"
+    },
+    {
+      "key": "kb_short_assimetria",
+      "importance": 0.4,
+      "text": "Um short tem perda teoricamente ilimitada, custo de empréstimo e risco de squeeze em ações com short interest alto e float pequeno. A barra de evidência para SELL a descoberto é mais alta do que para BUY.",
+      "source": "conhecimento geral de trading e microestrutura (escrito pelo assistente, não medido no teu histórico)"
+    },
+    {
+      "key": "kb_ex_dividendo",
+      "importance": 0.3,
+      "text": "No dia ex-dividendo a ação abre ajustada pelo valor do dividendo. Esse gap não é informação sobre a tendência e não deve gerar proposta.",
+      "source": "conhecimento geral de trading e microestrutura (escrito pelo assistente, não medido no teu histórico)"
+    },
+    {
+      "key": "kb_resultados_pos_fecho",
+      "importance": 0.45,
+      "text": "Uma posição intradiária nunca deve ficar aberta para o fecho no dia em que a empresa reporta resultados após o fecho: o gap do dia seguinte ignora o stop. O blackout de resultados existe para isso.",
+      "source": "conhecimento geral de trading e microestrutura (escrito pelo assistente, não medido no teu histórico)"
+    },
+    {
+      "key": "kb_halt_noticias",
+      "importance": 0.35,
+      "text": "Um ativo sem velas recentes (halt de notícias ou de volatilidade) reabre com gap. Não propor nada sobre um ativo cujos dados estejam parados.",
+      "source": "conhecimento geral de trading e microestrutura (escrito pelo assistente, não medido no teu histórico)"
+    },
+    {
+      "key": "kb_fora_de_horas",
+      "importance": 0.3,
+      "text": "Pré-mercado e after-hours têm liquidez mínima e spreads largos; indicadores calculados com essas velas ficam distorcidos. O bot decide só em horário regular.",
+      "source": "conhecimento geral de trading e microestrutura (escrito pelo assistente, não medido no teu histórico)"
+    },
+    {
+      "key": "regime:lateral:kb_reversao",
+      "importance": 0.4,
+      "text": "Em mercado lateral (preço a oscilar em torno das médias) os extremos de RSI funcionam como reversão à média e os breakouts falham. Propor entradas nos extremos com alvo no centro do intervalo, não breakouts.",
+      "source": "conhecimento geral de trading e microestrutura (escrito pelo assistente, não medido no teu histórico)"
+    },
+    {
+      "key": "regime:alta:kb_pullback",
+      "importance": 0.4,
+      "text": "Em tendência de alta, o RSI pode ficar acima de 70 durante horas; vender a descoberto por 'sobrecompra' é apanhar facas. As melhores entradas são pullbacks à EMA ou à VWAP com volume a secar, não compras em máximos.",
+      "source": "conhecimento geral de trading e microestrutura (escrito pelo assistente, não medido no teu histórico)"
+    },
+    {
+      "key": "regime:baixa:kb_facas",
+      "importance": 0.4,
+      "text": "Em tendência de baixa, comprar por 'sobrevenda' do RSI é apanhar facas: o RSI pode ficar abaixo de 30 durante horas. Só propor BUY contra tendência de baixa com inversão confirmada (cruzamento das médias e volume).",
+      "source": "conhecimento geral de trading e microestrutura (escrito pelo assistente, não medido no teu histórico)"
+    },
+    {
+      "key": "rsi:sobrecompra:kb_contexto",
+      "importance": 0.35,
+      "text": "RSI acima de 70 significa coisas diferentes consoante o regime: em lateral é sinal de reversão, em tendência de alta é sinal de força. Ler o RSI sempre junto da tendência das médias, nunca isolado.",
+      "source": "conhecimento geral de trading e microestrutura (escrito pelo assistente, não medido no teu histórico)"
+    },
+    {
+      "key": "rsi:sobrevenda:kb_contexto",
+      "importance": 0.35,
+      "text": "RSI abaixo de 30 significa coisas diferentes consoante o regime: em lateral é sinal de reversão, em tendência de baixa é sinal de fraqueza. Ler o RSI sempre junto da tendência das médias, nunca isolado.",
+      "source": "conhecimento geral de trading e microestrutura (escrito pelo assistente, não medido no teu histórico)"
+    },
+    {
+      "key": "kb_vwap",
+      "importance": 0.4,
+      "text": "Preço acima da VWAP indica controlo comprador intradiário e abaixo controlo vendedor; o fluxo institucional executa à volta da VWAP. Vender a descoberto acima da VWAP ou comprar abaixo dela, contra o momentum, é operar contra esse fluxo.",
+      "source": "conhecimento geral de trading e microestrutura (escrito pelo assistente, não medido no teu histórico)"
+    },
+    {
+      "key": "kb_volume_confirma",
+      "importance": 0.45,
+      "text": "Um breakout sem volume relativo pelo menos 1,5 vezes acima da média do mesmo horário é suspeito e tende a falhar. Volume confirma; preço sozinho não.",
+      "source": "conhecimento geral de trading e microestrutura (escrito pelo assistente, não medido no teu histórico)"
+    },
+    {
+      "key": "kb_multiplos_timeframes",
+      "importance": 0.4,
+      "text": "Um sinal de 5 minutos contra a tendência de 30 minutos e diária tem menor taxa de acerto. Propor na direção do timeframe superior; contra ele, só com inversão confirmada.",
+      "source": "conhecimento geral de trading e microestrutura (escrito pelo assistente, não medido no teu histórico)"
+    },
+    {
+      "key": "kb_nao_mediar_perda",
+      "importance": 0.4,
+      "text": "Não fazer média em perda: a posição perdedora já tem o stop que a resolve. Reforçar uma posição em perda é duplicar o erro, e por isso o sistema não permite pirâmide.",
+      "source": "conhecimento geral de trading e microestrutura (escrito pelo assistente, não medido no teu histórico)"
+    },
+    {
+      "key": "kb_revenge_trading",
+      "importance": 0.4,
+      "text": "Entrar outra vez no mesmo ativo logo após um stop é revenge trading: o mercado não deve nada. O cooldown existe para isso; depois de um stop, a próxima proposta nesse ativo precisa de um sinal novo e completo.",
+      "source": "conhecimento geral de trading e microestrutura (escrito pelo assistente, não medido no teu histórico)"
+    },
+    {
+      "key": "kb_assimetria",
+      "importance": 0.45,
+      "text": "Com alvo de 2 vezes o stop, 45% de acertos ainda dá lucro depois de custos; com alvo igual ao stop é preciso mais de 55%. Propor só entradas em que o alvo natural (resistência, VWAP, máximo da sessão) está claramente mais longe do que o stop.",
+      "source": "conhecimento geral de trading e microestrutura (escrito pelo assistente, não medido no teu histórico)"
+    },
+    {
+      "key": "kb_pdt",
+      "importance": 0.3,
+      "text": "Contas com menos de 25 000 USD estão limitadas a 3 day trades em 5 dias úteis enquanto a regra PDT estiver em vigor na corretora. O bot deve contar day trades em contas pequenas.",
+      "source": "conhecimento geral de trading e microestrutura (escrito pelo assistente, não medido no teu histórico); FINRA Rule 4210 (em transição em 2026-2027)"
     }
   ]
 }
