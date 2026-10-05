@@ -13,6 +13,33 @@ from .trading_engine import TradingEngine
 from .ui_bus import UIBus, setup_logging
 
 
+def _import_seed_lessons(settings: Settings, db: Database, log: logging.Logger) -> None:
+    """Carrega as lições iniciais uma única vez (marca em kv)."""
+    path = settings.seed_lessons_file
+    if not path:
+        return
+    from pathlib import Path
+
+    from .config import resource_path
+    from .lessons import import_seed_lessons
+
+    candidate = Path(path)
+    if not candidate.is_absolute() and not candidate.exists():
+        candidate = resource_path(path)
+    if not candidate.exists():
+        log.warning("Ficheiro de lições iniciais não encontrado: %s", path)
+        return
+    marker = f"seed_imported:{candidate.name}:{candidate.stat().st_mtime_ns}"
+    if db.get_kv(marker):
+        return
+    try:
+        n = import_seed_lessons(db, str(candidate))
+        db.set_kv(marker, "1")
+        log.info("Lições iniciais: %d importadas de %s", n, candidate)
+    except (OSError, ValueError) as exc:
+        log.error("Falha a importar lições iniciais: %s", exc)
+
+
 def main() -> int:
     multiprocessing.freeze_support()  # inofensivo fora do PyInstaller; necessário no Windows
     settings = Settings.load()
@@ -21,6 +48,7 @@ def main() -> int:
     log.info("Dados em %s", app_data_dir())
 
     db = Database(settings.db_path())
+    _import_seed_lessons(settings, db, log)
     brain = OllamaBrain(settings, db)
     engine = TradingEngine(settings, db, bus, brain)
     engine.start()

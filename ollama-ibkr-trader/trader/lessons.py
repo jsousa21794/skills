@@ -124,7 +124,10 @@ class LessonEngine:
         for l in found:
             self.db.upsert_lesson(key=l["key"], symbol=l["symbol"], text=l["text"], support=l["support"],
                                   effect=l["effect"], importance=l["importance"])
-        self.db.deactivate_lessons_except([l["key"] for l in found])
+        # Lições iniciais (importadas) mantêm-se ativas: têm importância fixa baixa e são
+        # ultrapassadas pelas lições medidas assim que estas existem.
+        seeds = [l["key"] for l in self.db.active_lessons() if l["key"].startswith("seed:")]
+        self.db.deactivate_lessons_except([l["key"] for l in found] + seeds)
         log.info("Lições recalculadas: %d ativas (base %.0f%% em %d decisões).", len(found), base * 100, len(directional))
         return found
 
@@ -161,3 +164,32 @@ class LessonEngine:
             scored.append((l["importance"] * relevance, l["text"]))
         scored.sort(key=lambda t: t[0], reverse=True)
         return [t for _, t in scored[:k]]
+
+
+SEED_IMPORTANCE = 0.5  # abaixo de qualquer lição medida (|z| >= 1.64 com suporte >= 12 dá >= 5.7)
+
+
+def import_seed_lessons(db: Database, path: str) -> int:
+    """Importa lições iniciais de um JSON: [{"key", "text", "symbol"?, "source"?}, ...].
+
+    Cada lição fica com a chave ``seed:<key>``, suporte 0 e importância fixa baixa,
+    e inclui a fonte no texto para o LLM e para auditoria. Idempotente.
+    """
+    import json
+    from pathlib import Path
+
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    items = data.get("lessons", data) if isinstance(data, dict) else data
+    count = 0
+    for item in items:
+        key = str(item.get("key") or "").strip()
+        text = str(item.get("text") or "").strip()
+        if not key or not text:
+            continue
+        source = str(item.get("source") or "").strip()
+        full = f"{text} [fonte: {source}]" if source else text
+        db.upsert_lesson(key=f"seed:{key}", symbol=item.get("symbol"), text=full, support=int(item.get("support") or 0),
+                         effect=0.0, importance=float(item.get("importance") or SEED_IMPORTANCE))
+        count += 1
+    log.info("Lições iniciais importadas de %s: %d", path, count)
+    return count

@@ -85,3 +85,24 @@ def test_settlement_counts_moves_below_cost_as_wrong():
     db.update_decision(did2, cost_pct=0.6)
     Settler(s, db, lambda symbol, when: 101.0).run(now)
     assert db._query("SELECT correct FROM decisions WHERE id=?", (did2,))[0]["correct"] == 1
+
+
+def test_seed_lessons_import_is_idempotent_and_survives_rebuild(tmp_path):
+    import json
+    from trader.lessons import import_seed_lessons
+    s = Settings()
+    db = Database(":memory:")
+    path = tmp_path / "seed.json"
+    path.write_text(json.dumps({"lessons": [
+        {"key": "open_window", "text": "Não abrir posições nos primeiros 15 minutos.", "source": "arXiv 1009.4785"},
+        {"key": "rsi_extreme", "text": "Não comprar com RSI acima de 75.", "symbol": None},
+        {"key": "", "text": "ignorada"},
+    ]}), encoding="utf-8")
+    assert import_seed_lessons(db, str(path)) == 2
+    assert import_seed_lessons(db, str(path)) == 2
+    active = db.active_lessons()
+    assert len(active) == 2 and all(l["key"].startswith("seed:") for l in active)
+    assert any("[fonte: arXiv 1009.4785]" in l["text"] for l in active)
+    LessonEngine(s, db).rebuild()  # sem decisões: seeds continuam ativas
+    assert len(db.active_lessons()) == 2
+    assert LessonEngine(s, db).for_prompt("AAPL", k=1)
