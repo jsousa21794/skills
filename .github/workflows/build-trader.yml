@@ -2,6 +2,11 @@ name: Build Ollama IBKR Trader
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Se preenchido (ex.: trader-v1.0.0), cria uma Release com os executáveis"
+        required: false
+        default: ""
   push:
     branches: ["claude/trading-system-ollama-ibkr-3qzwm3", "main"]
     paths: ["ollama-ibkr-trader/**", ".github/workflows/build-trader.yml"]
@@ -64,8 +69,24 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ollama-ibkr-trader/${{ matrix.binary }}
           if-no-files-found: error
-      - name: Attach to release (tags only)
-        if: startsWith(github.ref, 'refs/tags/trader-v')
+      - name: Rename binary with platform suffix
+        shell: bash
+        run: |
+          mkdir -p release
+          case "${{ runner.os }}" in
+            Windows) cp dist/OllamaIBKRTrader.exe release/OllamaIBKRTrader-windows-x64.exe ;;
+            macOS)   cp dist/OllamaIBKRTrader release/OllamaIBKRTrader-macos ;;
+            Linux)   cp dist/OllamaIBKRTrader release/OllamaIBKRTrader-linux-x64 ;;
+          esac
+          ls -la release/
+      - name: Attach to release (tag push or manual release_tag)
+        if: startsWith(github.ref, 'refs/tags/trader-v') || inputs.release_tag != ''
         uses: softprops/action-gh-release@v2
         with:
-          files: ollama-ibkr-trader/${{ matrix.binary }}
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
+          name: Ollama IBKR Trader ${{ inputs.release_tag || github.ref_name }}
+          target_commitish: ${{ github.sha }}
+          body: |
+            Executáveis compilados pelo GitHub Actions a partir de `ollama-ibkr-trader/` (commit ${{ github.sha }}).
+            Windows: `OllamaIBKRTrader-windows-x64.exe`. Requer TWS/IB Gateway com API ativa e Ollama a correr localmente.
+          files: ollama-ibkr-trader/release/*
