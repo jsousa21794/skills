@@ -174,6 +174,7 @@ class TradingEngine:
                  self.risk_multiplier, self.settings.stop_mode, "Platt" if self.calibrator.is_fitted else "heurística",
                  self.brain.prompt_version)
         await self._refresh_models()
+        self.bus.emit("equity_history", points=self.equity_history())
         tasks = [
             asyncio.create_task(self._cycle_loop(), name="cycle"),
             asyncio.create_task(self._portfolio_loop(), name="portfolio"),
@@ -223,6 +224,39 @@ class TradingEngine:
         if self.ibkr.connected:
             for symbol in cleaned:
                 await self.ibkr.subscribe_bars(symbol)
+
+    async def set_mode(self, mode: str, confirmed: bool = False) -> bool:
+        """Alterna entre paper (7497) e real (7496). Modo real exige confirmação explícita."""
+        mode = "live" if mode == "live" else "paper"
+        if mode == self.settings.trading_mode and self.ibkr.connected:
+            return True
+        if mode == "live" and not confirmed:
+            log.error("Modo REAL recusado: falta confirmação explícita.")
+            return False
+        was_trading = self.trading_enabled
+        self.trading_enabled = False
+        await self.ibkr.disconnect()
+        self._last_llm.clear()
+        self._persistence.clear()
+        self.settings.trading_mode = mode
+        self.settings.live_confirmed = bool(mode == "live" and confirmed)
+        self.settings.save()
+        self.db.record_experiment("config", f"mode={mode}")
+        if mode == "live":
+            log.critical("MODO REAL ATIVADO (porta %d). Ordens com dinheiro real. Camada de risco: %.2f%%/trade, "
+                         "kill-switch %.0f%%/dia, StoplossGuard %d stops.", self.settings.ib_port,
+                         self.settings.risk_per_trade_pct * 100, self.settings.daily_loss_limit_pct * 100,
+                         self.settings.stoploss_guard_count)
+        else:
+            log.warning("Modo PAPER ativado (porta %d).", self.settings.ib_port)
+        ok = await self._ensure_connected()
+        self.trading_enabled = was_trading and ok
+        self._emit_status()
+        return ok
+
+    def equity_history(self, hours: int = 48) -> list[tuple[str, float]]:
+        rows = self.db.equity_series(datetime.now(timezone.utc) - timedelta(hours=hours))
+        return [(ts.isoformat(), v) for ts, v in rows]
 
     async def run_retrospective(self) -> dict[str, Any]:
         log.info("Retrospetiva manual iniciada…")
@@ -335,6 +369,11 @@ class TradingEngine:
             try:
                 state = self.ibkr.portfolio_state()
                 now = datetime.now(timezone.utc)
+                open_trades = {t["symbol"]: t for t in self.db.open_trades()}
+                for pos in state.get("positions", []):
+                    trade = open_trades.get(pos["symbol"])
+                    pos["stop"] = trade["stop_price"] if trade else None
+                    pos["tp"] = trade["tp_price"] if trade else None
                 self.gate.update_day_baseline(state.get("net_liq"), now)
                 pct = self.gate.day_pnl_pct(state.get("net_liq"))
                 state["day_pnl_pct"] = round(pct, 3) if pct is not None else None
@@ -470,10 +509,12 @@ class TradingEngine:
                 f"{ctx.snapshot.rsi:.0f}" if ctx.snapshot.rsi is not None else "n/d",
                 f"{ctx.dynamics.atr_pct:.2f}" if ctx.dynamics and ctx.dynamics.atr_pct is not None else "n/d",
                 decision.razao, extra={"category": "ollama"})
-        self.bus.emit("decision", symbol=symbol, decision=decision.to_dict(), snapshot=ctx.snapshot.to_dict(),
-                      agree_frac=outcome.agree_frac, calibrated=calibrated)
+        self.bus.emit("decision", decision_id=decision_id, symbol=symbol, decision=decision.to_dict(),
+                      snapshot=ctx.snapshot.to_dict(), agree_frac=outcome.agree_frac, calibrated=calibrated,
+                      model=(outcome.models[0] if outcome.models else self.brain.model))
         if outcome.review:
             self.db.mark_decision(decision_id, executed=False, skip_reason="REVIEW")
+            self.bus.emit("decision_result", decision_id=decision_id, executed=False, reason="REVIEW")
             return
         await self._execute(outcome, calibrated, ctx, state, decision_id, position_qty, global_gate)
 
@@ -487,6 +528,7 @@ class TradingEngine:
 
         def skip(reason: str) -> None:
             self.db.mark_decision(decision_id, executed=False, skip_reason=reason)
+            self.bus.emit("decision_result", decision_id=decision_id, executed=False, reason=reason)
             if action != "HOLD":
                 log.info("[%s] %s não executado: %s", symbol, action, reason)
 
@@ -520,6 +562,7 @@ class TradingEngine:
                     ref_price=ctx.snapshot.price, tp_price=None, sl_price=None)
                 self._pending_close[symbol] = group_id
                 self.db.mark_decision(decision_id, executed=True)
+                self.bus.emit("decision_result", decision_id=decision_id, executed=True, reason="fecho de posição")
                 log.warning("[%s] Sinal %s contra posição existente: posição FECHADA (ordem %d).",
                             symbol, action, result["order_id"])
             else:
@@ -586,6 +629,8 @@ class TradingEngine:
                            qty=sizing.qty, stop_price=sizing.stop_price, tp_price=sizing.tp_price,
                            risk_amount=sizing.risk_amount)
         self.db.mark_decision(decision_id, executed=True)
+        self.bus.emit("decision_result", decision_id=decision_id, executed=True,
+                      reason=f"{action} x{sizing.qty} SL {sizing.stop_price:.2f} TP {sizing.tp_price:.2f}")
         self._persistence[symbol] = []
         log.warning("[%s] EXECUTADO %s x%d @~%.2f | SL %.2f | TP %.2f | risco %.0f USD (%.2f%% ×%.2f, ATR %.2f) | "
                     "p=%.2f ≥ %.2f | %s",
@@ -713,4 +758,14 @@ class TradingEngine:
             llm_interval=self.settings.llm_interval_minutes,
             llm_samples=self.settings.llm_samples,
             n_trials=self.db.experiment_count(),
+            mode=self.settings.trading_mode,
+            port=self.settings.ib_port,
+            accounts=list(getattr(self.ibkr, "accounts", [])),
+            lesson_texts=[l["text"] for l in self.db.active_lessons()[:5]],
+            gates_detail=(self.db.latest_report("weekly") or {}).get("gates"),
+            risk_summary={"stop_mode": self.settings.stop_mode, "atr_mult": self.settings.atr_stop_multiple,
+                          "rr": self.settings.reward_risk_ratio, "daily_loss": self.settings.daily_loss_limit_pct,
+                          "max_positions": self.settings.max_open_positions,
+                          "cooldown": self.settings.cooldown_minutes,
+                          "stoploss_guard": self.settings.stoploss_guard_count},
         )

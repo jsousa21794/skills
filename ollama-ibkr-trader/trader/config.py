@@ -44,7 +44,11 @@ def app_data_dir() -> Path:
 class Settings:
     # ---- Interactive Brokers -------------------------------------------------
     ib_host: str = "127.0.0.1"
-    ib_port: int = 7497  # 7497 = TWS Paper, 4002 = Gateway Paper
+    trading_mode: str = "paper"  # "paper" | "live"
+    ib_port_paper: int = 7497  # TWS Paper (Gateway Paper: 4002)
+    ib_port_live: int = 7496  # TWS Real (Gateway Real: 4001)
+    live_confirmed: bool = False  # confirmado na GUI (escrever REAL) antes de ligar em modo real
+    ui_always_on_top: bool = False
     ib_client_id: int = 17
     market_data_type: int = 3  # 1 = tempo real, 3 = atrasado (funciona sem subscrição)
     symbols: list[str] = field(default_factory=lambda: ["AAPL", "TSLA"])
@@ -201,6 +205,14 @@ class Settings:
             )
         except OSError:
             pass
+
+    @property
+    def is_live(self) -> bool:
+        return self.trading_mode == "live"
+
+    @property
+    def ib_port(self) -> int:
+        return self.ib_port_live if self.is_live else self.ib_port_paper
 
     def db_path(self) -> Path:
         return app_data_dir() / "trader.sqlite3"

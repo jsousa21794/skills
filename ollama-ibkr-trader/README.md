@@ -124,6 +124,27 @@ trader.spec, build.sh/.bat   PyInstaller
 - Gates estatísticos: só quando todos passam o risco por trade sobe de 0,5%
   para 1%. O bot nunca "decide" sair do paper: isso é teu.
 
+## Interface
+
+- **Cabeçalho permanente** com o valor da carteira (Net Liquidation), variação do
+  dia, estado IBKR/Ollama/ciclo/dados. Sem ligação, mostra o **último valor
+  conhecido** com a hora, lido do histórico em SQLite; o título da janela
+  repete o valor para ficar visível na barra de tarefas. Interruptor "Janela
+  sempre visível" (always-on-top).
+- **Conta**: seletor *Paper* / *Real* na barra lateral. *Real* liga à porta
+  7496 (TWS) e exige escrever `REAL` numa caixa de confirmação; o distintivo
+  no cabeçalho passa a vermelho. Ao ligar, o bot confirma o tipo de conta pelo
+  identificador (`DU…` = paper): em modo paper com conta real desliga-se por
+  segurança; em modo real com conta paper avisa. Não é preciso passar por
+  paper: a camada de risco, o kill-switch e os brackets funcionam igual em
+  ambos os modos, e os gates estatísticos apenas decidem se o risco por trade
+  é 0,5% ou 1%.
+- **Separadores**: *Visão geral* (cartões, gráfico do valor da carteira nas
+  últimas 48 h, posições com stop e take-profit), *Decisões* (cada proposta do
+  LLM com confiança verbal, acordo, probabilidade calibrada e o veredicto da
+  camada de risco), *Risco* (proteções ativas, gates, calibração, lições) e
+  *Consola*.
+
 ## Instalação
 
 ```bash
@@ -135,9 +156,9 @@ python main.py
 
 Requisitos:
 - Python 3.10+ (exigido pelo `ib_async`) com Tk (`sudo apt install python3-tk` no Linux).
-- **TWS ou IB Gateway** em Paper Trading com API ativa: *Configure → API →
-  Settings*: ✔ Enable ActiveX and Socket Clients, ✘ Read-Only API, porta
-  **7497**, 127.0.0.1 nos Trusted IPs. Sem subscrição, o paper usa dados com
+- **TWS ou IB Gateway** com API ativa: *Configure → API → Settings*:
+  ✔ Enable ActiveX and Socket Clients, ✘ Read-Only API, porta **7497**
+  (paper) ou **7496** (real), 127.0.0.1 nos Trusted IPs. Sem subscrição, o paper usa dados com
   15 min de atraso; o bot avisa e as métricas de qualidade do LLM não são válidas.
 - **Ollama** (`ollama serve`) com pelo menos um modelo; o dropdown lista `/api/tags`.
 

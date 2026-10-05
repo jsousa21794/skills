@@ -62,6 +62,7 @@ class IBKRClient:
         self._connecting = False
         self._disconnect_handled = False
         self.data_delayed: Optional[bool] = None  # True quando o feed é atrasado (paper sem subscrição)
+        self.accounts: list[str] = []
         self._hist_times: list[float] = []  # pacing de pedidos históricos
         self._hist_lock: Optional[asyncio.Lock] = None
 
@@ -89,8 +90,20 @@ class IBKRClient:
             self.ib.reqMarketDataType(self.settings.market_data_type)
             self._disconnect_handled = False
             accounts = self.ib.managedAccounts()
-            log.info("IBKR ligado (%s:%s) conta(s): %s",
-                     self.settings.ib_host, self.settings.ib_port, ", ".join(accounts) or "?")
+            self.accounts = list(accounts)
+            is_paper_account = all(a.startswith("DU") for a in accounts) if accounts else None
+            log.info("IBKR ligado (%s:%s) conta(s): %s [%s]",
+                     self.settings.ib_host, self.settings.ib_port, ", ".join(accounts) or "?",
+                     "PAPER" if is_paper_account else "REAL" if is_paper_account is False else "?")
+            if self.settings.is_live and is_paper_account:
+                log.warning("Modo REAL selecionado mas a conta ligada (%s) é de Paper Trading.", ", ".join(accounts))
+            if not self.settings.is_live and is_paper_account is False:
+                log.critical("Modo PAPER selecionado mas a conta ligada (%s) é REAL. A desligar por segurança.",
+                             ", ".join(accounts))
+                self.ib.disconnect()
+                return False
+            if self.settings.is_live and is_paper_account is False:
+                log.critical("CONTA REAL LIGADA (%s): todas as ordens usam dinheiro real.", ", ".join(accounts))
             return True
         except (asyncio.TimeoutError, ConnectionRefusedError, OSError) as exc:
             log.error("Falha ao ligar à IBKR em %s:%s — %s. A TWS está aberta com a API ativa?",
