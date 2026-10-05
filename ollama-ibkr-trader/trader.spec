@@ -14,6 +14,7 @@ for pkg in ("customtkinter", "ib_async", "eventkit"):
     binaries += b
     hiddenimports += h
 hiddenimports += collect_submodules("trader")
+datas += [("data/seed_lessons.json", "data")]
 hiddenimports += ["nest_asyncio", "tzdata", "zoneinfo", "sqlite3", "requests", "darkdetect", "yfinance"]
 
 a = Analysis(

@@ -1,0 +1,65 @@
+{
+  "_sobre": "Lições iniciais com fonte, derivadas da pesquisa em research_notes/. Importância baixa (0.3-0.6): são substituídas pelas lições medidas nas tuas próprias decisões assim que houver suporte estatístico. Edita à vontade; o bot reimporta quando o ficheiro muda.",
+  "lessons": [
+    {
+      "key": "abertura_volatil",
+      "importance": 0.6,
+      "text": "A volatilidade intradiária tem forma em U: os primeiros 15-30 minutos após a abertura e os últimos minutos são os mais voláteis e o ATR calculado nessa janela desalinha o dimensionamento. Não propor entradas na abertura; preferir HOLD até a volatilidade estabilizar.",
+      "source": "Allez & Bouchaud, arXiv 1009.4785; ICI, volatilidade do S&P 500 nos primeiros 30 min"
+    },
+    {
+      "key": "dinamica_nao_niveis",
+      "importance": 0.6,
+      "text": "O conteúdo preditivo dos indicadores está na sua dinâmica (cruzamentos, mudanças de sinal, saída de zonas extremas do RSI), não nos valores estáticos. 'RSI em 58' não é sinal; 'RSI cruzou 30 para cima com EMA a cruzar a SMA' é.",
+      "source": "arXiv 2605.05211 (revisão 2026 de algoritmos LLM vs regras de análise técnica)"
+    },
+    {
+      "key": "hold_por_omissao",
+      "importance": 0.55,
+      "text": "Modelos de linguagem a prever a direção do preço acertam cerca de 50-57% (GPT-4: 53% no ACL18; FinBen: 0,41-0,57 em 14 modelos). Sem confluência de pelo menos dois sinais em transição, a resposta com melhor valor esperado é HOLD.",
+      "source": "Ploutos (ACL18: GPT-4 acc 53,08%, MCC 0,023); FinBen arXiv 2402.12659"
+    },
+    {
+      "key": "custos_comem_lucro",
+      "importance": 0.55,
+      "text": "A comissão IBKR é 0,005 USD por ação com mínimo de 1 USD por ordem: uma ida e volta custa pelo menos 2 USD mais slippage. Um alvo de lucro que não cubra várias vezes esse custo é prejuízo; não propor entradas em movimentos esperados pequenos.",
+      "source": "IBKR Pro Fixed pricing (excerto); cálculo próprio"
+    },
+    {
+      "key": "sobreconfianca",
+      "importance": 0.5,
+      "text": "Modelos pequenos verbalizam confiança 'perto do teto' mesmo quando acertam perto do acaso. Reportar confiança acima de 0,8 só com confluência clara; a confiança é calibrada contra o resultado real e a sobreconfiança baixa a probabilidade atribuída.",
+      "source": "arXiv 2608.05064 (calibração de modelos 0,5B-14B); Xiong et al., ICLR 2024"
+    },
+    {
+      "key": "saidas_mecanicas",
+      "importance": 0.5,
+      "text": "Em produção, saídas mecânicas (stop e take-profit fixos em volatilidade) superaram a discrição de agentes LLM em 39 pontos base por posição; 43% das posições chegaram a +300 pb e 49% fecharam em perda por não realizar. Propor a ação e deixar o stop e o alvo ao sistema de risco.",
+      "source": "DXRG, registo contínuo de 231 638 turnos (arXiv 2609.05663)"
+    },
+    {
+      "key": "volatilidade_tamanho",
+      "importance": 0.45,
+      "text": "O padrão de falha dominante dos agentes LLM é exposição constante independentemente da volatilidade. Em expansão de volatilidade (ATR elevado face ao histórico) o risco por trade deve cair, não subir; propor BUY/SELL com menos convicção quando o ATR dispara.",
+      "source": "DXRG (alavancagem mediana constante em todos os sextis de volatilidade)"
+    },
+    {
+      "key": "stops_em_serie",
+      "importance": 0.45,
+      "text": "Vários stops seguidos no mesmo ativo em poucas horas indicam entradas em ruído, não azar. Depois de dois stops num ativo, exigir confirmação de tendência em velas de 30 minutos antes de voltar a propor entrada.",
+      "source": "freqtrade protections (StoplossGuard) docs; prática de risco"
+    },
+    {
+      "key": "contra_tendencia",
+      "importance": 0.4,
+      "text": "Comprar com o preço abaixo da SMA rápida e da SMA lenta, ou vender a descoberto acima de ambas, é operar contra a tendência de fundo. Só propor contra-tendência com inversão confirmada (cruzamento das médias), nunca com base num único RSI extremo.",
+      "source": "Regra de análise técnica comum; consistente com arXiv 2605.05211"
+    },
+    {
+      "key": "noticias_2h",
+      "importance": 0.35,
+      "text": "O poder preditivo do sentimento de notícias sobre o preço concentra-se nas primeiras duas horas após a notícia. Sentimento antigo não justifica uma entrada; sentimento fortemente negativo recente contraria um BUY.",
+      "source": "Estudo AUT sobre sentimento intradiário; Lopez-Lira & Tang arXiv 2304.07619"
+    }
+  ]
+}

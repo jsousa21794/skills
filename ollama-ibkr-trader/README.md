@@ -58,11 +58,13 @@ trader/
                              WFE, gates → multiplicador de risco; relatório markdown
   retrospective.py           orquestra settlement → lições → calibração → relatório
   backtest.py                replay offline (CSV/Alpaca) com cache de decisões e custos
+  lessons_offline.py         lições calculadas a partir de histórico de velas de 1 min
+data/seed_lessons.json       lições iniciais com fonte (importadas uma vez)
   sentiment.py               FinBERT opcional (feature + veto)
   volmodel.py                Chronos-Bolt opcional com fallback EWMA (largura p90−p10)
   database.py                SQLite: decisões (c/ settlement), ordens, trades, fills, P&L,
                              lições, cache, experiências, protections, relatórios
-tests/                       69 testes offline (IBKR e Ollama simulados)
+tests/                       75 testes offline (IBKR e Ollama simulados)
 trader.spec, build.sh/.bat   PyInstaller
 ```
 
@@ -123,6 +125,49 @@ trader.spec, build.sh/.bat   PyInstaller
   vol EWMA. Bloqueia entradas quando a largura prevista excede 3%.
 - Gates estatísticos: só quando todos passam o risco por trade sobe de 0,5%
   para 1%. O bot nunca "decide" sair do paper: isso é teu.
+
+## Custos: a comissão faz parte do P&L
+
+Pagar 1 USD de comissão para ganhar 0,50 USD é prejuízo. Por isso:
+- cada execução regista a comissão (o `CommissionReport` real da IBKR quando
+  chega; até lá, a estimativa 0,005 USD/ação com mínimo de 1 USD); os trades
+  guardam P&L bruto, comissões e P&L líquido, e é o líquido que entra em todas
+  as métricas, lições e gates;
+- o gate de custos recusa a entrada se a comissão ida+volta exceder 20% do
+  ganho bruto no take-profit, se o ganho líquido no TP for inferior a 3× o
+  custo, ou se o valor esperado líquido com a probabilidade calibrada for
+  negativo; o limiar de execução já incorpora o custo no break-even;
+- no settlement, um movimento menor do que o custo ida+volta nunca conta como
+  acerto;
+- a consola e a tabela de decisões mostram custo e ganho líquido no TP; o
+  cartão "P&L realizado" mostra as comissões do dia; o relatório mostra a
+  fração do lucro bruto consumida por comissões.
+
+## Lições iniciais e material de treino
+
+A pesquisa no GitHub e no Hugging Face (notas em
+`../research_notes/Material de treino para o bot/`) não encontrou nenhum
+corpus de "lições" de agentes LLM de trading pronto a importar, nem datasets
+de features técnicas intradiárias → BUY/SELL/HOLD, nem adaptadores LoRA para
+isso em modelos compatíveis com o bot. O Ollama atual, além disso, deixou de
+aceitar adaptadores LoRA (só GGUF já fundidos). O que existe e é usável:
+
+- **`data/seed_lessons.json`**: 10 lições iniciais com fonte, derivadas da
+  literatura (volatilidade da abertura, dinâmica vs níveis, custos,
+  sobreconfiança, saídas mecânicas, volatilidade e tamanho). São importadas
+  uma vez no arranque (`seed_lessons_file`), têm importância baixa e são
+  ultrapassadas pelas lições medidas nas tuas decisões assim que houver
+  suporte estatístico.
+- **`python -m trader.lessons_offline`**: calcula lições reais a partir de
+  velas de 1 minuto (CSV, ou Parquet dos datasets Hugging Face
+  `Rrishab/OHLCV-1m` / `ggaddam/OHLCV-1m`), com os mesmos indicadores do bot,
+  sinais em transição e retorno a 30 minutos líquido de custos. Produz um JSON
+  no mesmo formato, pronto a apontar por `seed_lessons_file`.
+- Para avaliação (não treino): `TheFinAI/flare-sm-acl` e irmãos (diário,
+  tweets, 2014-2018) com o scorer do PIXIU.
+- A evitar: LoRAs FinGPT (base Llama-2, rótulos gerados por GPT-4, horizonte
+  semanal), InvestLM/FinMA (licença ou base antiga), Fin-R1 como dados de
+  trading (é QA financeiro). Trading-R1 e o seu dataset não estão publicados.
 
 ## Interface
 

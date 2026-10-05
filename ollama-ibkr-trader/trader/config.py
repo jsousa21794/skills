@@ -132,7 +132,7 @@ class Settings:
     ab_test_models: list[str] = field(default_factory=list)  # round-robin para A/B
     anonymize_prompt: bool = True  # ticker e níveis de preço ocultados ao LLM
     lessons_in_prompt: int = 3
-    seed_lessons_file: str = ""  # JSON com lições iniciais (ver data/seed_lessons.json); importado uma vez
+    seed_lessons_file: str = "data/seed_lessons.json"  # lições iniciais com fonte; importado uma vez ("" desliga)
     review_retry_temperature: float = 0.0
 
     # ---- Calibração e gates estatísticos -----------------------------------------
