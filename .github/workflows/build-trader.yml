@@ -16,22 +16,7 @@ permissions:
   contents: write
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ollama-ibkr-trader
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: sudo apt-get update && sudo apt-get install -y python3-tk
-      - run: pip install -r requirements.txt pytest
-      - run: python -m pytest -q
-
   build:
-    needs: test
     strategy:
       fail-fast: false
       matrix:
@@ -56,7 +41,9 @@ jobs:
           python-version: "3.12"
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y python3-tk
-      - run: pip install -r requirements.txt pyinstaller
+      - run: pip install -r requirements.txt pyinstaller pytest
+      - name: Tests
+        run: python -m pytest -q
       - run: pyinstaller --clean --noconfirm trader.spec
       - name: Smoke test (binary imports and starts)
         if: runner.os != 'Windows'
