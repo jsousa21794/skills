@@ -217,12 +217,15 @@ DECISION_COLUMNS = {
     "sentiment_n": "INTEGER",
     "generation": "INTEGER",
     "account": "TEXT",
-    "label_source": "TEXT",  # "bracket:entrada" | "bracket:vela" | "direcional" | "censurado" (V09)
+    "label_source": "TEXT",  # "bracket:entrada" | "bracket:vela" | "direcional" | "censurado" | "ledger:*" (V09/W06)
+    "label_final": "INTEGER NOT NULL DEFAULT 1",  # 0 = rótulo provisório (operação ainda aberta no horizonte) (X06)
+    "provisional_correct": "INTEGER",  # rótulo provisório guardado quando o final o substitui (X06)
 }
 HISTORY_COLUMNS = {"perm_id": "INTEGER"}
 TRADE_COLUMNS = {"decision_action": "TEXT", "stop_price": "REAL", "tp_price": "REAL", "risk_amount": "REAL",
                  "commission": "REAL NOT NULL DEFAULT 0", "gross_pnl": "REAL NOT NULL DEFAULT 0", "account": "TEXT"}
-FILL_COLUMNS = {"commission": "REAL", "commission_estimated": "INTEGER NOT NULL DEFAULT 1", "account": "TEXT"}
+FILL_COLUMNS = {"commission": "REAL", "commission_estimated": "INTEGER NOT NULL DEFAULT 1", "account": "TEXT",
+                "client_id": "INTEGER", "perm_id": "INTEGER", "order_ref": "TEXT", "con_id": "INTEGER"}  # identidade original (X02)
 GROUP_COLUMNS = {"account": "TEXT", "con_id": "INTEGER", "order_ref": "TEXT"}
 
 
@@ -295,12 +298,31 @@ class Database:
                 out.add(str(r["account"]))
         return out
 
-    def known_order_ids(self) -> set[int]:
-        rows = self._query("SELECT order_id FROM order_history")
-        ids = {int(r["order_id"]) for r in rows}
-        for r in self._query("SELECT parent_order_id, tp_order_id, sl_order_id FROM order_groups"):
-            ids |= {int(v) for v in (r["parent_order_id"], r["tp_order_id"], r["sl_order_id"]) if v is not None}
-        return ids
+    def known_order_keys(self) -> set[tuple]:
+        """Identidade COMPLETA das ordens conhecidas: (símbolo, conta, conId, orderId). Um número de ordem
+        sozinho não é identidade global (sessões/clientes diferentes reutilizam-no) (X04)."""
+        keys: set[tuple] = set()
+        rows = self._query(
+            """SELECT g.symbol, g.account, g.con_id, h.order_id FROM order_history h JOIN order_groups g ON g.id = h.group_id
+               UNION SELECT symbol, account, con_id, parent_order_id FROM order_groups WHERE parent_order_id IS NOT NULL
+               UNION SELECT symbol, account, con_id, tp_order_id FROM order_groups WHERE tp_order_id IS NOT NULL
+               UNION SELECT symbol, account, con_id, sl_order_id FROM order_groups WHERE sl_order_id IS NOT NULL""")
+        for r in rows:
+            keys.add((r["symbol"], r["account"] or None, r["con_id"] or None, int(r["order_id"])))
+        return keys
+
+    @staticmethod
+    def _same_order(key: tuple, known: set[tuple]) -> bool:
+        symbol, account, con_id, oid = key
+        for k_symbol, k_account, k_con, k_oid in known:
+            if k_oid != oid or k_symbol != symbol:
+                continue
+            if account and k_account and account != k_account:
+                continue
+            if con_id and k_con and int(con_id) != int(k_con):
+                continue
+            return True
+        return False
 
     def merge_open_state_from(self, other: "Database") -> dict[str, int]:
         """Importa de outra base (legado que coexiste com esta) só o estado OPERACIONAL: proteções ainda
@@ -309,8 +331,8 @@ class Database:
         de origem; paper e live nunca são fundidos cegamente (V05)."""
         counts = {"protections": 0, "trades": 0, "duplicates": 0}
         now = utc_now()
-        known_ids = self.known_order_ids()
-        existing = {(t["symbol"], int(t["direction"]), t.get("entry_ts"), round(float(t.get("filled_qty") or 0), 6))
+        known_ids = self.known_order_keys()
+        existing = {(t["symbol"], t.get("account") or None, int(t["direction"]), t.get("entry_ts"), round(float(t.get("filled_qty") or 0), 6))
                     for t in self.open_trades()}
         with self._lock:
             self._conn.execute("BEGIN")
@@ -333,9 +355,10 @@ class Database:
         for t in other.open_trades():
             group = other._query("SELECT * FROM order_groups WHERE id=?", (t["group_id"],))
             g = group[0] if group else None
-            ids = {int(v) for v in ((g.get("parent_order_id"), g.get("tp_order_id"), g.get("sl_order_id")) if g else ()) if v is not None}
-            key = (t["symbol"], int(t["direction"]), t.get("entry_ts"), round(float(t.get("filled_qty") or 0), 6))
-            if (ids and ids & known_ids) or key in existing:
+            keys = {(g["symbol"], g.get("account") or None, g.get("con_id") or None, int(v))
+                    for v in ((g.get("parent_order_id"), g.get("tp_order_id"), g.get("sl_order_id")) if g else ()) if v is not None}
+            key = (t["symbol"], t.get("account") or None, int(t["direction"]), t.get("entry_ts"), round(float(t.get("filled_qty") or 0), 6))
+            if any(self._same_order(k, known_ids) for k in keys) or key in existing:
                 counts["duplicates"] += 1
                 continue
             gid = None
@@ -348,7 +371,7 @@ class Database:
                 for h in other._query("SELECT * FROM order_history WHERE group_id=? AND replaced_ts IS NOT NULL", (g["id"],)):
                     self._conn.execute("INSERT INTO order_history (group_id, leg, order_id, ts, replaced_ts, perm_id) VALUES (?,?,?,?,?,?)",
                                        (gid, h["leg"], h["order_id"], h["ts"], h["replaced_ts"], h.get("perm_id")))
-                known_ids |= ids
+                known_ids |= keys
             self._conn.execute(
                 """INSERT INTO trades (symbol, decision_id, group_id, direction, qty, filled_qty, entry_ts, entry_price,
                    exit_qty, exit_reason, pnl, status, stop_price, tp_price, risk_amount, commission, gross_pnl, account)
@@ -445,13 +468,23 @@ class Database:
             (iso(before),),
         )
 
+    def provisional_decisions(self) -> list[dict[str, Any]]:
+        """Decisões já avaliadas com rótulo PROVISÓRIO (operação ainda aberta na altura) (X06)."""
+        return self._query("SELECT * FROM decisions WHERE settled_ts IS NOT NULL AND label_final=0 ORDER BY ts")
+
+    def finalize_label(self, decision_id: int, *, correct: Optional[int], label_source: str) -> None:
+        self._execute(
+            """UPDATE decisions SET provisional_correct=correct, correct=?, label_source=?, label_final=1 WHERE id=?""",
+            (correct, label_source, decision_id))
+
     def settle_decision(self, decision_id: int, *, settled_price: float, settled_return: float,
                         bench_return: Optional[float], alpha: Optional[float], correct: Optional[int],
-                        horizon_min: int, label_source: Optional[str] = None) -> None:
+                        horizon_min: int, label_source: Optional[str] = None, final: bool = True) -> None:
         self._execute(
             """UPDATE decisions SET settled_ts=?, settled_price=?, settled_return=?, bench_return=?, alpha=?,
-               correct=?, horizon_min=?, label_source=COALESCE(?, label_source) WHERE id=?""",
-            (iso(utc_now()), settled_price, settled_return, bench_return, alpha, correct, horizon_min, label_source, decision_id),
+               correct=?, horizon_min=?, label_source=COALESCE(?, label_source), label_final=? WHERE id=?""",
+            (iso(utc_now()), settled_price, settled_return, bench_return, alpha, correct, horizon_min, label_source,
+             1 if final else 0, decision_id),
         )
 
     def settled_decisions(self, since: Optional[datetime] = None, symbol: Optional[str] = None,
@@ -757,13 +790,16 @@ class Database:
             params.append(int(group_id))
         self._execute(sql, params)
 
-    def unallocated_fills(self, symbol: Optional[str] = None) -> list[dict[str, Any]]:
+    def unallocated_fills(self, symbol: Optional[str] = None, order_id: Optional[int] = None) -> list[dict[str, Any]]:
         """Execuções registadas que ainda não tocaram em nenhum trade (identidade indisponível na altura)."""
         sql = "SELECT f.* FROM fills f WHERE NOT EXISTS (SELECT 1 FROM fill_allocations a WHERE a.exec_id = f.exec_id)"
         params: list[Any] = []
         if symbol:
             sql += " AND f.symbol=?"
             params.append(symbol)
+        if order_id is not None:
+            sql += " AND f.order_id=?"
+            params.append(int(order_id))
         return self._query(sql + " ORDER BY f.id", params)
 
     def perm_id_for(self, group_id: int, order_id: int) -> Optional[int]:
@@ -879,13 +915,17 @@ class Database:
 
     def insert_fill(self, *, exec_id: str, order_id: int, symbol: str, side: str,
                     shares: float, price: float, ts: datetime, commission: float = 0.0,
-                    commission_estimated: bool = True) -> bool:
-        """Devolve False se a execução já estava registada (ib_async pode repetir eventos)."""
+                    commission_estimated: bool = True, account: Optional[str] = None, client_id: Optional[int] = None,
+                    perm_id: Optional[int] = None, order_ref: Optional[str] = None, con_id: Optional[int] = None) -> bool:
+        """Devolve False se a execução já estava registada (ib_async pode repetir eventos). A identidade
+        ORIGINAL (conta, clientId, permId, orderRef, conId) fica persistida para qualquer reprocessamento (X02)."""
         try:
             self._execute(
-                """INSERT INTO fills (ts, exec_id, order_id, symbol, side, shares, price, commission, commission_estimated)
-                   VALUES (?,?,?,?,?,?,?,?,?)""",
-                (iso(ts), exec_id, order_id, symbol, side, shares, price, commission, int(commission_estimated)),
+                """INSERT INTO fills (ts, exec_id, order_id, symbol, side, shares, price, commission, commission_estimated,
+                   account, client_id, perm_id, order_ref, con_id)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (iso(ts), exec_id, order_id, symbol, side, shares, price, commission, int(commission_estimated),
+                 account or None, client_id, perm_id, order_ref, con_id),
             )
             return True
         except sqlite3.IntegrityError:

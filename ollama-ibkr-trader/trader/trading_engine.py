@@ -137,6 +137,8 @@ class TradingEngine:
         self._reconciled = False                              # nenhuma decisão até reconciliar o estado da corretora (N05)
         self._external_positions: set[str] = set()            # posições não abertas pelo bot (N09)
         self._mixed_warned: set[str] = set()                  # posições mistas já assinaladas (V07)
+        self._discrepancies: set[str] = set()                 # ativos com discrepância posição/saídas por resolver (X01)
+        self._reduction_warned: set[str] = set()
         self._last_weekly_report: Optional[date] = None
         self._load_gate_state()
         self.db.record_experiment("config", json.dumps({
@@ -464,6 +466,15 @@ class TradingEngine:
             self.db.set_kv("bound_account", account)
         return True
 
+    def _migration_blocked(self) -> bool:
+        """Falha de migração registada no ficheiro-marcador (independente da base aberta) ou na base atual (X03)."""
+        try:
+            if self.settings.migration_flag_path().exists():
+                return True
+        except OSError:
+            return True
+        return bool(self.db.get_kv("migration_failed"))
+
     def _lock_for(self, symbol: str) -> asyncio.Lock:
         lock = self._symbol_locks.get(symbol)
         if lock is None:
@@ -578,8 +589,9 @@ class TradingEngine:
         self._pending_close.clear()
         for t in self.ibkr.our_open_orders():
             o, st = t.order, t.orderStatus
-            if o.parentId != 0 or o.orderType not in ("MKT", "LMT") or st.status not in IBKRClient.ACTIVE_STATUSES:
+            if o.parentId != 0 or o.orderType not in ("MKT", "LMT") or not IBKRClient.is_live_order(t):
                 continue
+            in_transition = IBKRClient.in_transition(t)  # PendingCancel: ainda pode executar; reserva mantida (X05)
             symbol = t.contract.symbol
             # Classificação pela identidade PERSISTIDA (order_history): um TP/SL autónomo (parentId=0, criado por
             # ensure_protection) é proteção e fica; só pernas PARENT são entradas/fechos pendentes (V02).
@@ -601,9 +613,10 @@ class TradingEngine:
                     "symbol": symbol, "qty": float(o.totalQuantity),
                     "notional": float(o.totalQuantity) * float(group.get("ref_price") or 0.0), "ts": placed,
                     "deadline": _time.monotonic() + max(0.0, self.settings.entry_timeout_seconds - age),
-                    "trade_id": trade["id"] if trade else None, "filled": float(st.filled or 0.0)}
-                log.warning("Entrada pendente restaurada: ordem %d %s x%g (há %.0fs).", o.orderId, symbol,
-                            float(o.totalQuantity), age)
+                    "trade_id": trade["id"] if trade else None, "filled": float(st.filled or 0.0),
+                    "cancel_sent": in_transition}
+                log.warning("Entrada pendente restaurada: ordem %d %s x%g (há %.0fs%s).", o.orderId, symbol,
+                            float(o.totalQuantity), age, "; cancelamento em curso" if in_transition else "")
             elif group["role"] == "CLOSE":
                 self._pending_close[symbol] = {"state": "SENT", "order_id": int(o.orderId), "group_id": int(group["id"]),
                                                "qty": float(o.totalQuantity), "filled": float(st.filled or 0.0), "ts": placed}
@@ -693,11 +706,22 @@ class TradingEngine:
                      if p.get("sec_type", "STK") == "STK"}
         for symbol in self._managed_symbols():
             pos = positions.get(symbol)
-            if not pos or symbol in self._pending_close or symbol in self._external_positions:
+            if symbol in self._pending_close or symbol in self._external_positions:
+                continue
+            if not pos:
+                await self._reconcile_vanished_position(symbol)
                 continue
             own = abs(self._own_qty(symbol))
-            mixed = not self.settings.manage_external_positions and own > 0 and abs(float(pos["qty"])) > own + 1e-6
+            broker = abs(float(pos["qty"]))
+            if own > broker + 1e-6:
+                await self._reconcile_reduced_position(symbol, pos, own, broker)
+                continue
+            mixed = not self.settings.manage_external_positions and own > 0 and broker > own + 1e-6
             needed = own if mixed else None
+            if self.ibkr.has_excess_exits(symbol, allowed_qty=needed):
+                await self._resize_exits(symbol, pos, needed, "saídas do bot maiores do que a posição")
+                continue
+            self._discrepancies.discard(symbol)
             if not self.ibkr.has_protective_orders(symbol, needed_qty=needed, ours_only=mixed):
                 log.critical("[%s] Posição x%g SEM cobertura completa (stops ativos %.0f): a repor proteção.",
                              symbol, pos["qty"], self.ibkr.protective_coverage(symbol))
@@ -710,6 +734,72 @@ class TradingEngine:
                 continue  # fecho em curso dentro do lock do ativo
             if (now - pc["ts"]).total_seconds() > 600 and self.ibkr.position_qty(symbol) == 0:
                 self._pending_close.pop(symbol, None)
+
+    async def _reconcile_reduced_position(self, symbol: str, pos: dict[str, Any], own: float, broker: float) -> None:
+        """A posição líquida DIMINUIU abaixo do que o bot abriu (venda/compra externa, execução parcial não vista):
+        o ledger é ajustado com uma saída EXTERNAL ao preço de mercado, as decisões no ativo ficam bloqueadas e
+        todas as saídas do bot são canceladas (confirmação terminal) e repostas com a quantidade existente (X01)."""
+        async with self._lock_for(symbol):
+            self._discrepancies.add(symbol)
+            missing = own - broker
+            price = float(pos.get("market_price") or pos.get("avg_cost") or 0.0)
+            if symbol not in self._reduction_warned:
+                self._reduction_warned.add(symbol)
+                log.critical("[%s] Posição na corretora (%g) é MENOR do que a aberta pelo bot (%g): %g ações saíram fora do "
+                             "bot. Ledger ajustado (saída EXTERNAL a %.2f), decisões bloqueadas e saídas a redimensionar.",
+                             symbol, broker, own, missing, price)
+            now = datetime.now(timezone.utc)
+            remaining = missing
+            for row in self.db.open_trades(symbol):
+                if remaining <= 1e-9:
+                    break
+                open_qty = float(row["filled_qty"] or row["qty"]) - float(row["exit_qty"] or 0)
+                portion = min(remaining, open_qty)
+                if portion <= 0:
+                    continue
+                self.db.record_exit_fill(row["id"], portion, price, now, "EXTERNAL", 0.0)
+                remaining -= portion
+            await self._resize_exits_locked(symbol, pos, broker if broker > 0 else None, "posição reduzida externamente")
+
+    async def _reconcile_vanished_position(self, symbol: str) -> None:
+        """Trade aberto no ledger mas sem posição na corretora: cancela as saídas vivas do bot (abririam uma posição
+        inversa) e fecha o trade como RECONCILED (X01)."""
+        async with self._lock_for(symbol):
+            if not await self.ibkr.cancel_own_exits(symbol):
+                self._discrepancies.add(symbol)
+                log.error("[%s] Posição desapareceu mas há saídas do bot ainda não terminadas: a aguardar confirmação.", symbol)
+                return
+            for row in self.db.open_trades(symbol):
+                if float(row["filled_qty"] or 0) > 0:
+                    self.db.close_trade_reconciled(row["id"])
+                    log.warning("Trade #%d %s sem posição na IBKR -> fechado como RECONCILED (verifica o extrato).", row["id"], symbol)
+            self._discrepancies.discard(symbol)
+            self._reduction_warned.discard(symbol)
+
+    async def _resize_exits(self, symbol: str, pos: dict[str, Any], allowed: Optional[float], reason: str) -> None:
+        async with self._lock_for(symbol):
+            await self._resize_exits_locked(symbol, pos, allowed, reason)
+
+    async def _resize_exits_locked(self, symbol: str, pos: dict[str, Any], allowed: Optional[float], reason: str) -> None:
+        self._discrepancies.add(symbol)
+        trade = next((t for t in self.db.open_trades(symbol)), None)
+        price = float(pos.get("market_price") or pos.get("avg_cost") or 0.0)
+        sign = 1 if float(pos["qty"]) > 0 else -1
+        if trade and trade.get("stop_price") and trade.get("tp_price"):
+            stop, tp = float(trade["stop_price"]), float(trade["tp_price"])
+        else:
+            stop = price * (1 - sign * self.settings.stop_loss_pct)
+            tp = price * (1 + sign * self.settings.take_profit_pct)
+        log.critical("[%s] %s: a cancelar as saídas do bot (confirmação terminal) e a repor para %g ações.",
+                     symbol, reason, allowed if allowed is not None else abs(float(pos["qty"])))
+        result = await self.ibkr.resize_exits(symbol, stop_price=stop, tp_price=tp, max_qty=allowed)
+        if result is None:
+            return  # cancelamentos não confirmados: a discrepância mantém o bloqueio e o supervisor repete
+        if trade and result.get("tp_order_id"):
+            self.db.update_group_orders(int(trade["group_id"]), tp_order_id=result["tp_order_id"], sl_order_id=result["sl_order_id"])
+            self.db._execute("UPDATE trades SET stop_price=?, tp_price=? WHERE id=?", (result["sl_price"], result["tp_price"], trade["id"]))
+        if not self.ibkr.has_excess_exits(symbol, allowed_qty=allowed):
+            self._discrepancies.discard(symbol)
 
     async def _connection_loop(self) -> None:
         backoff = 5
@@ -951,7 +1041,7 @@ class TradingEngine:
             return self._skip(decision_id, symbol, action, "decisão invalidada (paragem/mudança de conta)")
         if not self.ibkr.connected or not self._reconciled:
             return self._skip(decision_id, symbol, action, "sem ligação à corretora ou estado por reconciliar")
-        if self.db.get_kv("migration_failed"):
+        if self._migration_blocked():
             return self._skip(decision_id, symbol, action, "migração da base de dados por resolver (ver log)")
         now = datetime.now(timezone.utc)
         state = self.ibkr.portfolio_state()
@@ -973,6 +1063,8 @@ class TradingEngine:
             global_gate=global_gate, sentiment=sentiment, vol_width=vol_width, risk_multiplier=model_multiplier,
             gates_passed=model_gates,
             external_position=symbol in self._external_positions or self._is_external(symbol, position_qty))
+        if not isinstance(plan, Skip) and symbol in self._discrepancies:
+            plan = Skip("discrepância posição/saídas por resolver (reconciliação em curso)")
         if isinstance(plan, Skip):
             return self._skip(decision_id, symbol, action, plan.reason)
         if plan.kind == "CLOSE":
@@ -1136,7 +1228,7 @@ class TradingEngine:
         perm_id = getattr(trade.order, "permId", None)
         if perm_id and group is not None:
             self.db.set_perm_id(int(order_id), int(perm_id), group_id=int(group["id"]), overwrite=True)  # identidade durável (V03/W03)
-            self._reconcile_unallocated_fills(symbol)
+            self._reconcile_unallocated_fills(symbol, order_id=int(order_id))
         if status in ("Cancelled", "Inactive", "ApiCancelled"):
             intentional = self.ibkr.is_intentional_cancel(order_id)
             self.ibkr.forget_cancel(order_id)
@@ -1163,15 +1255,16 @@ class TradingEngine:
                     and symbol not in self._pending_close and self.loop:
                 self.loop.create_task(self._reprotect(symbol))
 
-    def _reconcile_unallocated_fills(self, symbol: str) -> None:
-        """Execuções já registadas mas sem alocação (identidade indisponível na altura) são reprocessadas
-        quando a identidade da ordem fica conhecida (W03)."""
-        for row in self.db.unallocated_fills(symbol):
+    def _reconcile_unallocated_fills(self, symbol: str, order_id: Optional[int] = None) -> None:
+        """Execuções já registadas mas sem alocação são reprocessadas com a sua identidade ORIGINAL persistida
+        (conta, clientId, permId, orderRef, conId): identidade incompatível continua incompatível; só a
+        identidade antes desconhecida pode passar a corresponder (W03/X02). Limitado à ordem indicada."""
+        for row in self.db.unallocated_fills(symbol, order_id=order_id):
             execution = SimpleNamespace(execId=row["exec_id"], orderId=int(row["order_id"] or 0), side=row["side"],
                                         shares=float(row["shares"]), price=float(row["price"]),
                                         time=datetime.fromisoformat(row["ts"]), acctNumber=row.get("account") or "",
-                                        clientId=None, orderRef=None, permId=None)
-            fill = SimpleNamespace(contract=SimpleNamespace(symbol=symbol, secType="STK", conId=self.ibkr.con_id(symbol)),
+                                        clientId=row.get("client_id"), orderRef=row.get("order_ref"), permId=row.get("perm_id"))
+            fill = SimpleNamespace(contract=SimpleNamespace(symbol=symbol, secType="STK", conId=row.get("con_id")),
                                    execution=execution, commissionReport=None)
             self._on_fill(None, fill, reprocess=True)
 
@@ -1214,7 +1307,10 @@ class TradingEngine:
             if estimated else float(real)
         new = self.db.insert_fill(exec_id=execution.execId, order_id=execution.orderId, symbol=symbol,
                                   side=execution.side, shares=float(execution.shares), price=float(execution.price), ts=ts,
-                                  commission=commission_value, commission_estimated=estimated)
+                                  commission=commission_value, commission_estimated=estimated,
+                                  account=getattr(execution, "acctNumber", None) or None,
+                                  client_id=int(client_id) if client_id not in (None, "") else None, perm_id=perm_id,
+                                  order_ref=exec_ref, con_id=getattr(fill.contract, "conId", None) or None)
         if not new:
             # Já registada: só volta a ser processada se ainda não tocou em nenhum trade (reconciliação, W03).
             if self.db.allocations_for_fill(execution.execId):
@@ -1339,6 +1435,7 @@ class TradingEngine:
             pending_closes=list(self._pending_close.keys()),
             reconciled=self._reconciled,
             external_positions=sorted(self._external_positions),
+            discrepancies=sorted(self._discrepancies),
             bound_account=self.db.get_kv("bound_account"),
             experiment=self.calibrator.experiment,
             risk_summary={"stop_mode": self.settings.stop_mode, "atr_mult": self.settings.atr_stop_multiple,

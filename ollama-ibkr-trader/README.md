@@ -23,11 +23,37 @@ escuro).
 > de perda aplicam-se o StoplossGuard, o travão de perdas seguidas e o cooldown
 > após saída em perda. Tudo ajustável em `config.json` (validado ao carregar).
 >
-> Versão 1.0.6: resposta à revisão da 1.0.5 (7 achados, 2 P0), ver
-> `../reports/Resposta à revisão 1.0.5.md`; antes, as respostas às revisões da
-> 1.0.4 e da 1.0.3 e à auditoria da 1.0.2 na mesma pasta.
+> Versão 1.0.7: resposta à revisão da 1.0.6 (6 achados, 1 P0), ver
+> `../reports/Resposta à revisão 1.0.6.md`; antes, as respostas às revisões da
+> 1.0.5, 1.0.4 e 1.0.3 e à auditoria da 1.0.2 na mesma pasta.
 
-## Invariantes de segurança (1.0.6)
+## Invariantes de segurança (1.0.7)
+
+- **Nenhuma saída excede a posição reconciliada**: o supervisor compara a
+  posição líquida com a quantidade própria do ledger em ambos os sentidos. Se
+  a posição DIMINUIU fora do bot, o ledger regista uma saída `EXTERNAL`, as
+  decisões no ativo ficam bloqueadas e todas as saídas do bot são canceladas
+  com confirmação terminal e repostas com a quantidade existente; cobertura
+  excessiva é um estado distinto de cobertura suficiente. Uma posição que
+  desapareceu tem as suas saídas canceladas antes de o trade ser reconciliado.
+- **Identidade original dos fills persistida**: conta, `clientId`, `permId`,
+  `orderRef` e `conId` ficam gravados em cada execução; o reprocessamento usa
+  essa identidade e limita-se à ordem em causa, pelo que uma identidade
+  incompatível nunca é convertida em desconhecida.
+- **Falha de migração em ficheiro-marcador**: `migration_failed.flag` na pasta
+  de dados bloqueia entradas independentemente da base aberta, também quando
+  a falha ocorre sem destino prévio; apaga-se depois de resolver.
+- **Deduplicação por identidade completa**: (símbolo, conta, contrato, id da
+  ordem) e (símbolo, conta, direção, instante e quantidade da entrada); um
+  número de ordem sozinho nunca é prova de duplicado.
+- **Entradas não terminais restauradas**: uma entrada em `PendingCancel`
+  mantém a reserva e o bloqueio de nova entrada até à confirmação terminal.
+- **Rótulos provisórios e finais**: uma operação ainda aberta no horizonte
+  recebe um rótulo provisório (`label_final=0`); quando fecha, o ledger
+  finaliza o rótulo e guarda o provisório à parte. O resultado não depende da
+  cadência do avaliador.
+
+## Invariantes de segurança herdados (1.0.6)
 
 - **Ciclo de vida até ao estado terminal**: toda a ordem não terminal
   (`PendingCancel` incluído) conta como executável. Um fecho cancela, espera a

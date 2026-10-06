@@ -117,6 +117,43 @@ class FakeIBKR:
     def transitional_children(self, symbol):
         return []
 
+    def _own_live_orders(self, symbol):
+        return [o for o in self.orders.get(symbol, []) if o.orderRef == "OllamaIBKRTrader"
+                and o.status not in ("Filled", "Cancelled", "ApiCancelled", "Inactive")]
+
+    def own_exit_quantity(self, symbol):
+        qty = self.positions.get(symbol, 0.0)
+        if not qty:
+            return 0.0
+        need = "SELL" if qty > 0 else "BUY"
+        stops = sum(o.remaining for o in self._own_live_orders(symbol) if o.orderType in ("STP", "TRAIL", "STP LMT") and o.action == need)
+        tps = sum(o.remaining for o in self._own_live_orders(symbol) if o.orderType == "LMT" and o.action == need)
+        return max(stops, tps)
+
+    def has_excess_exits(self, symbol, allowed_qty=None):
+        qty = abs(self.positions.get(symbol, 0.0))
+        allowed = qty if allowed_qty is None else min(qty, abs(allowed_qty))
+        return self.own_exit_quantity(symbol) > allowed + 1e-9
+
+    async def resize_exits(self, symbol, *, stop_price, tp_price, max_qty=None):
+        replaced = [o.orderId for o in self._own_live_orders(symbol)]
+        for o in self._own_live_orders(symbol):
+            o.status = "Cancelled"
+            self.cancelled.append(o.orderId)
+        self.resized = getattr(self, "resized", []) + [(symbol, max_qty)]
+        if not self.positions.get(symbol, 0.0):
+            return {"tp_order_id": None, "sl_order_id": None, "qty": 0, "direction": 0, "trades": [], "tp_price": tp_price,
+                    "sl_price": stop_price, "replaced_order_ids": replaced}
+        result = await self.ensure_protection(symbol, stop_price=stop_price, tp_price=tp_price, max_qty=max_qty)
+        result["replaced_order_ids"] = replaced
+        return result
+
+    async def cancel_own_exits(self, symbol):
+        for o in self._own_live_orders(symbol):
+            o.status = "Cancelled"
+            self.cancelled.append(o.orderId)
+        return True
+
     def order_is_ours(self, order, contract=None):
         acct = getattr(order, "account", "") or ""
         if acct and acct != self.account:

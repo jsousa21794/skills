@@ -311,6 +311,10 @@ class Settings:
         suffix = f"_{_safe_name(account)}" if account else ""
         return app_data_dir() / f"trader_{self.trading_mode}{suffix}.sqlite3"
 
+    def migration_flag_path(self) -> Path:
+        """Marcador de falha de migração INDEPENDENTE da base de dados aberta (X03)."""
+        return app_data_dir() / "migration_failed.flag"
+
     def legacy_db_path(self) -> Path:
         """Ficheiro único das versões <= 1.0.2 (sem separação paper/real)."""
         return app_data_dir() / "trader.sqlite3"

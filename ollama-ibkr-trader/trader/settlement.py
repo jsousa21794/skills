@@ -117,9 +117,25 @@ class Settler:
             return 0, "ledger:SL"
         return None, f"ledger:{reason or 'OUTRO'}"
 
+    def finalize_provisional(self) -> int:
+        """Rótulos PROVISÓRIOS (operação ainda aberta no horizonte) passam a FINAIS quando o trade fecha, pelo
+        ledger: o resultado é o mesmo qualquer que seja a cadência do avaliador (X06)."""
+        finalized = 0
+        for d in self.db.provisional_decisions():
+            trade = self.db.trade_for_decision(int(d["id"]))
+            if not trade or trade.get("status") != "CLOSED":
+                continue
+            label, source = self._ledger_label(trade, datetime.now(timezone.utc))
+            self.db.finalize_label(int(d["id"]), correct=label, label_source=source or "ledger:OUTRO")
+            finalized += 1
+        if finalized:
+            log.info("Settlement: %d rótulos provisórios finalizados pelo ledger.", finalized)
+        return finalized
+
     def run(self, now: Optional[datetime] = None) -> int:
         now = now or datetime.now(timezone.utc)
         horizon = timedelta(minutes=self.s.settlement_horizon_minutes)
+        self.finalize_provisional()
         pending = self.db.unsettled_decisions(now - horizon)
         settled = 0
         for d in pending:
@@ -136,6 +152,7 @@ class Settler:
             trade = self.db.trade_for_decision(int(d["id"])) if d.get("executed") else None
             ledger_label: Optional[int] = None
             ledger_source: Optional[str] = None
+            final = True
             if trade and trade.get("entry_ts") and trade.get("entry_price"):
                 # Operação EXECUTADA: o rótulo vem do ledger (saída real por TP/SL) e, enquanto aberta, dos
                 # níveis ABSOLUTOS persistidos na ordem, no intervalo em que a posição esteve aberta (W06).
@@ -146,6 +163,8 @@ class Settler:
                     label_source = "bracket:entrada"
                 if trade["status"] == "OPEN" and datetime.fromisoformat(trade["entry_ts"]) + horizon > now:
                     continue  # ainda dentro do horizonte da operação: espera pelo desfecho real
+                if trade["status"] == "OPEN":
+                    final = False  # rótulo PROVISÓRIO: será finalizado pelo ledger quando o trade fechar (X06)
             price = self.price_at(d["symbol"], target)
             if price is None:
                 if now - ts > timedelta(hours=36):
@@ -199,7 +218,7 @@ class Settler:
                                     bench_return=round(bench_ret, 4) if bench_ret is not None else None,
                                     alpha=round(alpha, 4) if alpha is not None else None,
                                     correct=correct, horizon_min=self.s.settlement_horizon_minutes,
-                                    label_source=label_source)
+                                    label_source=label_source, final=final)
             settled += 1
         if settled:
             log.info("Settlement: %d decisões avaliadas a %d min.", settled, self.s.settlement_horizon_minutes)

@@ -842,10 +842,62 @@ class IBKRClient:
         return self.protective_coverage(symbol, ours_only=ours_only) + 1e-9 >= coverable
 
     def has_pending_entry(self, symbol: str) -> bool:
-        """Entrada do bot ainda viva na corretora: pai (sem parentId) a mercado OU limit (N05)."""
-        return any(t.order.parentId == 0 and t.order.orderType in ("MKT", "LMT")
-                   and t.orderStatus.status in self.ACTIVE_STATUSES
+        """Entrada do bot ainda viva na corretora: pai (sem parentId) a mercado OU limit, em QUALQUER estado
+        não terminal (um pedido de cancelamento ainda pode executar) (N05/X05)."""
+        return any(t.order.parentId == 0 and t.order.orderType in ("MKT", "LMT") and self.is_live_order(t)
                    for t in self.open_trades_for(symbol))
+
+    def own_exit_quantity(self, symbol: str) -> float:
+        """Maior quantidade que uma saída do bot (stop OU take-profit) poderia vender/comprar (X01)."""
+        qty = self.position_qty(symbol)
+        if qty == 0:
+            return 0.0
+        needed_action = "SELL" if qty > 0 else "BUY"
+        stops = sum(self._remaining(t) for t in self.open_trades_for(symbol, ours_only=True)
+                    if t.order.action == needed_action and t.order.orderType in self.STOP_TYPES and self.is_live_order(t))
+        tps = sum(self._remaining(t) for t in self.open_trades_for(symbol, ours_only=True)
+                  if t.order.action == needed_action and t.order.orderType == "LMT" and self.is_live_order(t))
+        return max(stops, tps)
+
+    def has_excess_exits(self, symbol: str, allowed_qty: Optional[float] = None) -> bool:
+        """Cobertura suficiente e cobertura EXCESSIVA são estados diferentes: uma saída maior do que a posição
+        (ou do que a parcela própria) inverteria a posição se executasse (X01)."""
+        qty = abs(self.position_qty(symbol))
+        allowed = qty if allowed_qty is None else min(qty, abs(float(allowed_qty)))
+        return self.own_exit_quantity(symbol) > allowed + 1e-9
+
+    async def resize_exits(self, symbol: str, *, stop_price: float, tp_price: float,
+                           max_qty: Optional[float] = None) -> Optional[dict[str, Any]]:
+        """Cancela TODAS as saídas do bot do ativo, espera a confirmação terminal e repõe um par com a
+        quantidade correta. Devolve None (e não coloca nada) enquanto algum cancelamento não for confirmado (X01)."""
+        if not self.connected:
+            return None
+        children = [t for t in self._protective_children(symbol)]
+        for t in children:
+            if t.orderStatus.status in self.ACTIVE_STATUSES:
+                self.cancel_trade(t)
+        if children and not await self.wait_done(children, timeout=5.0):
+            log.error("Redimensionamento de %s adiado: cancelamentos não confirmados.", symbol)
+            return None
+        if self.position_qty(symbol) == 0:
+            return {"tp_order_id": None, "sl_order_id": None, "qty": 0, "direction": 0, "trades": [],
+                    "tp_price": tp_price, "sl_price": stop_price, "replaced_order_ids": [int(t.order.orderId) for t in children]}
+        result = await self.ensure_protection(symbol, stop_price=stop_price, tp_price=tp_price, max_qty=max_qty)
+        if result is not None:
+            result["replaced_order_ids"] = sorted(set(result.get("replaced_order_ids", [])) | {int(t.order.orderId) for t in children})
+        return result
+
+    async def cancel_own_exits(self, symbol: str) -> bool:
+        """Cancela todas as saídas vivas do bot (posição desaparecida): nunca fica uma saída que abriria uma
+        posição inversa (X01)."""
+        if not self.connected:
+            return False
+        live = [t for t in self.open_trades_for(symbol, ours_only=True) if self.is_live_order(t)
+                and (t.order.orderType in self.STOP_TYPES or t.order.orderType == "LMT")]
+        for t in live:
+            if t.orderStatus.status in self.ACTIVE_STATUSES:
+                self.cancel_trade(t)
+        return not live or await self.wait_done(live, timeout=5.0)
 
     async def close_position(self, symbol: str, authorize: Optional[Callable[[], bool]] = None,
                              max_qty: Optional[float] = None) -> Optional[dict[str, Any]]:

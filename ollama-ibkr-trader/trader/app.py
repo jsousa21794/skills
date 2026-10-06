@@ -77,6 +77,7 @@ def _migrate_legacy_db(settings: Settings, log: logging.Logger) -> None:
                 counts = dst.merge_open_state_from(src)
                 dst.set_kv("migration_failed", "")
                 dst.set_kv("migration_1.0.2", f"importado de {legacy.name} em {datetime.now(timezone.utc).isoformat()}")
+                _clear_migration_flag(settings)
             finally:
                 src.close()
                 dst.close()
@@ -85,14 +86,9 @@ def _migrate_legacy_db(settings: Settings, log: logging.Logger) -> None:
                         "ignorados); o histórico fechado fica em %s (não é fundido). Confirma as posições na TWS antes de iniciar.",
                         legacy.name, effective.name, counts["protections"], counts["trades"], counts["duplicates"], archived.name)
         except Exception as exc:  # noqa: BLE001
-            log.error("Falha a importar o estado da base antiga %s: %s. Entradas BLOQUEADAS até resolver (kv migration_failed).",
-                      legacy, exc)
-            try:
-                dst = Database(target)
-                dst.set_kv("migration_failed", str(exc))
-                dst.close()
-            except Exception:  # noqa: BLE001
-                pass
+            log.error("Falha a importar o estado da base antiga %s: %s. Entradas BLOQUEADAS até resolver "
+                      "(apaga %s depois de resolver).", legacy, exc, settings.migration_flag_path())
+            _mark_migration_failed(settings, exc, [target, effective if "effective" in locals() else target])
         return
     try:
         src = Database(legacy)
@@ -104,7 +100,33 @@ def _migrate_legacy_db(settings: Settings, log: logging.Logger) -> None:
         log.warning("Base de dados da versão <= 1.0.2 migrada para %s (modo %s); original preservado como %s.",
                     target.name, settings.trading_mode, archived.name)
     except Exception as exc:  # noqa: BLE001
-        log.error("Falha a migrar a base de dados antiga %s: %s. A continuar com %s.", legacy, exc, target.name)
+        log.error("Falha a migrar a base de dados antiga %s: %s. Entradas BLOQUEADAS até resolver (apaga %s depois de resolver).",
+                  legacy, exc, settings.migration_flag_path())
+        _mark_migration_failed(settings, exc, [target])
+
+
+def _mark_migration_failed(settings: Settings, exc: Exception, dbs: list) -> None:
+    """Marcador em ficheiro (independente da base aberta) E nas bases envolvidas (X03)."""
+    try:
+        settings.migration_flag_path().write_text(f"{datetime.now(timezone.utc).isoformat()} {exc}", encoding="utf-8")
+    except OSError:
+        pass
+    for path in {str(p) for p in dbs}:
+        try:
+            db = Database(path)
+            db.set_kv("migration_failed", str(exc))
+            db.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _clear_migration_flag(settings: Settings) -> None:
+    try:
+        flag = settings.migration_flag_path()
+        if flag.exists():
+            flag.unlink()
+    except OSError:
+        pass
 
 
 def main() -> int:
