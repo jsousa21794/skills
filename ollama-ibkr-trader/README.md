@@ -23,11 +23,40 @@ escuro).
 > de perda aplicam-se o StoplossGuard, o travão de perdas seguidas e o cooldown
 > após saída em perda. Tudo ajustável em `config.json` (validado ao carregar).
 >
-> Versão 1.0.5: resposta à revisão da 1.0.4 (11 achados, 1 P0), ver
-> `../reports/Resposta à revisão 1.0.4.md`; antes, as respostas à revisão da
-> 1.0.3 e à auditoria da 1.0.2 na mesma pasta.
+> Versão 1.0.6: resposta à revisão da 1.0.5 (7 achados, 2 P0), ver
+> `../reports/Resposta à revisão 1.0.5.md`; antes, as respostas às revisões da
+> 1.0.4 e da 1.0.3 e à auditoria da 1.0.2 na mesma pasta.
 
-## Invariantes de segurança (1.0.5)
+## Invariantes de segurança (1.0.6)
+
+- **Ciclo de vida até ao estado terminal**: toda a ordem não terminal
+  (`PendingCancel` incluído) conta como executável. Um fecho cancela, espera a
+  confirmação terminal, reconcilia de novo todas as saídas do contrato e volta
+  a verificar imediatamente antes do envio; qualquer saída viva, manual ou do
+  bot, bloqueia a venda. A reparação de cobertura espera pelos stops em
+  transição antes de recalcular o residual e nunca coloca cobertura nova por
+  cima de um stop ainda não terminado.
+- **Identidade completa em todos os callbacks**: estados de ordem só alteram
+  histórico, reservas ou fechos se conta, `clientId`, `orderRef` e contrato
+  coincidirem e a ordem pertencer a um grupo do bot; o `permId` é gravado por
+  grupo e corrigível; execuções registadas sem alocação são reprocessadas
+  quando a identidade fica conhecida.
+- **Migração para a base efetiva**: a base ≤ 1.0.2 é importada para a base da
+  conta já em uso (não só para a base por modo), numa única transação e com
+  deduplicação pela identidade das ordens e da entrada; uma falha bloqueia
+  entradas até ser resolvida.
+- **Validação por experiência persistida**: o estado dos gates é guardado e
+  lido pela chave (modelo, versão do prompt); um prompt novo nunca herda a
+  validação do anterior.
+- **Rótulos pelo ledger**: operações executadas são rotuladas pela saída real
+  (TP = 1, stop = 0; outras saídas ficam censuradas com a razão explícita) e,
+  enquanto abertas, pelos níveis absolutos da ordem no intervalo em que a
+  posição esteve aberta, sem usar a vela da entrada; dentro do horizonte da
+  operação espera-se pelo desfecho real.
+- **Cobertura própria em posições mistas**: só os stops do próprio bot cobrem
+  a parcela própria; um stop manual pertence à parcela manual.
+
+## Invariantes de segurança herdados (1.0.5)
 
 - **Nenhuma saída concorrente**: um fecho por sinal reconcilia primeiro todas
   as ordens de saída do contrato na conta; com um stop ou limit MANUAL ativo o

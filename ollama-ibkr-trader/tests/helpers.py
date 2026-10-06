@@ -91,26 +91,41 @@ class FakeIBKR:
     def forget_cancel(self, order_id):
         getattr(self, "intentional", set()).discard(order_id)
 
-    def protective_coverage(self, symbol):
+    def protective_coverage(self, symbol, ours_only=False):
         qty = self.positions.get(symbol, 0.0)
         if not qty:
             return 0.0
         need = "SELL" if qty > 0 else "BUY"
         return sum(o.remaining for o in self.orders.get(symbol, [])
                    if o.orderType in ("STP", "TRAIL", "STP LMT") and o.action == need
-                   and o.status in ("PreSubmitted", "Submitted", "PendingSubmit", "ApiPending"))
+                   and o.status in ("PreSubmitted", "Submitted", "PendingSubmit", "ApiPending")
+                   and (not ours_only or o.orderRef == "OllamaIBKRTrader"))
 
-    def has_protective_orders(self, symbol, needed_qty=None):
+    def has_protective_orders(self, symbol, needed_qty=None, ours_only=False):
         qty = abs(self.positions.get(symbol, 0.0))
         if needed_qty is not None:
             qty = min(qty, abs(needed_qty))
-        return qty > 0 and self.protective_coverage(symbol) + 1e-9 >= qty
+            ours_only = True
+        return qty > 0 and self.protective_coverage(symbol, ours_only=ours_only) + 1e-9 >= qty
 
     def has_orphan_children(self, symbol):
         return False
 
     def external_exit_orders(self, symbol):
         return []
+
+    def transitional_children(self, symbol):
+        return []
+
+    def order_is_ours(self, order, contract=None):
+        acct = getattr(order, "account", "") or ""
+        if acct and acct != self.account:
+            return False
+        cid = getattr(order, "clientId", None)
+        if cid is not None and str(cid) != "" and int(cid) != 17:
+            return False
+        ref = getattr(order, "orderRef", None)
+        return ref is None or ref == "OllamaIBKRTrader"
 
     def bars_as_list(self, symbol):
         return list(self._bars.get(symbol, []))

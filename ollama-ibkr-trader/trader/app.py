@@ -6,6 +6,7 @@ import logging
 import multiprocessing
 import os
 import sys
+from datetime import datetime, timezone
 
 from .config import Settings, app_data_dir
 from .database import Database
@@ -58,22 +59,40 @@ def _migrate_legacy_db(settings: Settings, log: logging.Logger) -> None:
     target = settings.db_path()
     archived = legacy.with_name(legacy.name + ".migrated-1.0.2")
     if target.exists():
-        # Coexistência (a 1.0.3 correu primeiro): importa só o estado operacional do legado — proteções
-        # ainda ativas e trades abertos — para a base atual; ambos os ficheiros são preservados (V05).
+        # Coexistência (a 1.0.3/1.0.4 correu primeiro): importa só o estado operacional do legado — proteções
+        # ainda ativas e trades abertos — para a base EFETIVAMENTE usada: se a base por modo já está atribuída a
+        # uma conta e a base dessa conta existe, é essa o destino (W04). Deduplicado e transacional.
         try:
+            mode_db = Database(target)
+            try:
+                bound = mode_db.get_kv("bound_account")
+            finally:
+                mode_db.close()
+            effective = target
+            if bound and settings.db_path(bound).exists():
+                effective = settings.db_path(bound)
             src = Database(legacy)
-            dst = Database(target)
+            dst = Database(effective)
             try:
                 counts = dst.merge_open_state_from(src)
+                dst.set_kv("migration_failed", "")
+                dst.set_kv("migration_1.0.2", f"importado de {legacy.name} em {datetime.now(timezone.utc).isoformat()}")
             finally:
                 src.close()
                 dst.close()
             shutil.move(str(legacy), str(archived))
-            log.warning("Base antiga %s coexistia com %s: importadas %d proteções ativas e %d trades abertos; o histórico "
-                        "fechado fica em %s (não é fundido). Confirma as posições na TWS antes de iniciar.",
-                        legacy.name, target.name, counts["protections"], counts["trades"], archived.name)
+            log.warning("Base antiga %s coexistia com %s: importadas %d proteções ativas e %d trades abertos (%d duplicados "
+                        "ignorados); o histórico fechado fica em %s (não é fundido). Confirma as posições na TWS antes de iniciar.",
+                        legacy.name, effective.name, counts["protections"], counts["trades"], counts["duplicates"], archived.name)
         except Exception as exc:  # noqa: BLE001
-            log.error("Falha a importar o estado da base antiga %s: %s. Resolve manualmente antes de iniciar.", legacy, exc)
+            log.error("Falha a importar o estado da base antiga %s: %s. Entradas BLOQUEADAS até resolver (kv migration_failed).",
+                      legacy, exc)
+            try:
+                dst = Database(target)
+                dst.set_kv("migration_failed", str(exc))
+                dst.close()
+            except Exception:  # noqa: BLE001
+                pass
         return
     try:
         src = Database(legacy)

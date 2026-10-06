@@ -57,7 +57,13 @@ def test_f02_real_client_waits_cancellations_and_requantifies():
     calls = {"qty": [100, 100, 0]}  # 100 antes (leitura + reconciliação das saídas), 0 depois (stop executou)
     client.position_qty = lambda symbol: calls["qty"].pop(0) if len(calls["qty"]) > 1 else calls["qty"][0]
     child = SimpleNamespace(order=SimpleNamespace(orderId=5, action="SELL", orderRef="OllamaIBKRTrader", account=""),
-                            orderStatus=SimpleNamespace(status="Submitted", remaining=100, filled=0), isDone=lambda: True)
+                            orderStatus=SimpleNamespace(status="Submitted", remaining=100, filled=0))
+    child.isDone = lambda: child.orderStatus.status != "Submitted"  # termina quando o cancelamento é confirmado
+
+    def cancel(order):
+        child.orderStatus.status = "Cancelled"
+
+    client.ib.cancelOrder = cancel
     client.open_trades_for = lambda symbol, ours_only=True: [child]
 
     async def qualify(symbol):
@@ -449,4 +455,4 @@ def test_f38_close_commission_is_split_over_the_trades_it_closed(monkeypatch):
 
 # ---------------------------------------------------------------- F40
 def test_f40_version_matches_release_line():
-    assert __version__ == "1.0.5"
+    assert __version__ == "1.0.6"

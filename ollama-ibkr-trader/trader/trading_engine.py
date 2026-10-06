@@ -25,6 +25,7 @@ import math
 import threading
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from datetime import date, datetime, time as dtime, timedelta, timezone
 from typing import Any, Coroutine, Optional
 from zoneinfo import ZoneInfo
@@ -296,9 +297,14 @@ class TradingEngine:
         self.calibrator = cal
         self.retro.calibrator = cal
 
+    def _gates_key(self, model: str) -> str:
+        """Chave de persistência dos gates = identificador da experiência (modelo + versão do prompt). Chaves
+        antigas só por modelo não são lidas: um prompt novo nunca herda validação (W05)."""
+        return f"gates_passed:{Analytics.experiment_id(model, self.brain.prompt_version)}"
+
     def _gates_for(self, model: str) -> tuple[bool, float]:
-        """Estado de validação (gates) e multiplicador de risco DA experiência desse modelo (V08)."""
-        passed = self.db.get_kv(f"gates_passed:{model}") == "1"
+        """Estado de validação (gates) e multiplicador de risco DA experiência (modelo + prompt atual) (V08/W05)."""
+        passed = self.db.get_kv(self._gates_key(model)) == "1"
         return passed, (1.0 if passed else self.settings.learning_risk_multiplier)
 
     def _calibrator_for(self, model: str) -> Calibrator:
@@ -308,6 +314,7 @@ class TradingEngine:
             self._calibrators[model] = cal
         elif cal.prompt_version != self.brain.prompt_version:
             cal.set_prompt_version(self.brain.prompt_version)
+            self._load_gate_state()  # a experiência mudou: o estado de validação é o do novo prompt (W05)
         return cal
 
     async def set_model(self, model: str) -> None:
@@ -487,9 +494,14 @@ class TradingEngine:
                     return False
             if symbol and limit_price is not None and action in ("BUY", "SELL"):
                 quote = self.ibkr.last_price(symbol)
-                if quote is not None and ((action == "BUY" and quote[0] > limit_price) or (action == "SELL" and quote[0] < limit_price)):
-                    log.warning("[%s] Cotação %.2f já além do limite %.2f antes do envio: ordem não enviada.", symbol, quote[0], limit_price)
-                    return False
+                if quote is not None:
+                    last_price, last_ts = quote
+                    if (datetime.now(timezone.utc) - last_ts).total_seconds() > self.settings.max_bar_age_seconds + 60:
+                        log.warning("[%s] Cotação desatualizada (%s) antes do envio: ordem não enviada.", symbol, last_ts.isoformat())
+                        return False
+                    if (action == "BUY" and last_price > limit_price) or (action == "SELL" and last_price < limit_price):
+                        log.warning("[%s] Cotação %.2f já além do limite %.2f antes do envio: ordem não enviada.", symbol, last_price, limit_price)
+                        return False
             return True
 
         return ok
@@ -612,7 +624,7 @@ class TradingEngine:
             log.critical("[%s] Posição MISTA: %g ações na corretora, %g abertas pelo bot. Só as %g próprias são geridas/protegidas; "
                          "sinais neste ativo ficam bloqueados até adotares o resto (manage_external_positions).",
                          symbol, float(pos["qty"]), own, own)
-        if self.ibkr.has_protective_orders(symbol, needed_qty=max_qty) and not self.ibkr.has_orphan_children(symbol):
+        if self.ibkr.has_protective_orders(symbol, needed_qty=max_qty, ours_only=mixed) and not self.ibkr.has_orphan_children(symbol):
             return
         trade = next((t for t in self.db.open_trades(symbol)), None)
         price = pos.get("market_price") or pos.get("avg_cost") or 0.0
@@ -684,8 +696,9 @@ class TradingEngine:
             if not pos or symbol in self._pending_close or symbol in self._external_positions:
                 continue
             own = abs(self._own_qty(symbol))
-            needed = own if (not self.settings.manage_external_positions and own > 0) else None
-            if not self.ibkr.has_protective_orders(symbol, needed_qty=needed):
+            mixed = not self.settings.manage_external_positions and own > 0 and abs(float(pos["qty"])) > own + 1e-6
+            needed = own if mixed else None
+            if not self.ibkr.has_protective_orders(symbol, needed_qty=needed, ours_only=mixed):
                 log.critical("[%s] Posição x%g SEM cobertura completa (stops ativos %.0f): a repor proteção.",
                              symbol, pos["qty"], self.ibkr.protective_coverage(symbol))
                 await self._protect_if_naked(symbol, pos)
@@ -938,6 +951,8 @@ class TradingEngine:
             return self._skip(decision_id, symbol, action, "decisão invalidada (paragem/mudança de conta)")
         if not self.ibkr.connected or not self._reconciled:
             return self._skip(decision_id, symbol, action, "sem ligação à corretora ou estado por reconciliar")
+        if self.db.get_kv("migration_failed"):
+            return self._skip(decision_id, symbol, action, "migração da base de dados por resolver (ver log)")
         now = datetime.now(timezone.utc)
         state = self.ibkr.portfolio_state()
         global_gate = self.gate.check_global(equity=state.get("net_liq"), now=now)
@@ -1017,6 +1032,8 @@ class TradingEngine:
         quote = self.ibkr.last_price(symbol)
         if quote is not None:
             last_price, last_ts = quote
+            if (datetime.now(timezone.utc) - last_ts).total_seconds() > self.settings.max_bar_age_seconds + 60:
+                return self._skip(decision_id, symbol, plan.action, f"cotação desatualizada ({last_ts.isoformat()})")
             drift = abs(last_price - ctx.snapshot.price) / ctx.snapshot.price if ctx.snapshot.price else 0.0
             if plan.limit_price is not None and ((plan.action == "BUY" and last_price > plan.limit_price)
                                                  or (plan.action == "SELL" and last_price < plan.limit_price)):
@@ -1072,7 +1089,7 @@ class TradingEngine:
             return
         self.gates_passed = bool(gates.get("all_passed"))
         self.risk_multiplier = 1.0 if self.gates_passed else self.settings.learning_risk_multiplier
-        self.db.set_kv(f"gates_passed:{self.brain.model}", "1" if self.gates_passed else "0")
+        self.db.set_kv(self._gates_key(self.brain.model), "1" if self.gates_passed else "0")
         if not self.gates_passed:
             failed = [k for k, v in gates.get("checks", {}).items() if not v]
             log.warning("Gates estatísticos NÃO passam (%s). Risco por trade %.2f%% × %.2f.",
@@ -1081,8 +1098,7 @@ class TradingEngine:
             log.warning("Gates estatísticos PASSAM. Risco por trade %.2f%%.", self.settings.risk_per_trade_pct_validated * 100)
 
     def _load_gate_state(self) -> None:
-        self.gates_passed = self.db.get_kv(f"gates_passed:{self.brain.model}") == "1"
-        self.risk_multiplier = 1.0 if self.gates_passed else self.settings.learning_risk_multiplier
+        self.gates_passed, self.risk_multiplier = self._gates_for(self.brain.model)
 
     # ------------------------------------------------------------ callbacks
     def _price_at(self, symbol: str, when: datetime) -> Optional[float]:
@@ -1106,9 +1122,21 @@ class TradingEngine:
         status = trade.orderStatus.status
         order_id = trade.order.orderId
         symbol = trade.contract.symbol
+        # Identidade COMPLETA antes de tocar em histórico, reservas ou fechos (W03): conta, clientId, orderRef,
+        # contrato (símbolo/conId) e o grupo a que a ordem pertence. Um estado de outro cliente/conta/contrato
+        # com o mesmo orderId nunca altera o estado do motor.
+        if not self.ibkr.order_is_ours(trade.order, trade.contract):
+            log.debug("Estado da ordem %d (%s) de outra conta/cliente: ignorado.", order_id, symbol)
+            return
+        group = self.db.group_for_order(order_id, symbol=symbol, con_id=getattr(trade.contract, "conId", None) or None,
+                                        account=getattr(trade.order, "account", None) or None)
+        if group is None and order_id not in self._pending_entries and not any(
+                pc.get("order_id") == order_id for pc in self._pending_close.values()):
+            return
         perm_id = getattr(trade.order, "permId", None)
-        if perm_id:
-            self.db.set_perm_id(int(order_id), int(perm_id))  # identidade durável da corretora (V03)
+        if perm_id and group is not None:
+            self.db.set_perm_id(int(order_id), int(perm_id), group_id=int(group["id"]), overwrite=True)  # identidade durável (V03/W03)
+            self._reconcile_unallocated_fills(symbol)
         if status in ("Cancelled", "Inactive", "ApiCancelled"):
             intentional = self.ibkr.is_intentional_cancel(order_id)
             self.ibkr.forget_cancel(order_id)
@@ -1131,10 +1159,21 @@ class TradingEngine:
             # Cancelamentos intencionais (fecho em curso, substituição de órfãos) não disparam reproteção (N02).
             if intentional:
                 return
-            group = self.db.group_for_order(order_id, symbol=symbol)
             if group and group["role"] == "ENTRY" and self.db.order_leg(group, order_id) in ("TP", "SL") \
                     and symbol not in self._pending_close and self.loop:
                 self.loop.create_task(self._reprotect(symbol))
+
+    def _reconcile_unallocated_fills(self, symbol: str) -> None:
+        """Execuções já registadas mas sem alocação (identidade indisponível na altura) são reprocessadas
+        quando a identidade da ordem fica conhecida (W03)."""
+        for row in self.db.unallocated_fills(symbol):
+            execution = SimpleNamespace(execId=row["exec_id"], orderId=int(row["order_id"] or 0), side=row["side"],
+                                        shares=float(row["shares"]), price=float(row["price"]),
+                                        time=datetime.fromisoformat(row["ts"]), acctNumber=row.get("account") or "",
+                                        clientId=None, orderRef=None, permId=None)
+            fill = SimpleNamespace(contract=SimpleNamespace(symbol=symbol, secType="STK", conId=self.ibkr.con_id(symbol)),
+                                   execution=execution, commissionReport=None)
+            self._on_fill(None, fill, reprocess=True)
 
     async def _reprotect(self, symbol: str) -> None:
         await asyncio.sleep(1.0)  # dá tempo ao OCA irmão/fill de chegar
@@ -1146,7 +1185,7 @@ class TradingEngine:
                 log.critical("[%s] Proteção perdida (filho cancelado/rejeitado): a repor.", symbol)
                 await self._protect_if_naked_locked(symbol, positions[symbol])
 
-    def _on_fill(self, trade: Any, fill: Any) -> None:
+    def _on_fill(self, trade: Any, fill: Any, reprocess: bool = False) -> None:
         execution = fill.execution
         symbol = fill.contract.symbol
         if getattr(fill.contract, "secType", "STK") != "STK":
@@ -1177,15 +1216,22 @@ class TradingEngine:
                                   side=execution.side, shares=float(execution.shares), price=float(execution.price), ts=ts,
                                   commission=commission_value, commission_estimated=estimated)
         if not new:
-            return
-        log.info("Execução %s %s x%g @ %.2f (ordem %d) · comissão %.2f USD%s", symbol, execution.side, execution.shares,
-                 execution.price, execution.orderId, commission_value, " (estimada)" if estimated else "",
-                 extra={"category": "ordem"})
+            # Já registada: só volta a ser processada se ainda não tocou em nenhum trade (reconciliação, W03).
+            if self.db.allocations_for_fill(execution.execId):
+                return
+            stored = self.db.fill_by_exec(execution.execId)
+            if stored is not None:
+                commission_value = float(stored.get("commission") or commission_value)
+        if new:
+            log.info("Execução %s %s x%g @ %.2f (ordem %d) · comissão %.2f USD%s", symbol, execution.side, execution.shares,
+                     execution.price, execution.orderId, commission_value, " (estimada)" if estimated else "",
+                     extra={"category": "ordem"})
         group = self.db.group_for_order(execution.orderId, symbol=symbol, con_id=getattr(fill.contract, "conId", None),
                                         account=getattr(execution, "acctNumber", None) or None, perm_id=perm_id)
         if not group:
-            log.warning("Execução %s (ordem %d) sem grupo conhecido para este contrato/conta: ordem externa ou de "
-                        "outra sessão; só registada.", symbol, execution.orderId)
+            if not reprocess:
+                log.warning("Execução %s (ordem %d) sem grupo conhecido para este contrato/conta: ordem externa ou de "
+                            "outra sessão; só registada (reconciliável quando a identidade for conhecida).", symbol, execution.orderId)
             return
         if group["role"] == "ENTRY":
             trade_row = self.db.trade_for_group(group["id"])

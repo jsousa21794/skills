@@ -479,6 +479,20 @@ class IBKRClient:
                 out.append(t)
         return out
 
+    def order_is_ours(self, order: Any, contract: Any = None) -> bool:
+        """Identidade completa de uma ordem reportada num callback: conta, clientId e orderRef (W03)."""
+        if not self._same_account(order):
+            return False
+        client_id = getattr(order, "clientId", None)
+        if client_id is not None and str(client_id) != "" and int(client_id) != int(self.settings.ib_client_id):
+            return False
+        ref = getattr(order, "orderRef", None)
+        if self.settings.order_ref and ref is not None and ref != self.settings.order_ref:
+            return False
+        if contract is not None and getattr(contract, "secType", "STK") != "STK":
+            return False
+        return True
+
     def our_open_orders(self) -> list[Trade]:
         """Todas as ordens abertas do bot (orderRef + conta), para restaurar estado após reinício (N05)."""
         if not self.connected:
@@ -629,15 +643,33 @@ class IBKRClient:
         """Espera que todas as ordens atinjam estado terminal (cancelada/executada)."""
         import time as _time
 
+        def done(t: Trade) -> bool:
+            fn = getattr(t, "isDone", None)
+            return bool(fn()) if callable(fn) else t.orderStatus.status in self.TERMINAL_STATUSES
+
         deadline = _time.monotonic() + timeout
         while _time.monotonic() < deadline:
-            if all(t.isDone() for t in trades):
+            if all(done(t) for t in trades):
                 return True
             await asyncio.sleep(0.25)
-        return all(t.isDone() for t in trades)
+        return all(done(t) for t in trades)
 
     ACTIVE_STATUSES = ("PreSubmitted", "Submitted", "PendingSubmit", "ApiPending")
+    TERMINAL_STATUSES = ("Filled", "Cancelled", "ApiCancelled", "Inactive")
     STOP_TYPES = ("STP", "TRAIL", "STP LMT")
+
+    @classmethod
+    def is_live_order(cls, trade: Trade) -> bool:
+        """Toda a ordem NÃO terminal pode ainda executar: ``PendingCancel`` incluído (W01/W02). Um pedido de
+        cancelamento não é um cancelamento confirmado. Usa ``Trade.isDone()`` do ib_async quando existe."""
+        fn = getattr(trade, "isDone", None)
+        if callable(fn):
+            return not bool(fn())
+        return trade.orderStatus.status not in cls.TERMINAL_STATUSES
+
+    @classmethod
+    def in_transition(cls, trade: Trade) -> bool:
+        return cls.is_live_order(trade) and trade.orderStatus.status not in cls.ACTIVE_STATUSES
 
     @staticmethod
     def _remaining(trade: Trade) -> float:
@@ -654,14 +686,19 @@ class IBKRClient:
         out = []
         for t in self.open_trades_for(symbol, ours_only=True):
             o = t.order
-            if o.action != needed_action or t.orderStatus.status not in self.ACTIVE_STATUSES:
+            if o.action != needed_action or not self.is_live_order(t):
                 continue
             if o.orderType in self.STOP_TYPES or o.orderType == "LMT":
                 out.append(t)
         return out
 
+    def transitional_children(self, symbol: str) -> list[Trade]:
+        """Filhos do bot num estado de transição (ex.: PendingCancel): nem confirmados nem terminados (W02)."""
+        return [t for t in self._protective_children(symbol) if self.in_transition(t)]
+
     def external_exit_orders(self, symbol: str) -> list[Trade]:
-        """Ordens de saída ATIVAS na conta que NÃO são do bot (stop/limit manual do lado oposto à posição) (V01)."""
+        """Ordens de saída NÃO TERMINAIS na conta que não são do bot (stop/limit manual do lado oposto à
+        posição), incluindo as que aguardam cancelamento: enquanto não terminarem podem executar (V01/W01)."""
         qty = self.position_qty(symbol)
         if qty == 0:
             return []
@@ -670,7 +707,7 @@ class IBKRClient:
         for t in self.open_trades_for(symbol, ours_only=False):
             if self._is_ours(t) or t.order.action != needed_action:
                 continue
-            if t.orderStatus.status in self.ACTIVE_STATUSES:
+            if self.is_live_order(t):
                 out.append(t)
         return out
 
@@ -709,8 +746,17 @@ class IBKRClient:
         qty = self.position_qty(symbol)
         if qty == 0:
             return None
-        orphans = self._orphan_children(symbol)
-        if self.has_protective_orders(symbol, needed_qty=max_qty) and not orphans:
+        ours_only = max_qty is not None  # posição mista: só a cobertura do PRÓPRIO bot conta para a parte própria (W07)
+        # Ordens em transição (PendingCancel) ainda podem executar: nunca se cria cobertura nova por cima
+        # delas; espera-se o estado terminal e só depois se recalcula (W02).
+        transitional = self.transitional_children(symbol)
+        if transitional:
+            if not await self.wait_done(transitional, timeout=5.0):
+                log.error("Reparação de %s adiada: %d ordem(ns) do bot ainda em transição (%s).", symbol, len(transitional),
+                          ", ".join(f"{t.order.orderId}:{t.orderStatus.status}" for t in transitional))
+                return None
+        orphans = [t for t in self._orphan_children(symbol) if not self.in_transition(t)]
+        if self.has_protective_orders(symbol, needed_qty=max_qty, ours_only=ours_only) and not orphans:
             return None
         contract = await self.qualify(symbol)
         if contract is None:
@@ -727,8 +773,11 @@ class IBKRClient:
         qty = self.position_qty(symbol)
         if qty == 0 or not self.connected:
             return None
+        if self.transitional_children(symbol):
+            log.error("Reparação de %s adiada: nova ordem em transição depois dos cancelamentos.", symbol)
+            return None
         manageable = abs(qty) if max_qty is None else min(abs(qty), float(max_qty))  # posição mista: só a parte própria
-        residual = manageable - self.protective_coverage(symbol)
+        residual = manageable - self.protective_coverage(symbol, ours_only=ours_only)
         n = int(residual + 1e-9)
         if n <= 0:
             if residual > 1e-9 and symbol not in self._fraction_warned:
@@ -755,14 +804,16 @@ class IBKRClient:
                 "direction": 1 if qty > 0 else -1, "trades": trades, "tp_price": round_tick(tp_price),
                 "sl_price": round_tick(stop_price), "replaced_order_ids": replaced}
 
-    def protective_coverage(self, symbol: str) -> float:
-        """Quantidade coberta por stops ATIVOS do lado oposto à posição, na conta do bot (N04)."""
+    def protective_coverage(self, symbol: str, ours_only: bool = False) -> float:
+        """Quantidade coberta por stops CONFIRMADOS (estados ativos) do lado oposto à posição, na conta do
+        bot (N04). Ordens em transição (PendingCancel) não são cobertura confirmada (W02). Com ``ours_only``
+        só contam os stops do próprio bot (parcela própria de uma posição mista, W07)."""
         qty = self.position_qty(symbol)
         if qty == 0:
             return 0.0
         needed_action = "SELL" if qty > 0 else "BUY"
         covered = 0.0
-        for t in self.open_trades_for(symbol, ours_only=False):  # conta filtrada sempre; orderRef não exigido
+        for t in self.open_trades_for(symbol, ours_only=ours_only):  # conta filtrada sempre
             o, st = t.order, t.orderStatus
             if o.orderType not in self.STOP_TYPES or o.action != needed_action:
                 continue
@@ -771,9 +822,10 @@ class IBKRClient:
             covered += self._remaining(t)
         return covered
 
-    def has_protective_orders(self, symbol: str, needed_qty: Optional[float] = None) -> bool:
-        """True quando os stops ativos cobrem toda a parte negociável da posição (ou ``needed_qty``, a
-        quantidade própria numa posição mista).
+    def has_protective_orders(self, symbol: str, needed_qty: Optional[float] = None, ours_only: bool = False) -> bool:
+        """True quando os stops confirmados cobrem toda a parte negociável da posição (ou ``needed_qty``, a
+        quantidade própria numa posição mista, caso em que só os stops do bot contam: um stop manual
+        pertence à parcela manual, W07).
 
         A parte inteira é o máximo que a API permite cobrir; a fração restante é assinalada
         uma vez em ``ensure_protection`` em vez de disparar reparações a cada ciclo (N03/F10).
@@ -783,10 +835,11 @@ class IBKRClient:
             return False
         if needed_qty is not None:
             qty = min(qty, abs(float(needed_qty)))
+            ours_only = True
         coverable = float(int(qty + 1e-9))
         if coverable <= 0:
             return False
-        return self.protective_coverage(symbol) + 1e-9 >= coverable
+        return self.protective_coverage(symbol, ours_only=ours_only) + 1e-9 >= coverable
 
     def has_pending_entry(self, symbol: str) -> bool:
         """Entrada do bot ainda viva na corretora: pai (sem parentId) a mercado OU limit (N05)."""
@@ -819,23 +872,41 @@ class IBKRClient:
             log.warning("Fecho de %s não iniciado: autorização revogada.", symbol)
             return {"order_id": None, "qty": 0, "direction": 1 if qty > 0 else -1, "trade": None,
                     "aborted": True, "needs_protection": not self.has_protective_orders(symbol)}
-        external = self.external_exit_orders(symbol)
-        if external and not self.settings.cancel_external_exits_on_close:
-            ids = ", ".join(f"{t.order.orderId}:{t.order.orderType} {t.order.action} x{t.order.totalQuantity:g}" for t in external)
-            log.critical("Fecho de %s BLOQUEADO: há ordens de saída MANUAIS ativas na conta (%s). Cancela-as na TWS ou ativa "
-                         "cancel_external_exits_on_close; sem isso o bot nunca envia uma saída concorrente.", symbol, ids)
+        def conflict(external: list[Trade]) -> dict[str, Any]:
+            ids = ", ".join(f"{t.order.orderId}:{t.order.orderType} {t.order.action} x{t.order.totalQuantity:g} [{t.orderStatus.status}]"
+                            for t in external)
+            log.critical("Fecho de %s BLOQUEADO: há ordens de saída MANUAIS não terminadas na conta (%s). Cancela-as na TWS "
+                         "ou ativa cancel_external_exits_on_close; sem isso o bot nunca envia uma saída concorrente.", symbol, ids)
             return {"order_id": None, "qty": 0, "direction": 1 if qty > 0 else -1, "trade": None, "aborted": True,
                     "needs_protection": False, "conflict": [int(t.order.orderId) for t in external]}
-        children = self.open_trades_for(symbol) + external
-        for trade in children:
-            self.cancel_trade(trade)
-        done = await self.wait_done(children, timeout=5.0)
-        if not done or not self.connected:
-            still_covered = self.connected and self.has_protective_orders(symbol)
-            log.error("Fecho de %s: cancelamentos não confirmados em 5 s; a abortar o fecho (cobertura %s).",
-                      symbol, "mantida" if still_covered else "INCOMPLETA: será reposta")
+
+        external = self.external_exit_orders(symbol)
+        if external and not self.settings.cancel_external_exits_on_close:
+            return conflict(external)
+        # Cancelar e ESPERAR o estado terminal; depois reconciliar de novo todas as saídas do contrato, porque
+        # uma ordem manual pode ter surgido durante a espera e um PendingCancel ainda pode executar (W01).
+        for attempt in range(3):
+            children = [t for t in self.open_trades_for(symbol) if self.is_live_order(t)] + external
+            for trade in children:
+                if trade.orderStatus.status in self.ACTIVE_STATUSES:
+                    self.cancel_trade(trade)
+            done = await self.wait_done(children, timeout=5.0)
+            if not done or not self.connected:
+                still_covered = self.connected and self.has_protective_orders(symbol)
+                log.error("Fecho de %s: cancelamentos não confirmados em 5 s; a abortar o fecho (cobertura %s).",
+                          symbol, "mantida" if still_covered else "INCOMPLETA: será reposta")
+                return {"order_id": None, "qty": 0, "direction": 1 if qty > 0 else -1, "trade": None,
+                        "aborted": True, "needs_protection": not still_covered}
+            external = self.external_exit_orders(symbol)
+            own_live = [t for t in self.open_trades_for(symbol) if self.is_live_order(t)]
+            if not external and not own_live:
+                break
+            if external and not self.settings.cancel_external_exits_on_close:
+                return conflict(external)
+        else:
+            log.error("Fecho de %s: saídas continuam não terminadas após 3 tentativas; a abortar.", symbol)
             return {"order_id": None, "qty": 0, "direction": 1 if qty > 0 else -1, "trade": None,
-                    "aborted": True, "needs_protection": not still_covered}
+                    "aborted": True, "needs_protection": not self.has_protective_orders(symbol)}
         qty_now = self.position_qty(symbol)
         if qty_now == 0 or (qty_now > 0) != (qty > 0):
             log.warning("Fecho de %s: a posição já foi fechada pelo stop/TP durante os cancelamentos.", symbol)
@@ -855,6 +926,12 @@ class IBKRClient:
             log.warning("Fecho de %s NÃO enviado: autorização revogada depois dos cancelamentos; a repor cobertura.", symbol)
             return {"order_id": None, "qty": 0, "direction": 1 if qty_now > 0 else -1, "trade": None,
                     "aborted": True, "needs_protection": True}
+        concurrent = self.external_exit_orders(symbol) + [t for t in self.open_trades_for(symbol) if self.is_live_order(t)]
+        if concurrent:  # última reconciliação imediatamente antes do envio: nenhuma saída concorrente viva (W01)
+            log.critical("Fecho de %s NÃO enviado: saída(s) %s ainda não terminada(s) no instante do envio.", symbol,
+                         [int(t.order.orderId) for t in concurrent])
+            return {"order_id": None, "qty": 0, "direction": 1 if qty_now > 0 else -1, "trade": None, "aborted": True,
+                    "needs_protection": not self.has_protective_orders(symbol), "conflict": [int(t.order.orderId) for t in concurrent]}
         try:
             trade = self.ib.placeOrder(contract, order)
         except Exception as exc:  # noqa: BLE001
