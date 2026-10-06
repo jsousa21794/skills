@@ -57,7 +57,8 @@ class Settings:
     ib_client_id: int = 17
     ib_account: str = ""  # conta/subconta autorizada; "" = primeira conta gerida
     order_ref: str = "OllamaIBKRTrader"  # etiqueta das ordens do bot (não toca em ordens manuais)
-    manage_external_positions: bool = False  # posições fora da lista de ativos: só avisa
+    manage_external_positions: bool = False  # posições não abertas pelo bot: só avisa (nunca geridas sem isto)
+    cancel_external_exits_on_close: bool = False  # fecho por sinal com stop/limit MANUAL ativo: False = bloqueia o fecho
     market_data_type: int = 3  # 1 = tempo real, 3 = atrasado (funciona sem subscrição)
     symbols: list[str] = field(default_factory=lambda: ["AAPL", "TSLA"])
     exchange: str = "SMART"

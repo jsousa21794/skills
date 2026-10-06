@@ -54,9 +54,11 @@ def test_f02_real_client_waits_cancellations_and_requantifies():
     client = IBKRClient(s)
     client.ib = SimpleNamespace(isConnected=lambda: True, cancelOrder=lambda o: None, placeOrder=None,
                                 client=SimpleNamespace(getReqId=lambda: 999))
-    calls = {"qty": [100, 0]}  # 100 antes dos cancelamentos, 0 depois (stop executou)
-    client.position_qty = lambda symbol: calls["qty"].pop(0)
-    client.open_trades_for = lambda symbol, ours_only=True: [SimpleNamespace(order=SimpleNamespace(orderId=5), isDone=lambda: True)]
+    calls = {"qty": [100, 100, 0]}  # 100 antes (leitura + reconciliação das saídas), 0 depois (stop executou)
+    client.position_qty = lambda symbol: calls["qty"].pop(0) if len(calls["qty"]) > 1 else calls["qty"][0]
+    child = SimpleNamespace(order=SimpleNamespace(orderId=5, action="SELL", orderRef="OllamaIBKRTrader", account=""),
+                            orderStatus=SimpleNamespace(status="Submitted", remaining=100, filled=0), isDone=lambda: True)
+    client.open_trades_for = lambda symbol, ours_only=True: [child]
 
     async def qualify(symbol):
         return SimpleNamespace(conId=1)
@@ -447,4 +449,4 @@ def test_f38_close_commission_is_split_over_the_trades_it_closed(monkeypatch):
 
 # ---------------------------------------------------------------- F40
 def test_f40_version_matches_release_line():
-    assert __version__ == "1.0.4"
+    assert __version__ == "1.0.5"

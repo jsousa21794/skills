@@ -100,9 +100,17 @@ class FakeIBKR:
                    if o.orderType in ("STP", "TRAIL", "STP LMT") and o.action == need
                    and o.status in ("PreSubmitted", "Submitted", "PendingSubmit", "ApiPending"))
 
-    def has_protective_orders(self, symbol):
+    def has_protective_orders(self, symbol, needed_qty=None):
         qty = abs(self.positions.get(symbol, 0.0))
+        if needed_qty is not None:
+            qty = min(qty, abs(needed_qty))
         return qty > 0 and self.protective_coverage(symbol) + 1e-9 >= qty
+
+    def has_orphan_children(self, symbol):
+        return False
+
+    def external_exit_orders(self, symbol):
+        return []
 
     def bars_as_list(self, symbol):
         return list(self._bars.get(symbol, []))
@@ -150,8 +158,10 @@ class FakeIBKR:
                 "tp_price": tp_price, "sl_price": stop_price, "trades": [], "con_id": self.con_id(symbol),
                 "account": self.account}
 
-    async def close_position(self, symbol, authorize=None):
+    async def close_position(self, symbol, authorize=None, max_qty=None):
         qty = self.positions.get(symbol, 0.0)
+        if max_qty is not None:
+            qty = (1 if qty > 0 else -1) * min(abs(qty), max_qty)
         if not qty:
             return None
         if getattr(self, "slow_cancel", None):
@@ -173,11 +183,13 @@ class FakeIBKR:
         return {"order_id": oid, "qty": abs(qty), "direction": 1 if qty > 0 else -1, "trade": None,
                 "needs_protection": False}
 
-    async def ensure_protection(self, symbol, *, stop_price, tp_price):
+    async def ensure_protection(self, symbol, *, stop_price, tp_price, max_qty=None):
         self.protections.append(symbol)
         tp_id, sl_id = self._next_id, self._next_id + 1
         self._next_id += 2
         qty = self.positions.get(symbol, 0.0)
+        if max_qty is not None:
+            qty = (1 if qty > 0 else -1) * min(abs(qty), max_qty)
         self.orders.setdefault(symbol, []).append(FakeOrder(sl_id, "SELL" if qty > 0 else "BUY", abs(qty), "STP"))
         return {"tp_order_id": tp_id, "sl_order_id": sl_id, "qty": abs(qty), "direction": 1 if qty > 0 else -1,
                 "trades": [], "tp_price": round(tp_price, 2), "sl_price": round(stop_price, 2)}

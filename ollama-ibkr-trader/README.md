@@ -23,11 +23,40 @@ escuro).
 > de perda aplicam-se o StoplossGuard, o travão de perdas seguidas e o cooldown
 > após saída em perda. Tudo ajustável em `config.json` (validado ao carregar).
 >
-> Versão 1.0.4: resposta à revisão da 1.0.3 (18 entradas, 4 P0), ver
-> `../reports/Resposta à revisão 1.0.3.md`; antes, a resposta à auditoria da
-> 1.0.2 em `../reports/Resposta à auditoria 1.0.2.md`.
+> Versão 1.0.5: resposta à revisão da 1.0.4 (11 achados, 1 P0), ver
+> `../reports/Resposta à revisão 1.0.4.md`; antes, as respostas à revisão da
+> 1.0.3 e à auditoria da 1.0.2 na mesma pasta.
 
-## Invariantes de segurança (1.0.4)
+## Invariantes de segurança (1.0.5)
+
+- **Nenhuma saída concorrente**: um fecho por sinal reconcilia primeiro todas
+  as ordens de saída do contrato na conta; com um stop ou limit MANUAL ativo o
+  fecho é bloqueado e assinalado (`cancel_external_exits_on_close` permite
+  cancelá-lo antes de enviar). Posições MISTAS (ações do bot + ações manuais no
+  mesmo contrato) só são protegidas e fechadas na quantidade própria, e os
+  sinais nesse ativo ficam bloqueados até adoção explícita.
+- **Identidade persistida das ordens**: no reinício, TP/SL autónomos são
+  reconhecidos pela perna registada em `order_history` e mantidos; só pernas
+  PARENT são entradas/fechos pendentes; um par incompleto (stop sem TP) é
+  reposto. Execuções só tocam num trade com o `clientId` do bot e, quando
+  conhecido, o mesmo `permId`; o cliente 0 (TWS manual) é uma identidade como
+  outra qualquer.
+- **Proveniência das bases**: `order_history` é preenchida para grupos
+  herdados; a base por modo fica atribuída à primeira conta que a copiou e
+  nunca é copiada para outra, nem quando contém registos de outra conta; uma
+  base ≤ 1.0.2 que coexista com a da 1.0.3 vê as suas proteções ativas e
+  trades abertos importados (histórico fechado preservado à parte).
+- **Experiência única**: retrospetiva, calibração, relatórios e gates usam o
+  calibrador atual e particionam por (modelo, versão do prompt), com a curva
+  de equity reconstruída dos trades dessa experiência; gates de outra
+  experiência nunca validam o modelo atual; no A/B o estado de validação é o
+  do modelo que respondeu. A autorização final reavalia a idade da decisão
+  (relógio e prazo monotónico) e a cotação face ao limite depois de cada
+  `await`. Os rótulos do bracket usam a entrada real quando a decisão foi
+  executada, o fim da inferência caso contrário, e as mesmas regras de
+  abertura do replay.
+
+## Invariantes de segurança herdados (1.0.4)
 
 - **Token de autorização até ao `placeOrder`**: a geração e o estado do ciclo
   são reavaliados depois de cada `await` (qualificação, cancelamentos) e

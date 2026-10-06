@@ -135,6 +135,7 @@ class TradingEngine:
         self._symbol_locks: dict[str, asyncio.Lock] = {}      # serializa fecho/reproteção por ativo (N02)
         self._reconciled = False                              # nenhuma decisão até reconciliar o estado da corretora (N05)
         self._external_positions: set[str] = set()            # posições não abertas pelo bot (N09)
+        self._mixed_warned: set[str] = set()                  # posições mistas já assinaladas (V07)
         self._last_weekly_report: Optional[date] = None
         self._load_gate_state()
         self.db.record_experiment("config", json.dumps({
@@ -285,11 +286,20 @@ class TradingEngine:
         self.db.switch_path(path)
         self.gate.reset()
         self._calibrators.clear()
-        self.calibrator = self._calibrator_for(self.brain.model)
         self.brain._load_addendum()
-        self.calibrator.set_prompt_version(self.brain.prompt_version)
+        self._set_calibrator(self._calibrator_for(self.brain.model))
         self.lessons.rebuild()
         self._load_gate_state()
+
+    def _set_calibrator(self, cal: Calibrator) -> None:
+        """Calibrador atual: TODAS as dependências (retrospetiva incluída) passam a usá-lo (V08)."""
+        self.calibrator = cal
+        self.retro.calibrator = cal
+
+    def _gates_for(self, model: str) -> tuple[bool, float]:
+        """Estado de validação (gates) e multiplicador de risco DA experiência desse modelo (V08)."""
+        passed = self.db.get_kv(f"gates_passed:{model}") == "1"
+        return passed, (1.0 if passed else self.settings.learning_risk_multiplier)
 
     def _calibrator_for(self, model: str) -> Calibrator:
         cal = self._calibrators.get(model)
@@ -303,7 +313,7 @@ class TradingEngine:
     async def set_model(self, model: str) -> None:
         if model and model != self.brain.model:
             self.brain.set_model(model)
-            self.calibrator = self._calibrator_for(model)
+            self._set_calibrator(self._calibrator_for(model))
             self._load_gate_state()
             self.generation += 1
             self.persistence.clear()
@@ -335,8 +345,12 @@ class TradingEngine:
         return True
 
     async def settings_changed(self) -> None:
-        """Definições alteradas na GUI: regista a experiência e atualiza o estado publicado."""
-        self.persistence.clear()
+        """Definições alteradas na GUI: reconstrói o que foi dimensionado no arranque (tracker de persistência,
+        fonte de eventos), regista a experiência e atualiza o estado publicado (V11)."""
+        self.persistence = PersistenceTracker(self.settings.signal_persistence_cycles)
+        self.events = EventData(self.db, self.settings.finnhub_api_key, self.settings.news_source)
+        self.gate.events = self.events
+        self._mixed_warned.clear()
         self.db.record_experiment("config", json.dumps({
             "model": self.brain.model, "threshold": self.settings.min_confidence, "edge_margin": self.settings.edge_margin,
             "samples": self.settings.llm_samples, "two_stage": self.settings.llm_two_stage,
@@ -358,7 +372,7 @@ class TradingEngine:
 
     async def run_statistical_report(self) -> dict[str, Any]:
         self.settler.run()
-        report = self.analytics.build_report(model=self.brain.model)  # só a experiência do modelo atual (N11)
+        report = self.analytics.build_report(model=self.brain.model, prompt_version=self.brain.prompt_version)  # só a experiência atual
         self._apply_gates(report["gates"])
         md = Analytics.render_markdown(report)
         path = self.settings.log_path().with_name(f"relatorio_estatistico_{self.settings.trading_mode}.md")
@@ -385,7 +399,7 @@ class TradingEngine:
         if models and self.brain.model not in models:
             log.warning("Modelo %s não está instalado no Ollama; a usar %s", self.brain.model, models[0])
             self.brain.set_model(models[0])
-            self.calibrator = self._calibrator_for(models[0])
+            self._set_calibrator(self._calibrator_for(models[0]))
             self._load_gate_state()
         self.bus.emit("models", models=models, current=self.brain.model)
         self._emit_status()
@@ -419,13 +433,20 @@ class TradingEngine:
         current = self.db.path
         if str(target) != str(current):
             unbound = self.db.get_kv("bound_account") is None  # só o estado pré-ligação (por modo) é copiado
+            foreign = self.db.accounts_in_records() - {account}
             if unbound and not target.exists() and current not in (":memory:", "") and Path(current).exists():
-                try:
-                    self.db.copy_to(target)
-                    log.warning("Base de dados da conta %s criada a partir de %s.", account, current)
-                except Exception as exc:  # noqa: BLE001
-                    log.error("Não foi possível criar a base de dados da conta %s: %s", account, exc)
-                    return False
+                if foreign:
+                    log.critical("Base %s tem registos das contas %s: NÃO é copiada para %s; a conta começa com base vazia.",
+                                 current, ", ".join(sorted(foreign)), account)
+                else:
+                    try:
+                        self.db.copy_to(target)
+                        # A origem fica atribuída de forma durável: nunca volta a ser copiada para outra conta (V06).
+                        self.db.set_kv("bound_account", account)
+                        log.warning("Base de dados da conta %s criada a partir de %s.", account, current)
+                    except Exception as exc:  # noqa: BLE001
+                        log.error("Não foi possível criar a base de dados da conta %s: %s", account, exc)
+                        return False
             self._switch_db(target)
         bound = self.db.get_kv("bound_account")
         if bound and bound != account:
@@ -442,10 +463,36 @@ class TradingEngine:
             lock = self._symbol_locks[symbol] = asyncio.Lock()
         return lock
 
-    def _authorize(self, generation: int) -> Any:
-        """Token de autorização reavaliado pelo cliente IBKR antes de cada ``placeOrder`` (N01)."""
-        return lambda: (generation == self.generation and self.trading_enabled and self.ibkr.connected
-                        and not self.gate.halted)
+    def _authorize(self, generation: int, *, bar_time: Optional[datetime] = None, symbol: Optional[str] = None,
+                   action: Optional[str] = None, limit_price: Optional[float] = None) -> Any:
+        """Token de autorização reavaliado pelo cliente IBKR antes de cada ``placeOrder`` (N01/V10).
+
+        Além da geração e do estado do ciclo, revalida a IDADE da decisão (relógio de parede e prazo
+        monotónico, contra suspensões durante a qualificação) e a cotação face ao limite da entrada.
+        """
+        import time as _time
+
+        deadline = None
+        if bar_time is not None:
+            remaining = self.settings.decision_max_age_seconds - (datetime.now(timezone.utc) - bar_time).total_seconds()
+            deadline = _time.monotonic() + remaining
+
+        def ok() -> bool:
+            if not (generation == self.generation and self.trading_enabled and self.ibkr.connected and not self.gate.halted):
+                return False
+            if bar_time is not None:
+                age = (datetime.now(timezone.utc) - bar_time).total_seconds()
+                if age > self.settings.decision_max_age_seconds or (deadline is not None and _time.monotonic() > deadline):
+                    log.warning("[%s] Decisão expirou antes do envio (%.0fs): ordem não enviada.", symbol, age)
+                    return False
+            if symbol and limit_price is not None and action in ("BUY", "SELL"):
+                quote = self.ibkr.last_price(symbol)
+                if quote is not None and ((action == "BUY" and quote[0] > limit_price) or (action == "SELL" and quote[0] < limit_price)):
+                    log.warning("[%s] Cotação %.2f já além do limite %.2f antes do envio: ordem não enviada.", symbol, quote[0], limit_price)
+                    return False
+            return True
+
+        return ok
 
     def _managed_symbols(self) -> set[str]:
         """Ativos que o bot gere: os que têm trades abertos na base de dados (abertos pelo bot ou adotados)."""
@@ -455,9 +502,27 @@ class TradingEngine:
                         if p.get("sec_type", "STK") == "STK"}
         return managed
 
+    def _own_qty(self, symbol: str) -> float:
+        """Quantidade (com sinal) que o bot abriu e ainda não fechou, segundo a base de dados."""
+        total = 0.0
+        for t in self.db.open_trades(symbol):
+            total += int(t["direction"]) * max(0.0, float(t["filled_qty"] or 0) - float(t["exit_qty"] or 0))
+        return total
+
     def _is_external(self, symbol: str, position_qty: float) -> bool:
-        return position_qty != 0 and not self.settings.manage_external_positions \
-            and not any(float(t["filled_qty"] or 0) > 0 or t["status"] == "OPEN" for t in self.db.open_trades(symbol))
+        """Posição total ou parcialmente alheia ao bot (sem adoção explícita).
+
+        A posição da corretora é líquida: com 20 ações do bot e 80 manuais no mesmo contrato, a posição é
+        MISTA e não é gerida além das 20 próprias (V07). Sinais nesse ativo ficam bloqueados.
+        """
+        if position_qty == 0 or self.settings.manage_external_positions:
+            return False
+        own = self._own_qty(symbol)
+        if own == 0:
+            return True
+        if (own > 0) != (position_qty > 0):
+            return True
+        return abs(position_qty) > abs(own) + 1e-6
 
     async def _reconcile(self) -> None:
         """Após (re)ligar: importa execuções offline, restaura ordens vivas, fecha trades órfãos e repõe cobertura.
@@ -504,6 +569,12 @@ class TradingEngine:
             if o.parentId != 0 or o.orderType not in ("MKT", "LMT") or st.status not in IBKRClient.ACTIVE_STATUSES:
                 continue
             symbol = t.contract.symbol
+            # Classificação pela identidade PERSISTIDA (order_history): um TP/SL autónomo (parentId=0, criado por
+            # ensure_protection) é proteção e fica; só pernas PARENT são entradas/fechos pendentes (V02).
+            known = self.db.group_for_order(int(o.orderId), symbol=symbol)
+            leg = self.db.order_leg(known, int(o.orderId)) if known else None
+            if leg in ("TP", "SL"):
+                continue
             group = self.db.group_by_parent(int(o.orderId))
             if group is None:
                 log.error("Ordem %d (%s %s x%g) do bot sem grupo na base de dados: a cancelar por segurança.",
@@ -531,7 +602,17 @@ class TradingEngine:
             await self._protect_if_naked_locked(symbol, pos)
 
     async def _protect_if_naked_locked(self, symbol: str, pos: dict[str, Any]) -> None:
-        if symbol in self._pending_close or symbol in self._external_positions or self.ibkr.has_protective_orders(symbol):
+        if symbol in self._pending_close or symbol in self._external_positions:
+            return
+        own = abs(self._own_qty(symbol))
+        mixed = not self.settings.manage_external_positions and own > 0 and abs(float(pos["qty"])) > own + 1e-6
+        max_qty = own if mixed else None
+        if mixed and symbol not in self._mixed_warned:
+            self._mixed_warned.add(symbol)
+            log.critical("[%s] Posição MISTA: %g ações na corretora, %g abertas pelo bot. Só as %g próprias são geridas/protegidas; "
+                         "sinais neste ativo ficam bloqueados até adotares o resto (manage_external_positions).",
+                         symbol, float(pos["qty"]), own, own)
+        if self.ibkr.has_protective_orders(symbol, needed_qty=max_qty) and not self.ibkr.has_orphan_children(symbol):
             return
         trade = next((t for t in self.db.open_trades(symbol)), None)
         price = pos.get("market_price") or pos.get("avg_cost") or 0.0
@@ -547,7 +628,7 @@ class TradingEngine:
             else:
                 stop = price * (1 - sign * self.settings.stop_loss_pct)
                 tp = price * (1 + sign * self.settings.take_profit_pct)
-        result = await self.ibkr.ensure_protection(symbol, stop_price=stop, tp_price=tp)
+        result = await self.ibkr.ensure_protection(symbol, stop_price=stop, tp_price=tp, max_qty=max_qty)
         if not result:
             return
         # Persistir a proteção reconstruída para que os seus fills fechem o trade certo; os filhos
@@ -600,10 +681,16 @@ class TradingEngine:
                      if p.get("sec_type", "STK") == "STK"}
         for symbol in self._managed_symbols():
             pos = positions.get(symbol)
-            if pos and symbol not in self._pending_close and symbol not in self._external_positions \
-                    and not self.ibkr.has_protective_orders(symbol):
+            if not pos or symbol in self._pending_close or symbol in self._external_positions:
+                continue
+            own = abs(self._own_qty(symbol))
+            needed = own if (not self.settings.manage_external_positions and own > 0) else None
+            if not self.ibkr.has_protective_orders(symbol, needed_qty=needed):
                 log.critical("[%s] Posição x%g SEM cobertura completa (stops ativos %.0f): a repor proteção.",
                              symbol, pos["qty"], self.ibkr.protective_coverage(symbol))
+                await self._protect_if_naked(symbol, pos)
+            elif self.ibkr.has_orphan_children(symbol):
+                log.warning("[%s] Par de proteção incompleto (TP sem stop ou stop sem TP): a repor o par.", symbol)
                 await self._protect_if_naked(symbol, pos)
         for symbol, pc in list(self._pending_close.items()):
             if pc.get("state") == "CLOSING":
@@ -859,6 +946,8 @@ class TradingEngine:
         position_qty = self.ibkr.position_qty(symbol)
         persistence = self.persistence.push(symbol, action)
         reserved = sum(e["notional"] for e in self._pending_entries.values())
+        # No A/B, o estado de validação aplicado é o do modelo que respondeu, não o global (V08).
+        model_gates, model_multiplier = self._gates_for(calibrator.model_name)
         plan = decide_execution(
             settings=self.settings, gate=self.gate, sizer=self.sizer, calibrator=calibrator, outcome=outcome,
             calibrated=calibrated, snapshot=ctx.snapshot, agg_bars=ctx.agg_bars, now=now, position_qty=position_qty,
@@ -866,8 +955,8 @@ class TradingEngine:
             equity_usd=state.get("net_liq_usd"), available_funds_usd=state.get("available_funds_usd"),
             reserved_notional=reserved, persistence=persistence, pending_close=symbol in self._pending_close,
             pending_entry=any(e["symbol"] == symbol for e in self._pending_entries.values()) or self.ibkr.has_pending_entry(symbol),
-            global_gate=global_gate, sentiment=sentiment, vol_width=vol_width, risk_multiplier=self.risk_multiplier,
-            gates_passed=self.gates_passed,
+            global_gate=global_gate, sentiment=sentiment, vol_width=vol_width, risk_multiplier=model_multiplier,
+            gates_passed=model_gates,
             external_position=symbol in self._external_positions or self._is_external(symbol, position_qty))
         if isinstance(plan, Skip):
             return self._skip(decision_id, symbol, action, plan.reason)
@@ -887,7 +976,9 @@ class TradingEngine:
             self._pending_close[symbol] = {"state": "CLOSING", "order_id": None, "group_id": None, "qty": 0.0,
                                            "filled": 0.0, "ts": datetime.now(timezone.utc)}
             try:
-                result = await self.ibkr.close_position(symbol, authorize=self._authorize(generation))
+                own = abs(self._own_qty(symbol))
+                result = await self.ibkr.close_position(symbol, authorize=self._authorize(generation),
+                                                        max_qty=own if (own > 0 and not self.settings.manage_external_positions) else None)
             except Exception:
                 self._pending_close.pop(symbol, None)
                 raise
@@ -896,6 +987,8 @@ class TradingEngine:
                 reason = ("falha ao fechar posição" if not result else
                           "posição já fechada pelo stop/TP" if result.get("closed_by_children") else "fecho abortado")
                 self._skip(decision_id, symbol, plan.action, reason)
+                if result and result.get("conflict"):
+                    self.bus.emit("log", level="CRITICAL", message=f"[{symbol}] fecho bloqueado por ordens manuais {result['conflict']}")
                 if result and result.get("needs_protection"):
                     positions = {p["symbol"]: p for p in self.ibkr.portfolio_state().get("positions", [])}
                     if symbol in positions:
@@ -937,7 +1030,8 @@ class TradingEngine:
         result = await self.ibkr.place_bracket(symbol, plan.action, sizing.qty, ctx.snapshot.price,
                                                stop_price=sizing.stop_price, tp_price=sizing.tp_price,
                                                trailing=self.settings.use_trailing_stop, limit_price=plan.limit_price,
-                                               authorize=self._authorize(generation))
+                                               authorize=self._authorize(generation, bar_time=ctx.snapshot.bar_time, symbol=symbol,
+                                                                         action=plan.action, limit_price=plan.limit_price))
         if not result:
             return self._skip(decision_id, symbol, plan.action, "Bracket não enviado (falha ou autorização revogada)")
         direction = 1 if plan.action == "BUY" else -1
@@ -970,6 +1064,11 @@ class TradingEngine:
     # --------------------------------------------------------------- gates
     def _apply_gates(self, gates: Optional[dict[str, Any]]) -> None:
         if not gates:
+            return
+        # Só gates da PRÓPRIA experiência (modelo + versão do prompt atuais) validam o modelo atual (V08/A11).
+        expected = Analytics.experiment_id(self.brain.model, self.brain.prompt_version)
+        if gates.get("experiment") != expected:
+            log.warning("Gates da experiência %r ignorados: a experiência atual é %r.", gates.get("experiment"), expected)
             return
         self.gates_passed = bool(gates.get("all_passed"))
         self.risk_multiplier = 1.0 if self.gates_passed else self.settings.learning_risk_multiplier
@@ -1007,6 +1106,9 @@ class TradingEngine:
         status = trade.orderStatus.status
         order_id = trade.order.orderId
         symbol = trade.contract.symbol
+        perm_id = getattr(trade.order, "permId", None)
+        if perm_id:
+            self.db.set_perm_id(int(order_id), int(perm_id))  # identidade durável da corretora (V03)
         if status in ("Cancelled", "Inactive", "ApiCancelled"):
             intentional = self.ibkr.is_intentional_cancel(order_id)
             self.ibkr.forget_cancel(order_id)
@@ -1054,13 +1156,15 @@ class TradingEngine:
         # Identidade da execução (N06): orderIds são por cliente; uma execução de outro clientId (TWS manual,
         # outra sessão) com o mesmo número nunca pode tocar nos trades do bot.
         client_id = getattr(execution, "clientId", None)
-        if client_id not in (None, 0, "") and int(client_id) != int(self.settings.ib_client_id):
-            log.info("Execução %s de outro cliente API (clientId %s): ignorada.", symbol, client_id)
+        if client_id is not None and str(client_id) != "" and int(client_id) != int(self.settings.ib_client_id):
+            # O cliente 0 (TWS manual) é uma identidade como outra qualquer, não ausência de identidade (V03).
+            log.info("Execução %s de outro cliente (clientId %s): ignorada.", symbol, client_id)
             return
         exec_ref = getattr(execution, "orderRef", None)
-        if self.settings.order_ref and exec_ref not in (None, "") and exec_ref != self.settings.order_ref:
+        if self.settings.order_ref and exec_ref is not None and exec_ref != self.settings.order_ref:
             log.info("Execução %s com orderRef %r (não é do bot): ignorada.", symbol, exec_ref)
             return
+        perm_id = getattr(execution, "permId", None) or None
         ts = execution.time if isinstance(execution.time, datetime) else datetime.now(timezone.utc)
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
@@ -1078,7 +1182,7 @@ class TradingEngine:
                  execution.price, execution.orderId, commission_value, " (estimada)" if estimated else "",
                  extra={"category": "ordem"})
         group = self.db.group_for_order(execution.orderId, symbol=symbol, con_id=getattr(fill.contract, "conId", None),
-                                        account=getattr(execution, "acctNumber", None) or None)
+                                        account=getattr(execution, "acctNumber", None) or None, perm_id=perm_id)
         if not group:
             log.warning("Execução %s (ordem %d) sem grupo conhecido para este contrato/conta: ordem externa ou de "
                         "outra sessão; só registada.", symbol, execution.orderId)

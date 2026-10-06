@@ -180,7 +180,8 @@ CREATE TABLE IF NOT EXISTS order_history (
     leg TEXT NOT NULL,             -- PARENT | TP | SL
     order_id INTEGER NOT NULL,
     ts TEXT NOT NULL,
-    replaced_ts TEXT
+    replaced_ts TEXT,
+    perm_id INTEGER                -- identidade durável da corretora, quando conhecida (V03)
 );
 CREATE INDEX IF NOT EXISTS idx_order_history_order ON order_history(order_id);
 """
@@ -216,7 +217,9 @@ DECISION_COLUMNS = {
     "sentiment_n": "INTEGER",
     "generation": "INTEGER",
     "account": "TEXT",
+    "label_source": "TEXT",  # "bracket:entrada" | "bracket:vela" | "direcional" | "censurado" (V09)
 }
+HISTORY_COLUMNS = {"perm_id": "INTEGER"}
 TRADE_COLUMNS = {"decision_action": "TEXT", "stop_price": "REAL", "tp_price": "REAL", "risk_amount": "REAL",
                  "commission": "REAL NOT NULL DEFAULT 0", "gross_pnl": "REAL NOT NULL DEFAULT 0", "account": "TEXT"}
 FILL_COLUMNS = {"commission": "REAL", "commission_estimated": "INTEGER NOT NULL DEFAULT 1", "account": "TEXT"}
@@ -267,12 +270,64 @@ class Database:
     def _migrate(self) -> None:
         with self._lock:
             for table, columns in (("decisions", DECISION_COLUMNS), ("trades", TRADE_COLUMNS), ("fills", FILL_COLUMNS),
-                                   ("order_groups", GROUP_COLUMNS)):
+                                   ("order_groups", GROUP_COLUMNS), ("order_history", HISTORY_COLUMNS)):
                 existing = {row[1] for row in self._conn.execute(f"PRAGMA table_info({table})")}
                 for name, decl in columns.items():
                     if name not in existing:
                         self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+            # Backfill idempotente (V04): grupos anteriores à tabela order_history ficam com as suas pernas
+            # registadas, para que uma reparação posterior arquive em vez de perder os IDs antigos.
+            rows = self._conn.execute(
+                """SELECT g.id, g.ts, g.parent_order_id, g.tp_order_id, g.sl_order_id FROM order_groups g
+                   WHERE NOT EXISTS (SELECT 1 FROM order_history h WHERE h.group_id = g.id)""").fetchall()
+            for gid, ts, parent, tp, sl in rows:
+                for leg, oid in (("PARENT", parent), ("TP", tp), ("SL", sl)):
+                    if oid is not None:
+                        self._conn.execute("INSERT INTO order_history (group_id, leg, order_id, ts) VALUES (?,?,?,?)",
+                                           (gid, leg, int(oid), ts))
             self._conn.commit()
+
+    def accounts_in_records(self) -> set[str]:
+        """Contas presentes nos registos (grupos, trades, fills, decisões): proveniência dos dados (V06)."""
+        out: set[str] = set()
+        for table in ("order_groups", "trades", "fills", "decisions"):
+            for r in self._query(f"SELECT DISTINCT account FROM {table} WHERE account IS NOT NULL AND account != ''"):
+                out.add(str(r["account"]))
+        return out
+
+    def merge_open_state_from(self, other: "Database") -> dict[str, int]:
+        """Importa de outra base (legado que coexiste com esta) só o estado OPERACIONAL: proteções ainda
+        ativas e trades abertos com os seus grupos e pernas (IDs remapeados). O histórico fechado fica no
+        ficheiro de origem; paper e live nunca são fundidos cegamente (V05)."""
+        counts = {"protections": 0, "trades": 0}
+        now = utc_now()
+        for ev in other.active_protections(now):
+            self._execute("INSERT INTO protection_events (ts, name, symbol, until, reason) VALUES (?,?,?,?,?)",
+                          (ev["ts"], ev["name"], ev["symbol"], ev["until"], f"{ev.get('reason') or ''} [importado]"))
+            counts["protections"] += 1
+        for t in other.open_trades():
+            group = other._query("SELECT * FROM order_groups WHERE id=?", (t["group_id"],))
+            g = group[0] if group else None
+            gid = None
+            if g is not None:
+                gid = self.insert_order_group(
+                    symbol=g["symbol"], decision_id=None, role=g["role"], direction=int(g["direction"]), qty=float(g["qty"]),
+                    parent_order_id=g.get("parent_order_id"), tp_order_id=g.get("tp_order_id"), sl_order_id=g.get("sl_order_id"),
+                    ref_price=g.get("ref_price"), tp_price=g.get("tp_price"), sl_price=g.get("sl_price"),
+                    account=g.get("account"), con_id=g.get("con_id"), ts=datetime.fromisoformat(g["ts"]))
+                for h in other._query("SELECT * FROM order_history WHERE group_id=? AND replaced_ts IS NOT NULL", (g["id"],)):
+                    self._execute("INSERT INTO order_history (group_id, leg, order_id, ts, replaced_ts, perm_id) VALUES (?,?,?,?,?,?)",
+                                  (gid, h["leg"], h["order_id"], h["ts"], h["replaced_ts"], h.get("perm_id")))
+            self._execute(
+                """INSERT INTO trades (symbol, decision_id, group_id, direction, qty, filled_qty, entry_ts, entry_price,
+                   exit_qty, exit_reason, pnl, status, stop_price, tp_price, risk_amount, commission, gross_pnl, account)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,'OPEN',?,?,?,?,?,?)""",
+                (t["symbol"], None, gid, int(t["direction"]), float(t["qty"]), float(t["filled_qty"] or 0), t.get("entry_ts"),
+                 t.get("entry_price"), float(t.get("exit_qty") or 0), t.get("exit_reason"), float(t.get("pnl") or 0),
+                 t.get("stop_price"), t.get("tp_price"), t.get("risk_amount"), float(t.get("commission") or 0),
+                 float(t.get("gross_pnl") or 0), t.get("account")))
+            counts["trades"] += 1
+        return counts
 
     # ------------------------------------------------------------------ util
     def _execute(self, sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
@@ -344,11 +399,11 @@ class Database:
 
     def settle_decision(self, decision_id: int, *, settled_price: float, settled_return: float,
                         bench_return: Optional[float], alpha: Optional[float], correct: Optional[int],
-                        horizon_min: int) -> None:
+                        horizon_min: int, label_source: Optional[str] = None) -> None:
         self._execute(
             """UPDATE decisions SET settled_ts=?, settled_price=?, settled_return=?, bench_return=?, alpha=?,
-               correct=?, horizon_min=? WHERE id=?""",
-            (iso(utc_now()), settled_price, settled_return, bench_return, alpha, correct, horizon_min, decision_id),
+               correct=?, horizon_min=?, label_source=COALESCE(?, label_source) WHERE id=?""",
+            (iso(utc_now()), settled_price, settled_return, bench_return, alpha, correct, horizon_min, label_source, decision_id),
         )
 
     def settled_decisions(self, since: Optional[datetime] = None, symbol: Optional[str] = None,
@@ -370,11 +425,11 @@ class Database:
 
     # -------------------------------------------------------- protections
     def closed_trades_between(self, since: datetime, until: Optional[datetime] = None,
-                              model: Optional[str] = None) -> list[dict[str, Any]]:
-        """Trades fechados; com ``model`` só os originados por decisões desse modelo (N11)."""
+                              model: Optional[str] = None, prompt_version: Optional[int] = None) -> list[dict[str, Any]]:
+        """Trades fechados; com ``model``/``prompt_version`` só os originados por decisões dessa experiência (N11)."""
         sql = "SELECT t.* FROM trades t"
         params: list[Any] = []
-        if model is not None:
+        if model is not None or prompt_version is not None:
             sql += " JOIN decisions d ON d.id = t.decision_id"
         sql += " WHERE t.status='CLOSED' AND t.exit_ts >= ?"
         params.append(iso(since))
@@ -384,6 +439,9 @@ class Database:
         if model is not None:
             sql += " AND d.model = ?"
             params.append(model)
+        if prompt_version is not None:
+            sql += " AND d.prompt_version = ?"
+            params.append(prompt_version)
         return self._query(sql + " ORDER BY t.exit_ts", params)
 
     def recent_stop_count(self, since: datetime) -> int:
@@ -604,11 +662,21 @@ class Database:
 
     def update_group_orders(self, group_id: int, *, tp_order_id: Optional[int] = None,
                             sl_order_id: Optional[int] = None, ts: Optional[datetime] = None) -> None:
-        """Substitui os filhos ativos do grupo, ARQUIVANDO os anteriores em ``order_history`` (N07)."""
+        """Substitui os filhos ativos do grupo, ARQUIVANDO os anteriores em ``order_history`` (N07).
+
+        Se o ID antigo ainda não estiver no histórico (grupo herdado), é inserido primeiro: nunca se perde
+        a identidade de um filho substituído (V04)."""
         when = iso(ts or utc_now())
+        current = self._query("SELECT ts, tp_order_id, sl_order_id FROM order_groups WHERE id=?", (group_id,))
         for leg, oid in (("TP", tp_order_id), ("SL", sl_order_id)):
             if oid is None:
                 continue
+            if current:
+                old_id = current[0]["tp_order_id" if leg == "TP" else "sl_order_id"]
+                if old_id is not None and not self._query(
+                        "SELECT 1 FROM order_history WHERE group_id=? AND leg=? AND order_id=?", (group_id, leg, int(old_id))):
+                    self._execute("INSERT INTO order_history (group_id, leg, order_id, ts) VALUES (?,?,?,?)",
+                                  (group_id, leg, int(old_id), current[0]["ts"]))
             self._execute("UPDATE order_history SET replaced_ts=? WHERE group_id=? AND leg=? AND replaced_ts IS NULL",
                           (when, group_id, leg))
             self._execute("INSERT INTO order_history (group_id, leg, order_id, ts) VALUES (?,?,?,?)",
@@ -628,9 +696,24 @@ class Database:
                            (int(group["id"]), int(order_id)))
         return rows[0]["leg"] if rows else None
 
+    def set_perm_id(self, order_id: int, perm_id: Optional[int]) -> None:
+        """Associa o ``permId`` da corretora a uma ordem do bot assim que é conhecido (V03)."""
+        if perm_id:
+            self._execute("UPDATE order_history SET perm_id=? WHERE order_id=? AND perm_id IS NULL", (int(perm_id), int(order_id)))
+
+    def perm_id_for(self, group_id: int, order_id: int) -> Optional[int]:
+        rows = self._query("SELECT perm_id FROM order_history WHERE group_id=? AND order_id=? AND perm_id IS NOT NULL LIMIT 1",
+                           (int(group_id), int(order_id)))
+        return int(rows[0]["perm_id"]) if rows else None
+
+    def trade_for_decision(self, decision_id: int) -> Optional[dict[str, Any]]:
+        rows = self._query("SELECT * FROM trades WHERE decision_id=? ORDER BY id DESC LIMIT 1", (decision_id,))
+        return rows[0] if rows else None
+
     def group_for_order(self, order_id: int, *, symbol: Optional[str] = None, con_id: Optional[int] = None,
-                        account: Optional[str] = None) -> Optional[dict[str, Any]]:
-        """Grupo a que a ordem pertence (ativa ou arquivada), validando símbolo, contrato e conta (N06).
+                        account: Optional[str] = None, perm_id: Optional[int] = None) -> Optional[dict[str, Any]]:
+        """Grupo a que a ordem pertence (ativa ou arquivada), validando símbolo, contrato, conta e, quando
+        ambos são conhecidos, o ``permId`` (N06/V03).
 
         Um grupo gravado sem ``con_id``/``account`` (versões antigas) só é aceite se o símbolo coincidir.
         """
@@ -648,6 +731,10 @@ class Database:
                 continue
             if account and row.get("account") and row["account"] != account:
                 continue
+            if perm_id:
+                known = self.perm_id_for(int(row["id"]), int(order_id))
+                if known is not None and known != int(perm_id):
+                    continue
             return row
         return None
 

@@ -34,18 +34,26 @@ BarsBetween = Callable[[str, datetime, datetime], list[Bar]]
 
 
 def first_touch_label(bars: list[Bar], entry: float, stop_pct: float, tp_pct: float, direction: int) -> Optional[int]:
-    """1 se o TP é tocado antes do stop, 0 se o stop é tocado antes, None se nenhum (trajetória)."""
+    """1 se o TP é tocado antes do stop, 0 se o stop é tocado antes, None se nenhum (trajetória).
+
+    Regras idênticas às do replay (V09/A10): primeiro os eventos observáveis na ABERTURA de cada vela
+    (gap pelo stop → 0, gap pelo TP → 1) e só depois a ambiguidade intrabar, em que o pior caso prevalece.
+    """
     if not bars or entry <= 0 or stop_pct <= 0 or tp_pct <= 0:
         return None
     stop = entry * (1 - direction * stop_pct / 100.0)
     tp = entry * (1 + direction * tp_pct / 100.0)
     for b in bars:
-        hit_stop = b.low <= stop if direction > 0 else b.high >= stop
-        hit_tp = b.high >= tp if direction > 0 else b.low <= tp
-        if hit_stop and hit_tp:
-            return 0  # ambíguo na mesma vela: assume-se o pior caso
-        if hit_stop:
+        if direction > 0:
+            gap_stop, gap_tp, hit_stop, hit_tp = b.open <= stop, b.open >= tp, b.low <= stop, b.high >= tp
+        else:
+            gap_stop, gap_tp, hit_stop, hit_tp = b.open >= stop, b.open <= tp, b.high >= stop, b.low <= tp
+        if gap_stop:
             return 0
+        if gap_tp:
+            return 1
+        if hit_stop:
+            return 0  # inclui o caso ambíguo na mesma vela: assume-se o pior caso
         if hit_tp:
             return 1
     return None
@@ -81,9 +89,21 @@ class Settler:
         pending = self.db.unsettled_decisions(now - horizon)
         settled = 0
         for d in pending:
-            # O instante de mercado é o da vela usada na decisão (market_ts), não o fim da inferência.
-            ts = datetime.fromisoformat(d["market_ts"] or d["ts"])
+            # Instante de OBSERVAÇÃO (fecho da vela, market_ts) vs instante de DECISÃO (fim da inferência, ts)
+            # vs instante de EXECUÇÃO (entrada real do trade). O rótulo do bracket usa o mais tardio
+            # conhecido: a entrada real quando a decisão foi executada, senão o fim da inferência (V09).
+            observed = datetime.fromisoformat(d["market_ts"] or d["ts"])
+            decided = datetime.fromisoformat(d["ts"])
+            if decided.tzinfo is None:
+                decided = decided.replace(tzinfo=timezone.utc)
+            ts = observed
             target = ts + horizon
+            path_start, entry_price, label_source = max(observed, decided), float(d["price"]), "bracket:vela"
+            trade = self.db.trade_for_decision(int(d["id"])) if d.get("executed") else None
+            if trade and trade.get("entry_ts") and trade.get("entry_price"):
+                path_start = max(path_start, datetime.fromisoformat(trade["entry_ts"]))
+                entry_price = float(trade["entry_price"])
+                label_source = "bracket:entrada"
             price = self.price_at(d["symbol"], target)
             if price is None:
                 if now - ts > timedelta(hours=36):
@@ -116,15 +136,19 @@ class Settler:
             # dentro do horizonte, a decisão fica CENSURADA (correct=None): a probabilidade calibrada
             # significa sempre "TP antes do stop" e nunca mistura o rótulo direcional (N10/F29).
             if d["action"] in ("BUY", "SELL") and self.bars_between is not None and d.get("stop_pct") and d.get("tp_pct"):
-                path = [b for b in self.bars_between(d["symbol"], ts, target) if b.time >= ts]
+                path = [b for b in self.bars_between(d["symbol"], path_start, target) if b.time >= path_start]
                 direction = 1 if d["action"] == "BUY" else -1
-                correct = first_touch_label(path, entry, float(d["stop_pct"]), float(d["tp_pct"]), direction)
+                correct = first_touch_label(path, entry_price, float(d["stop_pct"]), float(d["tp_pct"]), direction)
+                if correct is None:
+                    label_source = "censurado"
             else:
                 correct = label(d["action"], ret, thr, missed)
+                label_source = "direcional"
             self.db.settle_decision(d["id"], settled_price=price, settled_return=round(ret, 4),
                                     bench_return=round(bench_ret, 4) if bench_ret is not None else None,
                                     alpha=round(alpha, 4) if alpha is not None else None,
-                                    correct=correct, horizon_min=self.s.settlement_horizon_minutes)
+                                    correct=correct, horizon_min=self.s.settlement_horizon_minutes,
+                                    label_source=label_source)
             settled += 1
         if settled:
             log.info("Settlement: %d decisões avaliadas a %d min.", settled, self.s.settlement_horizon_minutes)

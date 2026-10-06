@@ -234,24 +234,49 @@ class Analytics:
         self.s = settings
         self.db = db
 
+    @staticmethod
+    def experiment_id(model: Optional[str], prompt_version: Optional[int]) -> str:
+        if model is None:
+            return "(agregado)"
+        return f"{model}" + (f":p{prompt_version}" if prompt_version is not None else "")
+
     def build_report(self, now: Optional[datetime] = None, since_days: int = 90,
-                     model: Optional[str] = None) -> dict[str, Any]:
-        """Relatório e gates da EXPERIÊNCIA ``model``: só decisões e trades desse modelo (N11).
+                     model: Optional[str] = None, prompt_version: Optional[int] = None) -> dict[str, Any]:
+        """Relatório e gates da EXPERIÊNCIA (modelo + versão do prompt): só decisões e trades dessa
+        experiência, com a curva de equity reconstruída a partir dos SEUS trades (N11/V08).
 
         Sem ``model`` o relatório é agregado e os gates não devem validar nenhum modelo em particular.
         """
         now = now or datetime.now(timezone.utc)
         since = now - timedelta(days=since_days)
+
+        def same_experiment(r: dict[str, Any]) -> bool:
+            if model is not None and (r.get("model") or "") != model:
+                return False
+            return prompt_version is None or r.get("prompt_version") == prompt_version
+
         settled = [r for r in self.db.settled_decisions(since=since, directional_only=True)
-                   if r.get("correct") is not None and (model is None or (r.get("model") or "") == model)]
+                   if r.get("correct") is not None and same_experiment(r)]
         probs = [float(r["calibrated_prob"] if r.get("calibrated_prob") is not None else r["confidence"]) for r in settled]
         outcomes = [int(r["correct"]) for r in settled]
-        closed = self.db.closed_trades_between(since, model=model)
+        closed = self.db.closed_trades_between(since, model=model, prompt_version=prompt_version)
         pnls = [float(t["pnl"]) for t in closed]  # líquidos de comissões
         commissions = sum(float(t.get("commission") or 0) for t in closed)
         gross = sum(float(t.get("gross_pnl") or 0) for t in closed)
-        equity = [v for _, v in self.db.daily_equity(since)]
-        current_equity = equity[-1] if equity else 0.0
+        account_equity = [v for _, v in self.db.daily_equity(since)]
+        current_equity = account_equity[-1] if account_equity else 0.0
+        if model is None:
+            equity = account_equity
+        else:
+            # Equity da experiência: equity inicial da conta + P&L acumulado dos trades desta experiência, por dia.
+            base = (account_equity[0] if account_equity else 0.0)
+            by_day: dict[str, float] = {}
+            for t in closed:
+                by_day[(t.get("exit_ts") or "")[:10]] = by_day.get((t.get("exit_ts") or "")[:10], 0.0) + float(t["pnl"])
+            running, equity = base, [base]
+            for day in sorted(by_day):
+                running += by_day[day]
+                equity.append(running)
         n_trials = self.db.experiment_count()
 
         by_model: dict[str, dict[str, Any]] = {}
@@ -260,7 +285,8 @@ class Analytics:
             by_model[model] = {"n": len(rows), "hit_rate": round(sum(int(r["correct"]) for r in rows) / len(rows), 4)}
 
         report = {
-            "ts": now.isoformat(), "window_days": since_days, "experiment": model or "(agregado)",
+            "ts": now.isoformat(), "window_days": since_days, "experiment": self.experiment_id(model, prompt_version),
+            "model": model, "prompt_version": prompt_version,
             "calibration": calibration_metrics(probs, outcomes),
             "permutation": permutation_hit_rate(settled),
             "trades": {**trade_metrics(pnls), "commissions": round(commissions, 2), "gross_pnl": round(gross, 2),
@@ -294,7 +320,8 @@ class Analytics:
         multiplier = 1.0 if passed else self.s.learning_risk_multiplier
         risk = self.s.risk_per_trade_pct_validated if passed else self.s.risk_per_trade_pct * multiplier
         return {"checks": checks, "all_passed": passed, "risk_multiplier": multiplier, "risk_per_trade": risk,
-                "experiment": report.get("experiment")}
+                "experiment": report.get("experiment"), "model": report.get("model"),
+                "prompt_version": report.get("prompt_version")}
 
     @staticmethod
     def render_markdown(report: dict[str, Any]) -> str:

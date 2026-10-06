@@ -56,9 +56,24 @@ def _migrate_legacy_db(settings: Settings, log: logging.Logger) -> None:
     if not legacy.exists():
         return
     target = settings.db_path()
+    archived = legacy.with_name(legacy.name + ".migrated-1.0.2")
     if target.exists():
-        log.warning("Base de dados antiga %s encontrada mas %s já existe: o ficheiro antigo NÃO foi tocado. "
-                    "Verifica manualmente qual dos dois tem o histórico correto.", legacy.name, target.name)
+        # Coexistência (a 1.0.3 correu primeiro): importa só o estado operacional do legado — proteções
+        # ainda ativas e trades abertos — para a base atual; ambos os ficheiros são preservados (V05).
+        try:
+            src = Database(legacy)
+            dst = Database(target)
+            try:
+                counts = dst.merge_open_state_from(src)
+            finally:
+                src.close()
+                dst.close()
+            shutil.move(str(legacy), str(archived))
+            log.warning("Base antiga %s coexistia com %s: importadas %d proteções ativas e %d trades abertos; o histórico "
+                        "fechado fica em %s (não é fundido). Confirma as posições na TWS antes de iniciar.",
+                        legacy.name, target.name, counts["protections"], counts["trades"], archived.name)
+        except Exception as exc:  # noqa: BLE001
+            log.error("Falha a importar o estado da base antiga %s: %s. Resolve manualmente antes de iniciar.", legacy, exc)
         return
     try:
         src = Database(legacy)
@@ -66,9 +81,9 @@ def _migrate_legacy_db(settings: Settings, log: logging.Logger) -> None:
             src.copy_to(target)
         finally:
             src.close()
-        shutil.move(str(legacy), str(legacy.with_name(legacy.name + ".migrated-1.0.2")))
+        shutil.move(str(legacy), str(archived))
         log.warning("Base de dados da versão <= 1.0.2 migrada para %s (modo %s); original preservado como %s.",
-                    target.name, settings.trading_mode, legacy.name + ".migrated-1.0.2")
+                    target.name, settings.trading_mode, archived.name)
     except Exception as exc:  # noqa: BLE001
         log.error("Falha a migrar a base de dados antiga %s: %s. A continuar com %s.", legacy, exc, target.name)
 

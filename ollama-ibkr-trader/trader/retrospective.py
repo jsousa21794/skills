@@ -74,7 +74,8 @@ class Retrospective:
             model = self.calibrator.fit_from_db()
         report = None
         if full_report:
-            report = self.analytics.build_report(now, model=self.calibrator.model_name)  # gates da experiência atual (N11)
+            report = self.analytics.build_report(now, model=self.calibrator.model_name,
+                                                 prompt_version=self.calibrator.prompt_version)  # gates da experiência atual
 
         result = {
             "ts": now.isoformat(),

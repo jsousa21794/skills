@@ -660,6 +660,24 @@ class IBKRClient:
                 out.append(t)
         return out
 
+    def external_exit_orders(self, symbol: str) -> list[Trade]:
+        """Ordens de saída ATIVAS na conta que NÃO são do bot (stop/limit manual do lado oposto à posição) (V01)."""
+        qty = self.position_qty(symbol)
+        if qty == 0:
+            return []
+        needed_action = "SELL" if qty > 0 else "BUY"
+        out = []
+        for t in self.open_trades_for(symbol, ours_only=False):
+            if self._is_ours(t) or t.order.action != needed_action:
+                continue
+            if t.orderStatus.status in self.ACTIVE_STATUSES:
+                out.append(t)
+        return out
+
+    def has_orphan_children(self, symbol: str) -> bool:
+        """Há um TP sem stop ou um stop sem TP entre os filhos do bot (par incompleto) (V02)."""
+        return bool(self._orphan_children(symbol))
+
     def _orphan_children(self, symbol: str) -> list[Trade]:
         """Filhos cujo grupo OCA perdeu a perna irmã (TP sem stop ou stop sem TP): candidatos a substituição (N07)."""
         children = self._protective_children(symbol)
@@ -674,7 +692,8 @@ class IBKRClient:
                 orphans.extend(legs)
         return orphans
 
-    async def ensure_protection(self, symbol: str, *, stop_price: float, tp_price: float) -> Optional[dict[str, Any]]:
+    async def ensure_protection(self, symbol: str, *, stop_price: float, tp_price: float,
+                                max_qty: Optional[float] = None) -> Optional[dict[str, Any]]:
         """Repõe cobertura TP+SL (OCA, GTC) só na quantidade que FALTA cobrir (N03).
 
         1. Filhos órfãos (TP sem stop ou stop sem TP, do bot) são cancelados e esperados: nunca
@@ -690,13 +709,13 @@ class IBKRClient:
         qty = self.position_qty(symbol)
         if qty == 0:
             return None
-        if self.has_protective_orders(symbol):
+        orphans = self._orphan_children(symbol)
+        if self.has_protective_orders(symbol, needed_qty=max_qty) and not orphans:
             return None
         contract = await self.qualify(symbol)
         if contract is None:
             return None
         replaced: list[int] = []
-        orphans = self._orphan_children(symbol)
         if orphans:
             for t in orphans:
                 self.cancel_trade(t)
@@ -708,7 +727,8 @@ class IBKRClient:
         qty = self.position_qty(symbol)
         if qty == 0 or not self.connected:
             return None
-        residual = abs(qty) - self.protective_coverage(symbol)
+        manageable = abs(qty) if max_qty is None else min(abs(qty), float(max_qty))  # posição mista: só a parte própria
+        residual = manageable - self.protective_coverage(symbol)
         n = int(residual + 1e-9)
         if n <= 0:
             if residual > 1e-9 and symbol not in self._fraction_warned:
@@ -751,8 +771,9 @@ class IBKRClient:
             covered += self._remaining(t)
         return covered
 
-    def has_protective_orders(self, symbol: str) -> bool:
-        """True quando os stops ativos cobrem toda a parte negociável da posição.
+    def has_protective_orders(self, symbol: str, needed_qty: Optional[float] = None) -> bool:
+        """True quando os stops ativos cobrem toda a parte negociável da posição (ou ``needed_qty``, a
+        quantidade própria numa posição mista).
 
         A parte inteira é o máximo que a API permite cobrir; a fração restante é assinalada
         uma vez em ``ensure_protection`` em vez de disparar reparações a cada ciclo (N03/F10).
@@ -760,6 +781,8 @@ class IBKRClient:
         qty = abs(self.position_qty(symbol))
         if qty <= 0:
             return False
+        if needed_qty is not None:
+            qty = min(qty, abs(float(needed_qty)))
         coverable = float(int(qty + 1e-9))
         if coverable <= 0:
             return False
@@ -771,12 +794,15 @@ class IBKRClient:
                    and t.orderStatus.status in self.ACTIVE_STATUSES
                    for t in self.open_trades_for(symbol))
 
-    async def close_position(self, symbol: str, authorize: Optional[Callable[[], bool]] = None) -> Optional[dict[str, Any]]:
+    async def close_position(self, symbol: str, authorize: Optional[Callable[[], bool]] = None,
+                             max_qty: Optional[float] = None) -> Optional[dict[str, Any]]:
         """Fecha a posição a mercado com segurança contra corridas com o stop.
 
-        1. Cancela os filhos (TP/SL) do bot (cancelamento intencional) e espera o estado terminal.
-        2. Volta a ler a posição: se o stop entretanto a fechou, não envia nada.
-        3. Reavalia ``authorize`` (geração/ciclo) e só então envia a quantidade remanescente (N01).
+        1. Reconcilia TODAS as saídas do contrato/conta: uma saída MANUAL ativa (stop ou limit que não
+           é do bot) bloqueia o fecho, salvo ``cancel_external_exits_on_close`` (V01).
+        2. Cancela os filhos (TP/SL) do bot (cancelamento intencional) e espera o estado terminal.
+        3. Volta a ler a posição: se o stop entretanto a fechou, não envia nada.
+        4. Reavalia ``authorize`` (geração/ciclo) e só então envia a quantidade remanescente (N01).
         Devolve ``needs_protection`` verdadeiro sempre que a cobertura possa ter ficado
         incompleta (timeout parcial incluído), para o motor a repor (N02).
         """
@@ -793,7 +819,14 @@ class IBKRClient:
             log.warning("Fecho de %s não iniciado: autorização revogada.", symbol)
             return {"order_id": None, "qty": 0, "direction": 1 if qty > 0 else -1, "trade": None,
                     "aborted": True, "needs_protection": not self.has_protective_orders(symbol)}
-        children = self.open_trades_for(symbol)
+        external = self.external_exit_orders(symbol)
+        if external and not self.settings.cancel_external_exits_on_close:
+            ids = ", ".join(f"{t.order.orderId}:{t.order.orderType} {t.order.action} x{t.order.totalQuantity:g}" for t in external)
+            log.critical("Fecho de %s BLOQUEADO: há ordens de saída MANUAIS ativas na conta (%s). Cancela-as na TWS ou ativa "
+                         "cancel_external_exits_on_close; sem isso o bot nunca envia uma saída concorrente.", symbol, ids)
+            return {"order_id": None, "qty": 0, "direction": 1 if qty > 0 else -1, "trade": None, "aborted": True,
+                    "needs_protection": False, "conflict": [int(t.order.orderId) for t in external]}
+        children = self.open_trades_for(symbol) + external
         for trade in children:
             self.cancel_trade(trade)
         done = await self.wait_done(children, timeout=5.0)
@@ -808,6 +841,8 @@ class IBKRClient:
             log.warning("Fecho de %s: a posição já foi fechada pelo stop/TP durante os cancelamentos.", symbol)
             return {"order_id": None, "qty": 0, "direction": 1 if qty > 0 else -1, "trade": None,
                     "closed_by_children": True, "needs_protection": qty_now != 0}
+        if max_qty is not None:
+            qty_now = (1 if qty_now > 0 else -1) * min(abs(qty_now), float(max_qty))  # só a parte própria
         n = self._order_qty(qty_now)
         if n is None:
             log.error("Fecho de %s: quantidade inteira zero (posição fracionária %.4f).", symbol, qty_now)

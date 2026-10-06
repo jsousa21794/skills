@@ -437,6 +437,7 @@ class TraderApp(ctk.CTk):
             ("ib_port_paper", "Porta conta Paper", "int"), ("ib_client_id", "Client ID da API", "int"),
             ("ib_account", "Conta (vazio = primeira conta gerida)", "str"),
             ("manage_external_positions", "Adotar posições não abertas pelo bot (proteger e gerir)", "bool"),
+            ("cancel_external_exits_on_close", "Ao fechar por sinal, cancelar stops/limits MANUAIS (senão o fecho é bloqueado)", "bool"),
         ],
         "Ollama": [
             ("ollama_url", "URL do Ollama", "str"), ("llm_interval_minutes", "Consultar o modelo a cada (min)", "int"),
