@@ -4,15 +4,16 @@ Separação de responsabilidades:
 - A GUI (thread principal, Tkinter) nunca chama ``ib_async`` diretamente;
   envia pedidos através de ``TradingEngine.call()`` (``run_coroutine_threadsafe``).
 - O motor publica estado/logs no ``UIBus`` e nunca toca em widgets.
+- A política de execução (``policy.decide_execution``) é partilhada com o replay.
 
-Ciclo (a cada ``cycle_seconds``):
-  settlement de decisões vencidas -> gates globais (kill-switch, protections,
-  VIX) -> por ativo: dados frescos? cadência do LLM? -> contexto (velas
-  agregadas, indicadores, dinâmica, ATR, sentimento, vol prevista) -> LLM (N
-  amostras, duas etapas) -> registo -> persistência do sinal -> camada de
-  risco (gates por ativo, sizing por ATR, custos, vetos) -> bracket.
-
-O LLM propõe; o código decide.
+Invariantes de segurança (resposta à auditoria 1.0.2):
+- Toda a decisão pertence a uma *geração*; parar, mudar de conta ou de ativos
+  incrementa a geração e nenhuma ordem é enviada por uma decisão antiga.
+- Antes de cada ordem o estado é relido (conta, fundos, gates, idade da decisão).
+- Fechos e entradas pendentes têm máquina de estados; entradas não executadas
+  são canceladas após ``entry_timeout_seconds``.
+- A cobertura das posições é verificada a cada ciclo e reposta se faltar.
+- Só se tocam ordens com o ``orderRef`` do bot, na conta configurada.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import threading
 from dataclasses import dataclass
 from datetime import date, datetime, time as dtime, timedelta, timezone
@@ -27,14 +29,15 @@ from typing import Any, Coroutine, Optional
 from zoneinfo import ZoneInfo
 
 from .analytics import Analytics
-from .calibration import Calibrator, ConfidenceSignals, execution_threshold
+from .calibration import Calibrator, ConfidenceSignals
 from .config import Settings
 from .database import Database
 from .ibkr_client import IBKRClient
 from .indicators import Bar, MarketSnapshot, aggregate_bars, atr as atr_fn, build_snapshot, compute_dynamics, Dynamics
 from .lessons import LessonEngine
 from .market_data import EventData
-from .ollama_brain import Decision, DecisionOutcome, OllamaBrain
+from .ollama_brain import DecisionOutcome, OllamaBrain
+from .policy import ExecutionPlan, PersistenceTracker, Skip, decide_execution
 from .retrospective import Retrospective
 from .risk import PositionSizer, RiskGate, commission as estimate_commission, round_trip_cost
 from .sentiment import SentimentScorer
@@ -65,18 +68,18 @@ class DecisionContext:
 
 def build_decision_context(settings: Settings, symbol: str, bars_1m: list[Bar], equity: float = 0.0,
                            drop_forming: bool = True) -> Optional[DecisionContext]:
-    """Agrega velas, calcula indicadores e dinâmica sobre a última vela fechada."""
+    """Agrega velas (só buckets completos), calcula indicadores e dinâmica sobre a última vela fechada."""
     if not bars_1m:
         return None
     closed = bars_1m[:-1] if (drop_forming and len(bars_1m) > 1) else bars_1m
-    agg = aggregate_bars(closed, settings.decision_bar_minutes)
+    agg = aggregate_bars(closed, settings.decision_bar_minutes, drop_incomplete=True)
     if len(agg) < settings.sma_slow + 5:
         return None
     closes = [b.close for b in agg]
     volumes = [b.volume for b in agg]
     snapshot = build_snapshot(symbol, closes, volumes, agg[-1].time, rsi_period=settings.rsi_period,
                               sma_fast_period=settings.sma_fast, sma_slow_period=settings.sma_slow,
-                              ema_period=settings.ema_period)
+                              ema_period=settings.ema_period, bar_minutes=settings.decision_bar_minutes)
     if snapshot is None:
         return None
     dynamics = compute_dynamics(closes, agg, rsi_period=settings.rsi_period, sma_fast_period=settings.sma_fast,
@@ -98,13 +101,14 @@ class TradingEngine:
         self.events = EventData(db, settings.finnhub_api_key, settings.news_source)
         self.sizer = PositionSizer(settings)
         self.gate = RiskGate(settings, db, self.events)
-        self.calibrator = Calibrator(settings, db)
-        self.settler = Settler(settings, db, self._price_at)
+        self.calibrator = Calibrator(settings, db, brain.model)
+        self.settler = Settler(settings, db, self._price_at, bars_between=self._bars_between)
         self.lessons = LessonEngine(settings, db)
         self.analytics = Analytics(settings, db)
         self.retro = Retrospective(settings, db, brain, self.settler, self.lessons, self.calibrator, self.analytics)
         self.sentiment = SentimentScorer(settings.sentiment_model) if settings.sentiment_enabled else None
         self.volmodel = VolatilityForecaster(settings.volmodel_name, settings.volmodel_enabled)
+        self.persistence = PersistenceTracker(settings.signal_persistence_cycles)
 
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
@@ -114,17 +118,21 @@ class TradingEngine:
 
         self.trading_enabled = False
         self.ollama_ok = False
-        self.risk_multiplier = 0.5  # fase de aprendizagem até os gates passarem
+        self.generation = 0  # invalida decisões em curso ao parar/mudar de conta/ativos
+        self.risk_multiplier = settings.learning_risk_multiplier
         self.gates_passed = False
         self._last_llm: dict[str, datetime] = {}
         self._last_decided_bar: dict[str, datetime] = {}
-        self._persistence: dict[str, list[str]] = {}
-        self._pending_close: dict[str, int] = {}
+        self._pending_close: dict[str, dict[str, Any]] = {}   # symbol -> {order_id, group_id, qty, filled}
+        self._pending_entries: dict[int, dict[str, Any]] = {}  # parent_order_id -> {symbol, qty, notional, ts, trade_id}
         self._last_weekly_report: Optional[date] = None
         self._load_gate_state()
         self.db.record_experiment("config", json.dumps({
             "model": brain.model, "threshold": settings.min_confidence, "edge_margin": settings.edge_margin,
-            "samples": settings.llm_samples, "two_stage": settings.llm_two_stage, "interval": settings.llm_interval_minutes}))
+            "samples": settings.llm_samples, "two_stage": settings.llm_two_stage, "interval": settings.llm_interval_minutes,
+            "mode": settings.trading_mode}))
+        for warning in Settings.load_warnings:
+            log.warning("config.json: %s", warning)
 
     # ------------------------------------------------------------ threading
     def start(self) -> None:
@@ -168,12 +176,12 @@ class TradingEngine:
         self._stop_event = asyncio.Event()
         self._decision_lock = asyncio.Lock()
         self._ready.set()
-        log.info("Motor iniciado: modelo %s | LLM a cada %d min, %d amostras, %s | risco/trade %.2f%% ×%.1f | "
-                 "stop %s | calibração %s | prompt v%d",
+        log.info("Motor iniciado: modelo %s | LLM a cada %d min, %d amostras, %s | risco/trade %.2f%% ×%.2f | "
+                 "stop %s | calibração %s | prompt v%d | modo %s (porta %d) | DB %s",
                  self.brain.model, self.settings.llm_interval_minutes, self.settings.llm_samples,
                  "2 etapas" if self.settings.llm_two_stage else "1 etapa", self.settings.risk_per_trade_pct * 100,
                  self.risk_multiplier, self.settings.stop_mode, "Platt" if self.calibrator.is_fitted else "heurística",
-                 self.brain.prompt_version)
+                 self.brain.prompt_version, self.settings.trading_mode.upper(), self.settings.ib_port, self.db.path)
         await self._refresh_models()
         self.bus.emit("equity_history", points=self.equity_history())
         tasks = [
@@ -192,6 +200,7 @@ class TradingEngine:
 
     async def _shutdown(self) -> None:
         self.trading_enabled = False
+        self.generation += 1
         if self._stop_event:
             self._stop_event.set()
 
@@ -204,34 +213,21 @@ class TradingEngine:
             self._emit_status()
             return
         self.trading_enabled = True
-        log.info("Ciclo de trading INICIADO. Ativos: %s", ", ".join(self.settings.symbols))
+        self.generation += 1
+        log.info("Ciclo de trading INICIADO (geração %d). Ativos: %s", self.generation, ", ".join(self.settings.symbols))
         await self._ensure_connected()
         self._emit_status()
 
     async def stop_trading(self) -> None:
         self.trading_enabled = False
-        log.info("Ciclo de trading PARADO. Posições abertas mantêm os seus Brackets (GTC) na IBKR.")
+        self.generation += 1  # decisões em curso ficam inválidas
+        self.persistence.clear()
+        log.info("Ciclo de trading PARADO (geração %d). Posições abertas mantêm os seus Brackets (GTC) na IBKR.",
+                 self.generation)
         self._emit_status()
 
-    async def set_model(self, model: str) -> None:
-        if model and model != self.brain.model:
-            self.brain.set_model(model)
-            log.info("Modelo Ollama alterado para %s (conta como nova experiência: N=%d)", model, self.db.experiment_count())
-            self._emit_status()
-
-    async def set_symbols(self, symbols: list[str]) -> None:
-        cleaned = sorted({s.strip().upper() for s in symbols if s.strip()})
-        if not cleaned:
-            return
-        self.settings.symbols = cleaned
-        self.settings.save()
-        log.info("Ativos atualizados: %s", ", ".join(cleaned))
-        if self.ibkr.connected:
-            for symbol in cleaned:
-                await self.ibkr.subscribe_bars(symbol)
-
     async def set_mode(self, mode: str, confirmed: bool = False) -> bool:
-        """Alterna entre real (7496, predefinido) e paper (7497). Modo real exige confirmação única."""
+        """Alterna entre real (7496, predefinido) e paper (7497): conta, base de dados e estado separados."""
         mode = "live" if mode == "live" else "paper"
         if mode == self.settings.trading_mode and self.ibkr.connected:
             return True
@@ -244,26 +240,59 @@ class TradingEngine:
             return False
         was_trading = self.trading_enabled
         self.trading_enabled = False
-        await self.ibkr.disconnect()
-        self._last_llm.clear()
-        self._persistence.clear()
-        self.settings.trading_mode = mode
-        self.settings.live_confirmed = bool(mode == "live" and confirmed)
-        self.settings.save()
-        self.db.record_experiment("config", f"mode={mode}")
-        if mode == "live":
-            self.settings.live_confirmed = True
+        self.generation += 1
+        assert self._decision_lock is not None
+        async with self._decision_lock:  # espera por qualquer decisão em curso
+            await self.ibkr.disconnect()
+            self._last_llm.clear()
+            self._last_decided_bar.clear()
+            self._pending_close.clear()
+            self._pending_entries.clear()
+            self.persistence.clear()
+            self.settings.trading_mode = mode
+            self.settings.live_confirmed = bool(mode == "live" and (confirmed or self.settings.live_confirmed))
             self.settings.save()
-            log.critical("MODO REAL ATIVADO (porta %d). Ordens com dinheiro real. Camada de risco: %.2f%%/trade, "
-                         "kill-switch %.0f%%/dia, StoplossGuard %d stops.", self.settings.ib_port,
-                         self.settings.risk_per_trade_pct * 100, self.settings.daily_loss_limit_pct * 100,
-                         self.settings.stoploss_guard_count)
+            # Base de dados, pausas, calibração e lições pertencem à conta: recarregar tudo.
+            self.db.switch_path(self.settings.db_path())
+            self.gate.reset()
+            self.calibrator.reload()
+            self.brain._load_addendum()
+            self._load_gate_state()
+            self.db.record_experiment("config", f"mode={mode}")
+        if mode == "live":
+            log.critical("MODO REAL ATIVADO (porta %d, DB %s). Ordens com dinheiro real. Camada de risco: %.2f%%/trade, "
+                         "kill-switch %.0f%%/dia.", self.settings.ib_port, self.db.path,
+                         self.settings.risk_per_trade_pct * 100, self.settings.daily_loss_limit_pct * 100)
         else:
-            log.warning("Modo PAPER ativado (porta %d).", self.settings.ib_port)
+            log.warning("Modo PAPER ativado (porta %d, DB %s).", self.settings.ib_port, self.db.path)
         ok = await self._ensure_connected()
         self.trading_enabled = was_trading and ok
+        self.bus.emit("equity_history", points=self.equity_history())
         self._emit_status()
         return ok
+
+    async def set_model(self, model: str) -> None:
+        if model and model != self.brain.model:
+            self.brain.set_model(model)
+            self.calibrator.set_model_name(model)
+            self._load_gate_state()
+            self.generation += 1
+            self.persistence.clear()
+            log.info("Modelo Ollama alterado para %s (calibração própria: %s; N experiências %d)", model,
+                     "ajustada" if self.calibrator.is_fitted else "heurística", self.db.experiment_count())
+            self._emit_status()
+
+    async def set_symbols(self, symbols: list[str]) -> None:
+        cleaned = sorted({s.strip().upper() for s in symbols if s.strip()})
+        if not cleaned:
+            return
+        self.settings.symbols = cleaned
+        self.settings.save()
+        self.generation += 1
+        log.info("Ativos atualizados: %s", ", ".join(cleaned))
+        if self.ibkr.connected:
+            for symbol in cleaned:
+                await self.ibkr.subscribe_bars(symbol)
 
     def equity_history(self, hours: int = 48) -> list[tuple[str, float]]:
         rows = self.db.equity_series(datetime.now(timezone.utc) - timedelta(hours=hours))
@@ -282,7 +311,7 @@ class TradingEngine:
         report = self.analytics.build_report()
         self._apply_gates(report["gates"])
         md = Analytics.render_markdown(report)
-        path = self.settings.log_path().with_name("relatorio_estatistico.md")
+        path = self.settings.log_path().with_name(f"relatorio_estatistico_{self.settings.trading_mode}.md")
         try:
             path.write_text(md, encoding="utf-8")
             html = self.analytics.try_quantstats_html(str(path.with_suffix(".html")))
@@ -306,6 +335,7 @@ class TradingEngine:
         if models and self.brain.model not in models:
             log.warning("Modelo %s não está instalado no Ollama; a usar %s", self.brain.model, models[0])
             self.brain.set_model(models[0])
+            self.calibrator.set_model_name(models[0])
         self.bus.emit("models", models=models, current=self.brain.model)
         self._emit_status()
 
@@ -322,28 +352,92 @@ class TradingEngine:
         self._emit_status()
         return True
 
+    def _managed_symbols(self) -> set[str]:
+        """Ativos que o bot gere: os configurados e os que têm trades abertos na base de dados."""
+        return set(self.settings.symbols) | {t["symbol"] for t in self.db.open_trades()}
+
     async def _reconcile(self) -> None:
-        """Após (re)ligar: SQLite vs IBKR. Fecha trades órfãos e protege posições sem stop."""
-        positions = {p["symbol"]: p for p in self.ibkr.portfolio_state().get("positions", [])}
+        """Após (re)ligar: importa execuções ocorridas offline, fecha trades órfãos e repõe cobertura."""
+        imported = 0
+        for fill in self.ibkr.recent_fills():
+            before = self.db.fill_by_exec(fill.execution.execId)
+            self._on_fill(None, fill)
+            if before is None and self.db.fill_by_exec(fill.execution.execId) is not None:
+                imported += 1
+        if imported:
+            log.warning("Reconciliação: %d execuções ocorridas sem o bot ligado foram importadas.", imported)
+        positions = {p["symbol"]: p for p in self.ibkr.portfolio_state().get("positions", [])
+                     if p.get("sec_type", "STK") == "STK"}
         for trade in self.db.open_trades():
             if trade["symbol"] not in positions and float(trade["filled_qty"] or 0) > 0:
                 self.db.close_trade_reconciled(trade["id"])
-                log.warning("Reconciliação: trade #%d %s sem posição na IBKR -> fechado como RECONCILED.",
-                            trade["id"], trade["symbol"])
+                log.warning("Reconciliação: trade #%d %s sem posição na IBKR e sem execução conhecida -> fechado como "
+                            "RECONCILED (P&L não determinado; verifica o extrato).", trade["id"], trade["symbol"])
+        managed = self._managed_symbols()
         for symbol, pos in positions.items():
-            if symbol == self.settings.benchmark_symbol or self.ibkr.has_protective_orders(symbol):
+            if symbol not in managed and not self.settings.manage_external_positions:
+                log.warning("Posição externa %s x%g fora dos ativos do bot: não gerida (manage_external_positions=False).",
+                            symbol, pos["qty"])
                 continue
-            bars = self.ibkr.bars_as_list(symbol)
-            price = pos.get("market_price") or pos.get("avg_cost") or 0.0
-            action = "BUY" if pos["qty"] > 0 else "SELL"
-            sizing = self.sizer.size(action=action, price=price, equity=max(price * abs(pos["qty"]), 1.0),
-                                     bars=aggregate_bars(bars, self.settings.decision_bar_minutes), risk_pct=1.0)
-            if sizing and price > 0:
-                await self.ibkr.ensure_protection(symbol, stop_price=sizing.stop_price, tp_price=sizing.tp_price)
+            await self._protect_if_naked(symbol, pos)
+
+    async def _protect_if_naked(self, symbol: str, pos: dict[str, Any]) -> None:
+        if symbol in self._pending_close or self.ibkr.has_protective_orders(symbol):
+            return
+        trade = next((t for t in self.db.open_trades(symbol)), None)
+        price = pos.get("market_price") or pos.get("avg_cost") or 0.0
+        sign = 1 if pos["qty"] > 0 else -1
+        if trade and trade.get("stop_price") and trade.get("tp_price"):
+            stop, tp = float(trade["stop_price"]), float(trade["tp_price"])
+        else:
+            bars = aggregate_bars(self.ibkr.bars_as_list(symbol), self.settings.decision_bar_minutes)
+            sizing = self.sizer.size(action="BUY" if sign > 0 else "SELL", price=price,
+                                     equity=max(price * abs(pos["qty"]), 1.0), bars=bars, risk_pct=1.0) if price > 0 else None
+            if sizing and sizing.qty >= 1:
+                stop, tp = sizing.stop_price, sizing.tp_price
             else:
-                sign = 1 if pos["qty"] > 0 else -1
-                await self.ibkr.ensure_protection(symbol, stop_price=price * (1 - sign * self.settings.stop_loss_pct),
-                                                  tp_price=price * (1 + sign * self.settings.take_profit_pct))
+                stop = price * (1 - sign * self.settings.stop_loss_pct)
+                tp = price * (1 + sign * self.settings.take_profit_pct)
+        result = await self.ibkr.ensure_protection(symbol, stop_price=stop, tp_price=tp)
+        if not result:
+            return
+        # Persistir a proteção reconstruída para que os seus fills fechem o trade certo.
+        if trade is None:
+            group_id = self.db.insert_order_group(symbol=symbol, decision_id=None, role="ENTRY", direction=sign,
+                                                  qty=abs(pos["qty"]), parent_order_id=None,
+                                                  tp_order_id=result["tp_order_id"], sl_order_id=result["sl_order_id"],
+                                                  ref_price=price, tp_price=result["tp_price"], sl_price=result["sl_price"],
+                                                  account=self.ibkr.account, con_id=self.ibkr.con_id(symbol))
+            trade_id = self.db.open_trade(symbol=symbol, decision_id=None, group_id=group_id, direction=sign,
+                                          qty=abs(pos["qty"]), stop_price=result["sl_price"], tp_price=result["tp_price"])
+            self.db.record_entry_fill(trade_id, abs(pos["qty"]), float(pos.get("avg_cost") or price), datetime.now(timezone.utc))
+            log.warning("Posição %s sem registo: trade #%d criado a partir da posição da corretora.", symbol, trade_id)
+        else:
+            self.db.update_group_orders(int(trade["group_id"]), tp_order_id=result["tp_order_id"], sl_order_id=result["sl_order_id"])
+            self.db._execute("UPDATE trades SET stop_price=?, tp_price=? WHERE id=?",
+                             (result["sl_price"], result["tp_price"], trade["id"]))
+
+    async def _supervise(self) -> None:
+        """A cada ciclo: cobertura das posições, entradas pendentes expiradas, fechos pendentes."""
+        now = datetime.now(timezone.utc)
+        for oid, entry in list(self._pending_entries.items()):
+            if (now - entry["ts"]).total_seconds() > self.settings.entry_timeout_seconds:
+                if self.ibkr.cancel_order_id(oid):
+                    log.warning("[%s] Entrada %d não executada em %ds: cancelada.", entry["symbol"], oid,
+                                self.settings.entry_timeout_seconds)
+                else:
+                    self._pending_entries.pop(oid, None)
+        positions = {p["symbol"]: p for p in self.ibkr.portfolio_state().get("positions", [])
+                     if p.get("sec_type", "STK") == "STK"}
+        for symbol in self._managed_symbols():
+            pos = positions.get(symbol)
+            if pos and symbol not in self._pending_close and not self.ibkr.has_protective_orders(symbol):
+                log.critical("[%s] Posição x%g SEM cobertura completa (stops ativos %.0f): a repor proteção.",
+                             symbol, pos["qty"], self.ibkr.protective_coverage(symbol))
+                await self._protect_if_naked(symbol, pos)
+        for symbol, pc in list(self._pending_close.items()):
+            if (now - pc["ts"]).total_seconds() > 600 and self.ibkr.position_qty(symbol) == 0:
+                self._pending_close.pop(symbol, None)
 
     async def _connection_loop(self) -> None:
         backoff = 5
@@ -385,6 +479,7 @@ class TradingEngine:
                     trade = open_trades.get(pos["symbol"])
                     pos["stop"] = trade["stop_price"] if trade else None
                     pos["tp"] = trade["tp_price"] if trade else None
+                    pos["covered"] = self.ibkr.has_protective_orders(pos["symbol"])
                 self.gate.update_day_baseline(state.get("net_liq"), now)
                 day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
                 state["commissions_today"] = round(self.db.commissions_since(day_start), 2)
@@ -404,6 +499,7 @@ class TradingEngine:
             try:
                 if self.ibkr.connected:
                     self.settler.run()
+                    await self._supervise()
                 if self.trading_enabled and self.ibkr.connected:
                     await self._run_cycle()
             except Exception as exc:  # noqa: BLE001
@@ -443,24 +539,29 @@ class TradingEngine:
         now = datetime.now(timezone.utc)
         if self.settings.trade_only_rth and not in_regular_hours(now):
             return
+        loop = asyncio.get_running_loop()
+        # Rede (resultados, VIX, notícias) fora do loop: os gates leem só a cache.
+        await loop.run_in_executor(None, self.events.prefetch, list(self.settings.symbols),
+                                   self.settings.sentiment_window_hours if self.sentiment else 0)
         state = self.ibkr.portfolio_state()
         global_gate = self.gate.check_global(equity=state.get("net_liq"), now=now)
-        state["day_pnl_pct"] = self.gate.day_pnl_pct(state.get("net_liq"))
         if self.gate.halted and self.trading_enabled:
-            # Kill-switch: para o ciclo automaticamente; posições abertas mantêm TP/SL na corretora.
             self.trading_enabled = False
+            self.generation += 1
             log.critical("Ciclo de trading PARADO automaticamente pelo kill-switch diário (%.0f%%). "
                          "Posições abertas mantêm os brackets. Reinicia manualmente amanhã.",
                          self.settings.daily_loss_limit_pct * 100)
             self._emit_status()
             return
+        generation = self.generation
         for symbol in list(self.settings.symbols):
-            if not self.trading_enabled or not self.ibkr.connected:
+            if not self.trading_enabled or not self.ibkr.connected or generation != self.generation:
                 return
             async with self._decision_lock:
-                await self._process_symbol(symbol, state, now, global_gate)
+                await self._process_symbol(symbol, generation)
 
-    async def _process_symbol(self, symbol: str, state: dict[str, Any], now: datetime, global_gate: Any) -> None:
+    async def _process_symbol(self, symbol: str, generation: int) -> None:
+        now = datetime.now(timezone.utc)
         bars = self.ibkr.bars_as_list(symbol)
         if not bars:
             await self.ibkr.subscribe_bars(symbol)
@@ -472,7 +573,8 @@ class TradingEngine:
         last_llm = self._last_llm.get(symbol)
         if last_llm and now - last_llm < timedelta(minutes=self.settings.llm_interval_minutes):
             return
-        ctx = build_decision_context(self.settings, symbol, bars, state.get("net_liq") or 0.0)
+        state = self.ibkr.portfolio_state()
+        ctx = build_decision_context(self.settings, symbol, bars, state.get("net_liq_usd") or 0.0)
         if ctx is None:
             log.debug("%s: histórico insuficiente para indicadores.", symbol)
             return
@@ -480,15 +582,14 @@ class TradingEngine:
             return
         self._last_llm[symbol] = now
         self._last_decided_bar[symbol] = ctx.snapshot.bar_time
+        state["day_pnl_pct"] = self.gate.day_pnl_pct(state.get("net_liq"))
 
-        # Features opcionais (fase 3) e lições relevantes.
         loop = asyncio.get_running_loop()
-        sentiment: Optional[tuple[Optional[float], int]] = None
+        sentiment: tuple[Optional[float], int] = (None, 0)
         if self.sentiment is not None:
-            headlines = [n["title"] for n in await loop.run_in_executor(
-                None, self.events.recent_news, symbol, self.settings.sentiment_window_hours)]
+            headlines = [n["title"] for n in self.events.recent_news(symbol, self.settings.sentiment_window_hours)]
             sentiment = await loop.run_in_executor(None, self.sentiment.score_news, headlines)
-        vol_width, vol_source = await loop.run_in_executor(
+        vol_width, _vol_source = await loop.run_in_executor(
             None, self.volmodel.interval_width_pct, ctx.closes, self.settings.volmodel_horizon_bars)
         lessons = self.lessons.for_prompt(symbol, ctx.snapshot.rsi, ctx.hour_ny, ctx.snapshot.trend_label())
         recent = self.db.recent_decisions(5, symbol)
@@ -497,7 +598,7 @@ class TradingEngine:
         outcome: DecisionOutcome = await loop.run_in_executor(
             None, lambda: self.brain.decide(ctx.snapshot, state, recent, dynamics=ctx.dynamics, lessons=lessons,
                                             sentiment=sentiment, vol_width=vol_width, model=model))
-        if outcome.review and outcome.decision.error == "review":
+        if outcome.review and outcome.decision.error == "review" and generation == self.generation:
             log.error("[%s] REVIEW: %s. A repetir uma vez a temperatura %.1f.", symbol, outcome.decision.razao,
                       self.settings.review_retry_temperature)
             outcome = await loop.run_in_executor(
@@ -508,11 +609,12 @@ class TradingEngine:
 
         decision = outcome.decision
         position_qty = self.ibkr.position_qty(symbol)
-        cost_pct = self._estimated_cost_pct(ctx, state)
+        cost_pct, stop_pct, tp_pct = self._estimated_levels_pct(ctx, state)
         signals = ConfidenceSignals(decision.confianca, outcome.agree_frac, outcome.margin, outcome.action_logprob)
         calibrated = self.calibrator.probability(signals) if decision.acao in ("BUY", "SELL") else None
+        used_model = outcome.models[0] if outcome.models else self.brain.model
         decision_id = self.db.insert_decision(
-            symbol=symbol, model=(outcome.models[0] if outcome.models else self.brain.model), action=decision.acao,
+            symbol=symbol, model=used_model, action=decision.acao,
             confidence=decision.confianca, reason=decision.razao, snapshot=ctx.snapshot.to_dict(),
             position_qty=position_qty, net_liq=state.get("net_liq"), prompt_version=self.brain.prompt_version,
             parse_ok=decision.parse_ok, raw_response=decision.raw,
@@ -520,189 +622,167 @@ class TradingEngine:
                    "action_logprob": outcome.action_logprob, "calibrated_prob": calibrated,
                    "n_samples": len(outcome.samples), "samples_json": outcome.samples, "prompt_hash": outcome.prompt_hash,
                    "dynamics_json": ctx.dynamics.to_dict() if ctx.dynamics else None, "atr": ctx.atr,
-                   "sentiment": sentiment[0] if sentiment else None, "vol_forecast": vol_width,
+                   "sentiment": sentiment[0], "sentiment_n": sentiment[1], "vol_forecast": vol_width,
                    "review": int(outcome.review), "hour_ny": ctx.hour_ny, "regime": ctx.snapshot.trend_label(),
-                   "cost_pct": cost_pct},
+                   "cost_pct": cost_pct, "stop_pct": stop_pct, "tp_pct": tp_pct,
+                   "market_ts": ctx.snapshot.bar_time.isoformat(), "generation": generation,
+                   "account": self.ibkr.account},
         )
         level = logging.ERROR if outcome.review else (logging.INFO if decision.parse_ok else logging.WARNING)
-        log.log(level, "[%s] %s verbal=%.2f acordo=%.0f%% p=%s (%.0fs, %d amostras%s) | RSI=%s ATR=%s%% | %s",
+        log.log(level, "[%s] %s verbal=%.2f acordo=%.0f%% p=%s (%.0fs, %d/%d amostras válidas%s) | RSI=%s ATR=%s%% | %s",
                 symbol, decision.acao, decision.confianca, outcome.agree_frac * 100,
-                f"{calibrated:.2f}" if calibrated is not None else "n/a", outcome.elapsed, len(outcome.samples),
+                f"{calibrated:.2f}" if calibrated is not None else "n/a", outcome.elapsed,
+                sum(1 for x in outcome.samples if x.get("parse_ok")), max(len(outcome.samples), 1),
                 f", logprob {outcome.action_logprob:.2f}" if outcome.action_logprob is not None else "",
                 f"{ctx.snapshot.rsi:.0f}" if ctx.snapshot.rsi is not None else "n/d",
                 f"{ctx.dynamics.atr_pct:.2f}" if ctx.dynamics and ctx.dynamics.atr_pct is not None else "n/d",
                 decision.razao, extra={"category": "ollama"})
         self.bus.emit("decision", decision_id=decision_id, symbol=symbol, decision=decision.to_dict(),
-                      snapshot=ctx.snapshot.to_dict(), agree_frac=outcome.agree_frac, calibrated=calibrated,
-                      model=(outcome.models[0] if outcome.models else self.brain.model))
+                      snapshot=ctx.snapshot.to_dict(), agree_frac=outcome.agree_frac, calibrated=calibrated, model=used_model)
         if outcome.review:
-            self.db.mark_decision(decision_id, executed=False, skip_reason="REVIEW")
-            self.bus.emit("decision_result", decision_id=decision_id, executed=False, reason="REVIEW")
+            self._skip(decision_id, symbol, decision.acao, "REVIEW")
             return
-        await self._execute(outcome, calibrated, ctx, state, decision_id, position_qty, global_gate)
+        await self._execute(outcome, calibrated, ctx, decision_id, generation, sentiment, vol_width)
+
+    def _estimated_levels_pct(self, ctx: DecisionContext, state: dict[str, Any]) -> tuple[Optional[float], Optional[float], Optional[float]]:
+        """Custo ida+volta, stop e TP em % do preço, para a quantidade que o sizer daria agora (settlement)."""
+        equity = state.get("net_liq_usd") or state.get("net_liq")
+        if not equity or ctx.snapshot.price <= 0:
+            return None, None, None
+        sizing = self.sizer.size(action="BUY", price=ctx.snapshot.price, equity=equity, bars=ctx.agg_bars)
+        if sizing is None:
+            return None, None, None
+        qty = sizing.qty if sizing.qty >= 1 else 1
+        cost_pct = round(round_trip_cost(qty, ctx.snapshot.price, self.settings) / (qty * ctx.snapshot.price) * 100.0, 4)
+        stop_pct = round(sizing.stop_distance / ctx.snapshot.price * 100.0, 4)
+        return cost_pct, stop_pct, round(stop_pct * self.settings.reward_risk_ratio, 4)
+
+    def _skip(self, decision_id: int, symbol: str, action: str, reason: str) -> None:
+        self.db.mark_decision(decision_id, executed=False, skip_reason=reason)
+        self.bus.emit("decision_result", decision_id=decision_id, executed=False, reason=reason)
+        if action != "HOLD":
+            log.info("[%s] %s não executado: %s", symbol, action, reason)
 
     # ------------------------------------------------------------ execução
     async def _execute(self, outcome: DecisionOutcome, calibrated: Optional[float], ctx: DecisionContext,
-                       state: dict[str, Any], decision_id: int, position_qty: float, global_gate: Any) -> None:
-        decision = outcome.decision
+                       decision_id: int, generation: int, sentiment: tuple[Optional[float], int],
+                       vol_width: Optional[float]) -> None:
         symbol = ctx.snapshot.symbol
-        action = decision.acao
+        action = outcome.decision.acao
+        # Revalidação imediatamente antes de qualquer ordem: geração, estado, conta, gates e dados frescos.
+        if generation != self.generation or not self.trading_enabled:
+            return self._skip(decision_id, symbol, action, "decisão invalidada (paragem/mudança de conta)")
+        if not self.ibkr.connected:
+            return self._skip(decision_id, symbol, action, "sem ligação à corretora")
         now = datetime.now(timezone.utc)
+        state = self.ibkr.portfolio_state()
+        global_gate = self.gate.check_global(equity=state.get("net_liq"), now=now)
+        if self.gate.halted:
+            return self._skip(decision_id, symbol, action, "kill-switch diário")
+        position_qty = self.ibkr.position_qty(symbol)
+        persistence = self.persistence.push(symbol, action)
+        reserved = sum(e["notional"] for e in self._pending_entries.values())
+        plan = decide_execution(
+            settings=self.settings, gate=self.gate, sizer=self.sizer, calibrator=self.calibrator, outcome=outcome,
+            calibrated=calibrated, snapshot=ctx.snapshot, agg_bars=ctx.agg_bars, now=now, position_qty=position_qty,
+            open_positions=len(state.get("positions", [])), pending_entries=len(self._pending_entries),
+            equity_usd=state.get("net_liq_usd"), available_funds_usd=state.get("available_funds_usd"),
+            reserved_notional=reserved, persistence=persistence, pending_close=symbol in self._pending_close,
+            pending_entry=any(e["symbol"] == symbol for e in self._pending_entries.values()) or self.ibkr.has_pending_entry(symbol),
+            global_gate=global_gate, sentiment=sentiment, vol_width=vol_width, risk_multiplier=self.risk_multiplier,
+            gates_passed=self.gates_passed)
+        if isinstance(plan, Skip):
+            return self._skip(decision_id, symbol, action, plan.reason)
+        if plan.kind == "CLOSE":
+            return await self._execute_close(plan, ctx, decision_id, position_qty)
+        await self._execute_entry(plan, ctx, decision_id, generation)
 
-        def skip(reason: str) -> None:
-            self.db.mark_decision(decision_id, executed=False, skip_reason=reason)
-            self.bus.emit("decision_result", decision_id=decision_id, executed=False, reason=reason)
-            if action != "HOLD":
-                log.info("[%s] %s não executado: %s", symbol, action, reason)
-
-        # Persistência do sinal entre ciclos LLM.
-        hist = self._persistence.setdefault(symbol, [])
-        hist.append(action)
-        del hist[:-max(1, self.settings.signal_persistence_cycles)]
-
-        if action == "HOLD":
-            return skip("HOLD")
-        if not decision.parse_ok:
-            return skip("resposta inválida")
-        if outcome.agree_frac < self.settings.llm_min_agreement:
-            return skip(f"acordo {outcome.agree_frac:.0%} < {self.settings.llm_min_agreement:.0%}")
-        if len(hist) < self.settings.signal_persistence_cycles or any(a != action for a in hist):
-            return skip(f"sinal ainda não persistente ({'/'.join(hist)})")
-        if symbol in self._pending_close:
-            return skip("fecho de posição ainda pendente")
-
-        # Ação alinhada com posição existente -> nada (sem pirâmide).
-        if (action == "BUY" and position_qty > 0) or (action == "SELL" and position_qty < 0):
-            return skip("já posicionado nessa direção")
-
-        # Ação oposta -> fecha (os filhos são cancelados), não inverte no mesmo ciclo.
-        if (action == "BUY" and position_qty < 0) or (action == "SELL" and position_qty > 0):
-            result = await self.ibkr.close_position(symbol)
-            if result:
-                group_id = self.db.insert_order_group(
-                    symbol=symbol, decision_id=decision_id, role="CLOSE", direction=result["direction"],
-                    qty=result["qty"], parent_order_id=result["order_id"], tp_order_id=None, sl_order_id=None,
-                    ref_price=ctx.snapshot.price, tp_price=None, sl_price=None)
-                self._pending_close[symbol] = group_id
-                self.db.mark_decision(decision_id, executed=True)
-                self.bus.emit("decision_result", decision_id=decision_id, executed=True, reason="fecho de posição")
-                log.warning("[%s] Sinal %s contra posição existente: posição FECHADA (ordem %d).",
-                            symbol, action, result["order_id"])
-            else:
-                skip("falha ao fechar posição")
-            return
-
-        # ---- Camada de risco: o código decide. ----
-        if not global_gate.allowed:
-            return skip(global_gate.reason)
-        sym_gate = self.gate.check_symbol(symbol=symbol, now=now)
-        if not sym_gate.allowed:
-            return skip(sym_gate.reason)
-        if action == "SELL" and not self.settings.allow_short:
-            return skip("short desativado na configuração")
-        if self.ibkr.has_pending_entry(symbol):
-            return skip("ordem de entrada ainda pendente")
-        if len(state.get("positions", [])) >= self.settings.max_open_positions:
-            return skip(f"máximo de posições ({self.settings.max_open_positions}) atingido")
-        sentiment_gate = self.gate.check_sentiment_veto(action, *(self._last_sentiment(decision_id)))
-        if not sentiment_gate.allowed:
-            return skip(sentiment_gate.reason)
-        vol_gate = self.gate.check_vol_forecast(self._last_vol(decision_id))
-        if not vol_gate.allowed:
-            return skip(vol_gate.reason)
-
-        equity = state.get("net_liq")
-        if not equity or ctx.snapshot.price <= 0:
-            return skip("NetLiq desconhecido")
-        risk_pct = self.settings.risk_per_trade_pct_validated if self.gates_passed else self.settings.risk_per_trade_pct
-        multiplier = global_gate.size_multiplier * sym_gate.size_multiplier
-        sizing = self.sizer.size(action=action, price=ctx.snapshot.price, equity=equity, bars=ctx.agg_bars,
-                                 risk_pct=risk_pct, multiplier=multiplier,
-                                 available_funds=state.get("available_funds"))
-        if sizing is None:
-            return skip("ATR indisponível para dimensionar")
-        if sizing.qty < 1:
-            return skip("quantidade < 1 ação com o risco configurado")
-        # Limiar de probabilidade: break-even do bracket COM custos + margem (ou piso enquanto não calibrado).
-        cost = round_trip_cost(sizing.qty, ctx.snapshot.price, self.settings)
-        rr = abs(sizing.tp_price - ctx.snapshot.price) / max(sizing.stop_distance, 1e-9)
-        threshold = execution_threshold(self.settings, reward_risk_ratio=rr, cost=cost, risk_amount=sizing.risk_amount,
-                                        calibrated=self.calibrator.is_fitted)
-        self.db.update_decision(decision_id, threshold_used=threshold)
-        prob = calibrated if calibrated is not None else 0.0
-        if prob < threshold:
-            return skip(f"p={prob:.2f} < limiar {threshold:.2f} (break-even R:R {rr:.1f} com custo {cost:.2f} USD)")
-        cost_gate = self.gate.check_costs(qty=sizing.qty, price=ctx.snapshot.price,
-                                          tp_distance=abs(sizing.tp_price - ctx.snapshot.price),
-                                          stop_distance=sizing.stop_distance, probability=prob)
-        if not cost_gate.allowed:
-            return skip(cost_gate.reason)
-
-        result = await self.ibkr.place_bracket(symbol, action, sizing.qty, ctx.snapshot.price,
-                                               stop_price=sizing.stop_price, tp_price=sizing.tp_price,
-                                               trailing=self.settings.use_trailing_stop)
+    async def _execute_close(self, plan: ExecutionPlan, ctx: DecisionContext, decision_id: int, position_qty: float) -> None:
+        symbol = plan.symbol
+        result = await self.ibkr.close_position(symbol)
         if not result:
-            return skip("falha ao colocar Bracket")
-        direction = 1 if action == "BUY" else -1
+            return self._skip(decision_id, symbol, plan.action, "falha ao fechar posição")
+        if result.get("closed_by_children") or result.get("aborted"):
+            reason = "posição já fechada pelo stop/TP" if result.get("closed_by_children") else "fecho abortado"
+            self._skip(decision_id, symbol, plan.action, reason)
+            if result.get("needs_protection"):
+                positions = {p["symbol"]: p for p in self.ibkr.portfolio_state().get("positions", [])}
+                if symbol in positions:
+                    await self._protect_if_naked(symbol, positions[symbol])
+            return
+        group_id = self.db.insert_order_group(
+            symbol=symbol, decision_id=decision_id, role="CLOSE", direction=result["direction"], qty=result["qty"],
+            parent_order_id=result["order_id"], tp_order_id=None, sl_order_id=None, ref_price=ctx.snapshot.price,
+            tp_price=None, sl_price=None, account=self.ibkr.account, con_id=self.ibkr.con_id(symbol))
+        self._pending_close[symbol] = {"order_id": result["order_id"], "group_id": group_id, "qty": float(result["qty"]),
+                                       "filled": 0.0, "ts": datetime.now(timezone.utc)}
+        self.persistence.reset(symbol)
+        self.db.mark_decision(decision_id, executed=True)
+        self.bus.emit("decision_result", decision_id=decision_id, executed=True, reason="fecho de posição")
+        log.warning("[%s] Sinal %s contra posição existente: posição a FECHAR (ordem %d, x%g).",
+                    symbol, plan.action, result["order_id"], result["qty"])
+
+    async def _execute_entry(self, plan: ExecutionPlan, ctx: DecisionContext, decision_id: int, generation: int) -> None:
+        symbol, sizing = plan.symbol, plan.sizing
+        assert sizing is not None
+        if generation != self.generation or not self.trading_enabled:
+            return self._skip(decision_id, symbol, plan.action, "decisão invalidada antes da ordem")
+        self.db.update_decision(decision_id, threshold_used=plan.threshold)
+        result = await self.ibkr.place_bracket(symbol, plan.action, sizing.qty, ctx.snapshot.price,
+                                               stop_price=sizing.stop_price, tp_price=sizing.tp_price,
+                                               trailing=self.settings.use_trailing_stop, limit_price=plan.limit_price)
+        if not result:
+            return self._skip(decision_id, symbol, plan.action, "falha ao colocar Bracket")
+        direction = 1 if plan.action == "BUY" else -1
         group_id = self.db.insert_order_group(
             symbol=symbol, decision_id=decision_id, role="ENTRY", direction=direction, qty=sizing.qty,
             parent_order_id=result["parent_order_id"], tp_order_id=result["tp_order_id"],
             sl_order_id=result["sl_order_id"], ref_price=ctx.snapshot.price,
-            tp_price=result["tp_price"], sl_price=result["sl_price"])
-        self.db.open_trade(symbol=symbol, decision_id=decision_id, group_id=group_id, direction=direction,
-                           qty=sizing.qty, stop_price=sizing.stop_price, tp_price=sizing.tp_price,
-                           risk_amount=sizing.risk_amount)
+            tp_price=result["tp_price"], sl_price=result["sl_price"], account=self.ibkr.account,
+            con_id=self.ibkr.con_id(symbol))
+        trade_id = self.db.open_trade(symbol=symbol, decision_id=decision_id, group_id=group_id, direction=direction,
+                                      qty=sizing.qty, stop_price=sizing.stop_price, tp_price=sizing.tp_price,
+                                      risk_amount=sizing.risk_amount)
+        self._pending_entries[result["parent_order_id"]] = {
+            "symbol": symbol, "qty": float(sizing.qty), "notional": sizing.qty * ctx.snapshot.price,
+            "ts": datetime.now(timezone.utc), "trade_id": trade_id, "filled": 0.0}
         self.db.mark_decision(decision_id, executed=True)
+        net_gain = sizing.qty * abs(sizing.tp_price - ctx.snapshot.price) - plan.cost
         self.bus.emit("decision_result", decision_id=decision_id, executed=True,
-                      reason=f"{action} x{sizing.qty} SL {sizing.stop_price:.2f} TP {sizing.tp_price:.2f} · "
-                             f"custo {cost:.2f} USD · ganho líquido no TP {sizing.qty * abs(sizing.tp_price - ctx.snapshot.price) - cost:.2f} USD")
-        self._persistence[symbol] = []
-        log.warning("[%s] EXECUTADO %s x%d @~%.2f | SL %.2f | TP %.2f | risco %.0f USD (%.2f%% ×%.2f, ATR %.2f) | "
+                      reason=f"{plan.action} x{sizing.qty} SL {sizing.stop_price:.2f} TP {sizing.tp_price:.2f} · "
+                             f"custo {plan.cost:.2f} USD · ganho líquido no TP {net_gain:.2f} USD")
+        self.persistence.reset(symbol)
+        log.warning("[%s] EXECUTADO %s x%d @~%.2f (limit %s) | SL %.2f | TP %.2f | risco %.0f USD (ATR %.2f) | "
                     "p=%.2f ≥ %.2f | %s",
-                    symbol, action, sizing.qty, ctx.snapshot.price, sizing.stop_price, sizing.tp_price,
-                    sizing.risk_amount, risk_pct * 100, multiplier, sizing.atr_used, prob, threshold,
-                    "; ".join(sizing.notes + cost_gate.notes + global_gate.notes), extra={"category": "ordem"})
-
-    def _estimated_cost_pct(self, ctx: DecisionContext, state: dict[str, Any]) -> Optional[float]:
-        """Custo ida+volta em % do notional para a quantidade que o sizer daria agora."""
-        equity = state.get("net_liq")
-        if not equity or ctx.snapshot.price <= 0:
-            return None
-        sizing = self.sizer.size(action="BUY", price=ctx.snapshot.price, equity=equity, bars=ctx.agg_bars)
-        qty = sizing.qty if sizing and sizing.qty >= 1 else 1
-        return round(round_trip_cost(qty, ctx.snapshot.price, self.settings) / (qty * ctx.snapshot.price) * 100.0, 4)
-
-    def _last_sentiment(self, decision_id: int) -> tuple[Optional[float], int]:
-        row = self.db._query("SELECT sentiment FROM decisions WHERE id=?", (decision_id,))
-        value = row[0]["sentiment"] if row else None
-        return (value, self.settings.sentiment_veto_min_news if value is not None else 0)
-
-    def _last_vol(self, decision_id: int) -> Optional[float]:
-        row = self.db._query("SELECT vol_forecast FROM decisions WHERE id=?", (decision_id,))
-        return row[0]["vol_forecast"] if row else None
+                    symbol, plan.action, sizing.qty, ctx.snapshot.price,
+                    f"{plan.limit_price:.2f}" if plan.limit_price else "mercado", sizing.stop_price, sizing.tp_price,
+                    sizing.risk_amount, sizing.atr_used, plan.probability, plan.threshold, "; ".join(plan.notes),
+                    extra={"category": "ordem"})
 
     # --------------------------------------------------------------- gates
     def _apply_gates(self, gates: Optional[dict[str, Any]]) -> None:
         if not gates:
             return
         self.gates_passed = bool(gates.get("all_passed"))
-        self.risk_multiplier = float(gates.get("risk_multiplier", 0.5))
-        self.db.set_kv("gates_passed", "1" if self.gates_passed else "0")
+        self.risk_multiplier = 1.0 if self.gates_passed else self.settings.learning_risk_multiplier
+        self.db.set_kv(f"gates_passed:{self.brain.model}", "1" if self.gates_passed else "0")
         if not self.gates_passed:
             failed = [k for k, v in gates.get("checks", {}).items() if not v]
-            log.warning("Gates estatísticos NÃO passam (%s). Risco por trade mantém-se em %.2f%%.",
-                        ", ".join(failed), self.settings.risk_per_trade_pct * 100)
+            log.warning("Gates estatísticos NÃO passam (%s). Risco por trade %.2f%% × %.2f.",
+                        ", ".join(failed), self.settings.risk_per_trade_pct * 100, self.risk_multiplier)
         else:
-            log.warning("Gates estatísticos PASSAM. Risco por trade pode subir para %.2f%%.",
-                        self.settings.risk_per_trade_pct_validated * 100)
+            log.warning("Gates estatísticos PASSAM. Risco por trade %.2f%%.", self.settings.risk_per_trade_pct_validated * 100)
 
     def _load_gate_state(self) -> None:
-        self.gates_passed = self.db.get_kv("gates_passed") == "1"
-        self.risk_multiplier = 1.0 if self.gates_passed else 0.5
+        self.gates_passed = self.db.get_kv(f"gates_passed:{self.brain.model}") == "1"
+        self.risk_multiplier = 1.0 if self.gates_passed else self.settings.learning_risk_multiplier
 
     # ------------------------------------------------------------ callbacks
     def _price_at(self, symbol: str, when: datetime) -> Optional[float]:
         return self.ibkr.price_at(symbol, when)
+
+    def _bars_between(self, symbol: str, start: datetime, end: datetime) -> list[Bar]:
+        return self.ibkr.bars_between(symbol, start, end)
 
     def _on_bar(self, symbol: str, bars: Any, has_new_bar: bool) -> None:
         if has_new_bar and bars:
@@ -711,17 +791,48 @@ class TradingEngine:
                           close=float(last.close), volume=float(last.volume))
 
     def _on_disconnect(self) -> None:
+        self.generation += 1
         self._emit_status()
 
     def _on_order_status(self, trade: Any) -> None:
         status = trade.orderStatus.status
+        order_id = trade.order.orderId
+        symbol = trade.contract.symbol
         if status in ("Cancelled", "Inactive", "ApiCancelled"):
-            log.info("Ordem %d (%s %s) -> %s", trade.order.orderId, trade.order.action,
-                     trade.contract.symbol, status, extra={"category": "ordem"})
+            log.info("Ordem %d (%s %s) -> %s", order_id, trade.order.action, symbol, status, extra={"category": "ordem"})
+            # Fecho pendente cancelado/rejeitado: libertar o bloqueio e repor cobertura.
+            pc = self._pending_close.get(symbol)
+            if pc and pc["order_id"] == order_id:
+                self._pending_close.pop(symbol, None)
+                log.error("[%s] Ordem de fecho %d terminou em %s sem executar: posição mantém-se; cobertura será reposta.",
+                          symbol, order_id, status)
+                if self.loop:
+                    self.loop.create_task(self._reprotect(symbol))
+            # Entrada pendente cancelada: libertar reserva e marcar o trade como cancelado.
+            entry = self._pending_entries.pop(order_id, None)
+            if entry and entry["filled"] <= 0:
+                self.db._execute("UPDATE trades SET status='CANCELLED', exit_reason='CANCELLED' WHERE id=? AND filled_qty=0",
+                                 (entry["trade_id"],))
+            # Filho de proteção cancelado/rejeitado com posição aberta: verificar cobertura.
+            group = self.db.group_for_order(order_id)
+            if group and group["role"] == "ENTRY" and order_id in (group["tp_order_id"], group["sl_order_id"]) \
+                    and symbol not in self._pending_close and self.loop:
+                self.loop.create_task(self._reprotect(symbol))
+
+    async def _reprotect(self, symbol: str) -> None:
+        await asyncio.sleep(1.0)  # dá tempo ao OCA irmão/fill de chegar
+        positions = {p["symbol"]: p for p in self.ibkr.portfolio_state().get("positions", [])}
+        if symbol in positions and not self.ibkr.has_protective_orders(symbol):
+            log.critical("[%s] Proteção perdida (filho cancelado/rejeitado): a repor.", symbol)
+            await self._protect_if_naked(symbol, positions[symbol])
 
     def _on_fill(self, trade: Any, fill: Any) -> None:
         execution = fill.execution
         symbol = fill.contract.symbol
+        if getattr(fill.contract, "secType", "STK") != "STK":
+            return
+        if self.ibkr.account and getattr(execution, "acctNumber", "") and execution.acctNumber != self.ibkr.account:
+            return
         ts = execution.time if isinstance(execution.time, datetime) else datetime.now(timezone.utc)
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
@@ -740,6 +851,8 @@ class TradingEngine:
                  extra={"category": "ordem"})
         group = self.db.group_for_order(execution.orderId)
         if not group:
+            log.warning("Execução %s (ordem %d) sem grupo conhecido: ordem externa ou de outra sessão; só registada.",
+                        symbol, execution.orderId)
             return
         if group["role"] == "ENTRY":
             trade_row = self.db.trade_for_group(group["id"])
@@ -750,10 +863,17 @@ class TradingEngine:
                 trade_id = trade_row["id"]
             if execution.orderId == group["parent_order_id"]:
                 self.db.record_entry_fill(trade_id, float(execution.shares), float(execution.price), ts, commission_value)
+                self.db.allocate_fill(execution.execId, trade_id, float(execution.shares), commission_value)
+                entry = self._pending_entries.get(execution.orderId)
+                if entry:
+                    entry["filled"] += float(execution.shares)
+                    if entry["filled"] + 1e-9 >= entry["qty"]:
+                        self._pending_entries.pop(execution.orderId, None)
             else:
                 reason = "TP" if execution.orderId == group["tp_order_id"] else "SL"
                 updated = self.db.record_exit_fill(trade_id, float(execution.shares), float(execution.price), ts, reason,
                                                    commission_value)
+                self.db.allocate_fill(execution.execId, trade_id, float(execution.shares), commission_value)
                 self._announce_close(updated, reason)
         elif group["role"] == "CLOSE":
             remaining = float(execution.shares)
@@ -765,12 +885,17 @@ class TradingEngine:
                     continue
                 share = commission_value * portion / max(float(execution.shares), 1e-9)
                 updated = self.db.record_exit_fill(row["id"], portion, float(execution.price), ts, "SIGNAL", share)
+                self.db.allocate_fill(execution.execId, row["id"], portion, share)
                 remaining -= portion
                 self._announce_close(updated, "SIGNAL")
-            self._pending_close.pop(symbol, None)
+            pc = self._pending_close.get(symbol)
+            if pc and pc["order_id"] == execution.orderId:
+                pc["filled"] += float(execution.shares)
+                if pc["filled"] + 1e-9 >= pc["qty"]:
+                    self._pending_close.pop(symbol, None)
 
     def _on_commission(self, trade: Any, fill: Any, report: Any) -> None:
-        """CommissionReport real da IBKR: substitui a estimativa e corrige o P&L líquido do trade."""
+        """CommissionReport real da IBKR: substitui a estimativa e corrige exatamente os trades que a execução tocou."""
         commission_value = getattr(report, "commission", None)
         exec_id = getattr(getattr(fill, "execution", None), "execId", None)
         if commission_value is None or not exec_id:
@@ -778,19 +903,14 @@ class TradingEngine:
         delta = self.db.set_fill_commission(exec_id, float(commission_value))
         if delta is None or abs(delta) < 1e-9:
             return
-        group = self.db.group_for_order(fill.execution.orderId)
-        if not group:
+        allocations = self.db.allocations_for_fill(exec_id)
+        if not allocations:
             return
-        if group["role"] == "ENTRY":
-            trade_row = self.db.trade_for_group(group["id"])
-            if trade_row:
-                self.db.apply_commission_delta(trade_row["id"], delta)
-        else:
-            rows = self.db._query("SELECT id FROM trades WHERE symbol=? ORDER BY id DESC LIMIT 1", (fill.contract.symbol,))
-            if rows:
-                self.db.apply_commission_delta(rows[0]["id"], delta)
-        log.info("Comissão real %s: %.2f USD (ajuste %+.2f)", fill.contract.symbol, float(commission_value), delta,
-                 extra={"category": "ordem"})
+        total = sum(float(a["shares"]) for a in allocations) or 1.0
+        for a in allocations:
+            self.db.apply_commission_delta(int(a["trade_id"]), delta * float(a["shares"]) / total)
+        log.info("Comissão real %s: %.2f USD (ajuste %+.2f em %d trade(s))", fill.contract.symbol, float(commission_value),
+                 delta, len(allocations), extra={"category": "ordem"})
 
     def _announce_close(self, trade_row: dict[str, Any], reason: str) -> None:
         if trade_row["status"] == "CLOSED":
@@ -801,8 +921,7 @@ class TradingEngine:
                     "Trade #%d %s fechado por %s: P&L líquido %+.2f USD (bruto %+.2f, comissões %.2f)",
                     trade_row["id"], trade_row["symbol"], reason, pnl, gross, comm, extra={"category": "ordem"})
             if gross > 0 >= pnl:
-                log.warning("Trade #%d: lucro bruto comido pelas comissões (%.2f de %.2f). O gate de custos deve "
-                            "ter recusado isto; verifica min_net_gain_multiple.", trade_row["id"], comm, gross)
+                log.warning("Trade #%d: lucro bruto comido pelas comissões (%.2f de %.2f).", trade_row["id"], comm, gross)
             self.bus.emit("trade_closed", trade=trade_row)
 
     # ------------------------------------------------------------- helpers
@@ -825,15 +944,19 @@ class TradingEngine:
             calibrated=self.calibrator.is_fitted,
             calibration_n=self.calibrator.model.n_samples if self.calibrator.model else self.db.count_settled(),
             gates_passed=self.gates_passed,
-            risk_pct=(self.settings.risk_per_trade_pct_validated if self.gates_passed else self.settings.risk_per_trade_pct),
+            risk_pct=(self.settings.risk_per_trade_pct_validated if self.gates_passed
+                      else self.settings.risk_per_trade_pct * self.risk_multiplier),
             llm_interval=self.settings.llm_interval_minutes,
             llm_samples=self.settings.llm_samples,
             n_trials=self.db.experiment_count(),
             mode=self.settings.trading_mode,
             port=self.settings.ib_port,
-            accounts=list(getattr(self.ibkr, "accounts", [])),
+            accounts=[self.ibkr.account] if self.ibkr.account else list(getattr(self.ibkr, "accounts", [])),
+            currency=self.ibkr.base_currency or "USD",
             lesson_texts=[l["text"] for l in self.db.active_lessons()[:5]],
             gates_detail=(self.db.latest_report("weekly") or {}).get("gates"),
+            pending_entries=len(self._pending_entries),
+            pending_closes=list(self._pending_close.keys()),
             risk_summary={"stop_mode": self.settings.stop_mode, "atr_mult": self.settings.atr_stop_multiple,
                           "rr": self.settings.reward_risk_ratio, "daily_loss": self.settings.daily_loss_limit_pct,
                           "max_positions": self.settings.max_open_positions,

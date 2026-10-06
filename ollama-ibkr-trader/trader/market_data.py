@@ -23,12 +23,28 @@ class EventData:
         self.finnhub_key = finnhub_key
         self.source = source
 
+    def prefetch(self, symbols: list[str], news_hours: int = 0) -> None:
+        """Aquece a cache (resultados, VIX, notícias). Correr num executor, nunca no loop."""
+        for symbol in symbols:
+            try:
+                self.next_earnings_date(symbol)
+                if news_hours:
+                    self.recent_news(symbol, news_hours)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("prefetch %s: %s", symbol, exc)
+        try:
+            self.vix()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("prefetch vix: %s", exc)
+
     # ------------------------------------------------------------ earnings
-    def next_earnings_date(self, symbol: str) -> Optional[date]:
+    def next_earnings_date(self, symbol: str, cached_only: bool = False) -> Optional[date]:
         """Próxima data de resultados (ou a mais recente, se já passou há pouco)."""
         cached = self.db.event_cache_get(f"earnings:{symbol}", max_age_hours=12)
         if cached is not None:
             return date.fromisoformat(cached) if cached else None
+        if cached_only:
+            return None
         value = self._fetch_earnings(symbol)
         self.db.event_cache_put(f"earnings:{symbol}", value.isoformat() if value else "")
         return value
@@ -86,19 +102,21 @@ class EventData:
             return None
 
     def in_earnings_blackout(self, symbol: str, days_before: int, days_after: int,
-                             today: Optional[date] = None) -> Optional[bool]:
-        """True/False, ou None quando não há dados."""
-        nxt = self.next_earnings_date(symbol)
+                             today: Optional[date] = None, cached_only: bool = True) -> Optional[bool]:
+        """True/False, ou None quando não há dados. Por defeito só lê a cache (sem rede no loop)."""
+        nxt = self.next_earnings_date(symbol, cached_only=cached_only)
         if nxt is None:
             return None
         today = today or datetime.now(timezone.utc).date()
         return nxt - timedelta(days=days_before) <= today <= nxt + timedelta(days=days_after)
 
     # ----------------------------------------------------------------- VIX
-    def vix(self) -> Optional[float]:
+    def vix(self, cached_only: bool = False) -> Optional[float]:
         cached = self.db.event_cache_get("vix", max_age_hours=0.25)
         if cached is not None:
             return float(cached) if cached else None
+        if cached_only:
+            return None
         value = self._fetch_vix()
         self.db.event_cache_put("vix", value if value is not None else "")
         return value

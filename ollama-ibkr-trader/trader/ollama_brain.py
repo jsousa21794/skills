@@ -25,6 +25,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import re
 import time
 from collections import Counter
@@ -229,34 +230,44 @@ def _first_key(obj: dict[str, Any], keys: tuple[str, ...]) -> Any:
     return None
 
 
+_NEGATIONS = ("NOT", "NO", "DONT", "DON'T", "NEVER", "NÃO", "NAO", "NUNCA", "SEM", "AVOID", "EVITAR", "EVITA")
+
+
 def normalize_action(value: Any) -> Optional[str]:
-    if value is None:
+    """Só aceita a ação exata (após limpar aspas/pontuação). "DO NOT BUY" não é BUY."""
+    if value is None or isinstance(value, bool):
         return None
     token = str(value).strip().strip('"\'').upper()
-    token = re.sub(r"[^A-ZÀ-Ü]", "", token)
-    if token in _ACTION_ALIASES:
-        return _ACTION_ALIASES[token]
-    for alias, action in _ACTION_ALIASES.items():
-        if alias in token:
-            return action
+    token = re.sub(r"[^A-ZÀ-Ü' ]+", " ", token).strip()
+    words = [w for w in token.split() if w]
+    if not words:
+        return None
+    if len(words) == 1:
+        return _ACTION_ALIASES.get(words[0])
+    # Formas de duas palavras sem negação, ex.: "BUY NOW"? Não: exigimos exatidão, exceto artigos triviais.
+    if any(w in _NEGATIONS for w in words):
+        return None
+    if len(words) == 2 and words[0] in _ACTION_ALIASES and words[1] in ("NOW", "AGORA"):
+        return _ACTION_ALIASES[words[0]]
     return None
 
 
-def normalize_confidence(value: Any) -> float:
-    if value is None:
-        return 0.0
-    if isinstance(value, bool):
-        return 0.0
+def normalize_confidence(value: Any) -> Optional[float]:
+    """Confiança em [0,1]; None quando ausente, não numérica ou não finita (NaN/Inf)."""
+    if value is None or isinstance(value, bool):
+        return None
     if isinstance(value, (int, float)):
         conf = float(value)
     else:
         text = str(value).strip().replace(",", ".")
         match = re.search(r"-?\d+(?:\.\d+)?", text)
         if not match:
-            return 0.0
+            return None
         conf = float(match.group(0))
         if "%" in text:
             conf /= 100.0
+    if not math.isfinite(conf):
+        return None
     if conf > 1.0:
         conf = conf / 100.0 if conf <= 100.0 else 1.0
     return max(0.0, min(1.0, conf))
@@ -290,18 +301,26 @@ def parse_decision(raw: str) -> Decision:
                 f"Ação inválida na resposta: {_first_key(obj, _ACTION_KEYS)!r}",
                 raw=raw, error="invalid_action",
             )
+        if confidence is None:
+            if _first_key(obj, _CONF_KEYS) is None:
+                confidence = 0.0  # ausente: nunca executa (abaixo de qualquer limiar)
+            else:
+                return Decision.hold(f"Confiança inválida: {_first_key(obj, _CONF_KEYS)!r}", raw=raw,
+                                     error="invalid_confidence")
         return Decision(action, confidence, reason or "(sem razão)", raw=raw, parse_ok=True)
 
     # Último recurso: regex direta sobre texto livre.
     action_match = re.search(
-        r"(?:acao|ação|action|decision)\W{0,5}(BUY|SELL|HOLD|COMPRAR|VENDER|MANTER)",
+        r"(?:acao|ação|action|decision)\W{0,5}(?!(?:NOT|NO|DON'T|NÃO|NAO|NUNCA|NEVER)\b)(BUY|SELL|HOLD|COMPRAR|VENDER|MANTER)\b",
         text, re.IGNORECASE,
     )
     conf_match = re.search(r"(?:confianca|confiança|confidence)\W{0,5}(\d+(?:[.,]\d+)?\s*%?)", text, re.IGNORECASE)
     reason_match = re.search(r"(?:razao|razão|reason)\W{0,5}[\"']?([^\"'\n}]{3,300})", text, re.IGNORECASE)
     if action_match:
         action = normalize_action(action_match.group(1)) or "HOLD"
-        confidence = normalize_confidence(conf_match.group(1)) if conf_match else 0.0
+        confidence = (normalize_confidence(conf_match.group(1)) if conf_match else 0.0)
+        if confidence is None:
+            return Decision.hold("Confiança inválida no texto livre", raw=raw, error="invalid_confidence")
         reason = reason_match.group(1).strip() if reason_match else "(extraído por regex)"
         return Decision(action, confidence, reason, raw=raw, parse_ok=True)
 
@@ -331,6 +350,8 @@ def parse_stage1(text: str) -> Optional[Decision]:
     if action is None:
         return None
     conf = normalize_confidence(match.group(2))
+    if conf is None:
+        return None
     reason = (match.group(3) or "").strip().splitlines()[0].strip() if match.group(3) else "(ver análise)"
     return Decision(action, conf, reason[:300], raw=text, parse_ok=True)
 
@@ -561,11 +582,11 @@ class OllamaBrain:
 
         samples: list[dict[str, Any]] = []
         per_model_majority: dict[str, str] = {}
-        logprob: Optional[float] = None
         errors: list[str] = []
+        n = max(1, s.llm_samples)
+        n_requested = n * len(models)
         for m in models:
             model_samples: list[dict[str, Any]] = []
-            n = max(1, s.llm_samples)
             for k in range(n):
                 temp = temperature_override if temperature_override is not None else (
                     s.llm_sample_temperature if n > 1 else s.ollama_temperature)
@@ -580,40 +601,40 @@ class OllamaBrain:
                 except ValueError as exc:
                     errors.append(f"{m}: resposta inválida ({exc})")
                     continue
-                if lp is not None and logprob is None:
-                    logprob = lp
                 model_samples.append({"model": m, "acao": dec.acao, "confianca": dec.confianca, "razao": dec.razao,
-                                      "parse_ok": dec.parse_ok})
+                                      "parse_ok": dec.parse_ok, "error": dec.error, "logprob": lp})
             samples.extend(model_samples)
-            valid = [x for x in model_samples if x["parse_ok"]]
-            if valid:
-                per_model_majority[m] = Counter(x["acao"] for x in valid).most_common(1)[0][0]
+            valid_m = [x for x in model_samples if x["parse_ok"]]
+            if valid_m:
+                per_model_majority[m] = Counter(x["acao"] for x in valid_m).most_common(1)[0][0]
+            else:
+                errors.append(f"{m}: sem respostas válidas")
 
         elapsed = time.monotonic() - started
         valid = [x for x in samples if x["parse_ok"]]
-        if not samples or len(valid) < max(1, len(samples) / 2):
-            reason = "; ".join(errors) if errors else f"{len(samples) - len(valid)}/{len(samples)} respostas sem decisão válida"
+        # Quórum sobre o número PEDIDO: timeouts e respostas inválidas contam como indisponibilidade.
+        if len(valid) < max(1, math.ceil(n_requested * s.llm_min_valid_fraction)) or len(per_model_majority) < len(models):
+            reason = "; ".join(errors) if errors else f"{n_requested - len(valid)}/{n_requested} respostas sem decisão válida"
             kind = "connection" if any("ligação" in e for e in errors) else ("timeout" if any("timeout" in e for e in errors) else "review")
-            outcome = DecisionOutcome(Decision.review(reason, error=kind), samples, 0.0, 0.0, logprob, prompt_hash,
-                                      review=True, elapsed=elapsed, models=models)
-            return outcome
+            return DecisionOutcome(Decision.review(reason, error=kind), samples, 0.0, 0.0, None, prompt_hash,
+                                   review=True, elapsed=elapsed, models=models)
 
         votes = Counter(x["acao"] for x in valid)
         ordered = votes.most_common()
         top_action, top_n = ordered[0]
         second_n = ordered[1][1] if len(ordered) > 1 else 0
-        agree = top_n / len(samples)
-        margin = (top_n - second_n) / len(samples)
+        agree = top_n / n_requested
+        margin = (top_n - second_n) / n_requested
         majority = [x for x in valid if x["acao"] == top_action]
         mean_conf = sum(x["confianca"] for x in majority) / len(majority)
         reason = max(majority, key=lambda x: x["confianca"])["razao"]
+        lps = [x["logprob"] for x in majority if x.get("logprob") is not None]
+        logprob = sum(lps) / len(lps) if lps else None  # só logprobs da ação vencedora
 
         if len(per_model_majority) > 1 and len(set(per_model_majority.values())) > 1:
             decision = Decision("HOLD", mean_conf, f"sem acordo entre modelos ({per_model_majority})", parse_ok=True)
         else:
             decision = Decision(top_action, round(mean_conf, 3), reason, parse_ok=True)
-        if logprob is None and s.llm_request_logprobs and top_action in VALID_ACTIONS:
-            logprob = None  # mantido explícito: indisponível nesta versão do Ollama
         outcome = DecisionOutcome(decision, samples, round(agree, 3), round(margin, 3), logprob, prompt_hash,
                                   review=False, elapsed=elapsed, models=models)
         if cache is not None:
@@ -643,8 +664,13 @@ class OllamaBrain:
             dec2 = parse_decision(content)
             if dec2.parse_ok:
                 lp = extract_action_logprob(data2, dec2.acao)
-                if dec is None or dec.acao != dec2.acao:
-                    dec = dec2  # a análise manda; se a linha final faltou, vale o JSON
+                if dec is None:
+                    dec = dec2  # a linha final faltou: vale o JSON da análise
+                elif dec.acao != dec2.acao:
+                    # A formatação nunca pode mudar a decisão da análise: amostra inválida.
+                    dec = Decision.hold(f"Divergência análise={dec.acao} vs JSON={dec2.acao}",
+                                        raw=analysis + "\n" + content, error="stage_mismatch")
+                    lp = None
             elif dec is None:
                 dec = Decision.hold("Análise sem linha de decisão e JSON inválido", raw=analysis + "\n" + content,
                                     error="unparseable")

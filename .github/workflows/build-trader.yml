@@ -45,11 +45,27 @@ jobs:
       - name: Tests
         run: python -m pytest -q
       - run: pyinstaller --clean --noconfirm trader.spec
-      - name: Smoke test (binary imports and starts)
-        if: runner.os != 'Windows'
+      - name: Smoke test (binary starts GUI + engine and exits cleanly)
         shell: bash
+        env:
+          OLLAMA_TRADER_SMOKE: "4"
+          OLLAMA_TRADER_HOME: ${{ runner.temp }}/trader-smoke
         run: |
-          chmod +x ${{ matrix.binary }}
+          mkdir -p "$OLLAMA_TRADER_HOME"
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            sudo apt-get install -y xvfb >/dev/null
+            chmod +x ${{ matrix.binary }}
+            xvfb-run -a -s "-screen 0 1360x860x24" ${{ matrix.binary }}
+          elif [ "${{ runner.os }}" = "macOS" ]; then
+            chmod +x ${{ matrix.binary }}
+            ${{ matrix.binary }}
+          else
+            ./${{ matrix.binary }}
+          fi
+          echo "--- log ---"
+          cat "$OLLAMA_TRADER_HOME/trader.log"
+          grep -q "Motor iniciado" "$OLLAMA_TRADER_HOME/trader.log"
+          grep -q "Motor de trading parado" "$OLLAMA_TRADER_HOME/trader.log"
           ls -la dist/
       - uses: actions/upload-artifact@v4
         with:

@@ -161,6 +161,15 @@ CREATE TABLE IF NOT EXISTS reports (
     kind TEXT NOT NULL,
     report_json TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS fill_allocations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    exec_id TEXT NOT NULL,
+    trade_id INTEGER NOT NULL,
+    shares REAL NOT NULL,
+    commission REAL NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_alloc_exec ON fill_allocations(exec_id);
 """
 
 # Colunas acrescentadas à tabela decisions depois da v1.0 (migração idempotente).
@@ -188,10 +197,17 @@ DECISION_COLUMNS = {
     "hour_ny": "INTEGER",
     "regime": "TEXT",
     "cost_pct": "REAL",
+    "market_ts": "TEXT",
+    "stop_pct": "REAL",
+    "tp_pct": "REAL",
+    "sentiment_n": "INTEGER",
+    "generation": "INTEGER",
+    "account": "TEXT",
 }
 TRADE_COLUMNS = {"decision_action": "TEXT", "stop_price": "REAL", "tp_price": "REAL", "risk_amount": "REAL",
-                 "commission": "REAL NOT NULL DEFAULT 0", "gross_pnl": "REAL NOT NULL DEFAULT 0"}
-FILL_COLUMNS = {"commission": "REAL", "commission_estimated": "INTEGER NOT NULL DEFAULT 1"}
+                 "commission": "REAL NOT NULL DEFAULT 0", "gross_pnl": "REAL NOT NULL DEFAULT 0", "account": "TEXT"}
+FILL_COLUMNS = {"commission": "REAL", "commission_estimated": "INTEGER NOT NULL DEFAULT 1", "account": "TEXT"}
+GROUP_COLUMNS = {"account": "TEXT", "con_id": "INTEGER", "order_ref": "TEXT"}
 
 
 def utc_now() -> datetime:
@@ -207,16 +223,29 @@ def iso(dt: datetime) -> str:
 class Database:
     def __init__(self, path: Path | str = ":memory:") -> None:
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(str(path), check_same_thread=False)
+        self.path = str(path)
+        self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.executescript(SCHEMA)
             self._conn.commit()
         self._migrate()
 
+    def switch_path(self, path: Path | str) -> None:
+        """Fecha a ligação atual e abre outro ficheiro (ex.: paper -> real). Mesmo objeto, outro estado."""
+        with self._lock:
+            self._conn.close()
+            self.path = str(path)
+            self._conn = sqlite3.connect(self.path, check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+            self._conn.executescript(SCHEMA)
+            self._conn.commit()
+        self._migrate()
+
     def _migrate(self) -> None:
         with self._lock:
-            for table, columns in (("decisions", DECISION_COLUMNS), ("trades", TRADE_COLUMNS), ("fills", FILL_COLUMNS)):
+            for table, columns in (("decisions", DECISION_COLUMNS), ("trades", TRADE_COLUMNS), ("fills", FILL_COLUMNS),
+                                   ("order_groups", GROUP_COLUMNS)):
                 existing = {row[1] for row in self._conn.execute(f"PRAGMA table_info({table})")}
                 for name, decl in columns.items():
                     if name not in existing:
@@ -255,6 +284,7 @@ class Database:
         parse_ok: bool,
         raw_response: str,
         extra: Optional[dict[str, Any]] = None,
+        ts: Optional[datetime] = None,
     ) -> int:
         cur = self._execute(
             """INSERT INTO decisions (ts, symbol, model, action, confidence, reason, price, rsi,
@@ -262,7 +292,7 @@ class Database:
                prompt_version, parse_ok, raw_response)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
-                iso(utc_now()), symbol, model, action, confidence, reason,
+                iso(ts or utc_now()), symbol, model, action, confidence, reason,
                 snapshot.get("price"), snapshot.get("rsi"), snapshot.get("sma_fast"),
                 snapshot.get("sma_slow"), snapshot.get("ema"), snapshot.get("change_5m_pct"),
                 snapshot.get("change_30m_pct"), position_qty, net_liq, prompt_version,
@@ -363,8 +393,13 @@ class Database:
                 n += 1
         return n
 
-    def consecutive_losses(self) -> int:
-        rows = self._query("SELECT pnl FROM trades WHERE status='CLOSED' ORDER BY exit_ts DESC LIMIT 50")
+    def consecutive_losses(self, since: Optional[datetime] = None) -> int:
+        """Perdas seguidas mais recentes; ``since`` limita a contagem (ex.: desde a última pausa)."""
+        if since is not None:
+            rows = self._query("SELECT pnl FROM trades WHERE status='CLOSED' AND exit_ts > ? ORDER BY exit_ts DESC LIMIT 50",
+                               (iso(since),))
+        else:
+            rows = self._query("SELECT pnl FROM trades WHERE status='CLOSED' ORDER BY exit_ts DESC LIMIT 50")
         n = 0
         for r in rows:
             if float(r["pnl"]) < 0:
@@ -404,6 +439,10 @@ class Database:
         return self._query(
             "SELECT * FROM protection_events WHERE until IS NOT NULL AND until > ? ORDER BY until DESC", (iso(now),)
         )
+
+    def last_protection_ts(self, name: str) -> Optional[datetime]:
+        rows = self._query("SELECT ts FROM protection_events WHERE name=? ORDER BY id DESC LIMIT 1", (name,))
+        return datetime.fromisoformat(rows[0]["ts"]) if rows else None
 
     # ------------------------------------------------------------- lessons
     def upsert_lesson(self, *, key: str, symbol: Optional[str], text: str, support: int, effect: float,
@@ -509,17 +548,25 @@ class Database:
         ref_price: Optional[float],
         tp_price: Optional[float],
         sl_price: Optional[float],
+        account: Optional[str] = None,
+        con_id: Optional[int] = None,
+        ts: Optional[datetime] = None,
     ) -> int:
         cur = self._execute(
             """INSERT INTO order_groups (ts, symbol, decision_id, role, direction, qty,
-               parent_order_id, tp_order_id, sl_order_id, ref_price, tp_price, sl_price)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+               parent_order_id, tp_order_id, sl_order_id, ref_price, tp_price, sl_price, account, con_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
-                iso(utc_now()), symbol, decision_id, role, direction, qty, parent_order_id,
-                tp_order_id, sl_order_id, ref_price, tp_price, sl_price,
+                iso(ts or utc_now()), symbol, decision_id, role, direction, qty, parent_order_id,
+                tp_order_id, sl_order_id, ref_price, tp_price, sl_price, account, con_id,
             ),
         )
         return int(cur.lastrowid)
+
+    def update_group_orders(self, group_id: int, *, tp_order_id: Optional[int] = None,
+                            sl_order_id: Optional[int] = None) -> None:
+        self._execute("UPDATE order_groups SET tp_order_id=COALESCE(?, tp_order_id), sl_order_id=COALESCE(?, sl_order_id) WHERE id=?",
+                      (tp_order_id, sl_order_id, group_id))
 
     def group_for_order(self, order_id: int) -> Optional[dict[str, Any]]:
         rows = self._query(
@@ -624,16 +671,23 @@ class Database:
         self._execute("UPDATE fills SET commission=?, commission_estimated=0 WHERE exec_id=?", (commission, exec_id))
         return delta
 
+    def allocate_fill(self, exec_id: str, trade_id: int, shares: float, commission: float) -> None:
+        self._execute("INSERT INTO fill_allocations (exec_id, trade_id, shares, commission) VALUES (?,?,?,?)",
+                      (exec_id, trade_id, shares, commission))
+
+    def allocations_for_fill(self, exec_id: str) -> list[dict[str, Any]]:
+        return self._query("SELECT * FROM fill_allocations WHERE exec_id=? ORDER BY id", (exec_id,))
+
     def commissions_since(self, since: datetime) -> float:
         rows = self._query("SELECT COALESCE(SUM(commission), 0) AS c FROM fills WHERE ts >= ?", (iso(since),))
         return float(rows[0]["c"] or 0.0)
 
     # ---------------------------------------------------------------- P&L
     def snapshot_pnl(self, *, net_liq: Optional[float], cash: Optional[float],
-                     unrealized: Optional[float], realized: Optional[float]) -> None:
+                     unrealized: Optional[float], realized: Optional[float], ts: Optional[datetime] = None) -> None:
         self._execute(
             "INSERT INTO pnl_snapshots (ts, net_liq, cash, unrealized, realized) VALUES (?,?,?,?,?)",
-            (iso(utc_now()), net_liq, cash, unrealized, realized),
+            (iso(ts or utc_now()), net_liq, cash, unrealized, realized),
         )
 
     def first_net_liq_on(self, day_utc: datetime) -> Optional[float]:

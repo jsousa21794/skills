@@ -94,7 +94,9 @@ class PositionSizer:
         # jesse.utils.risk_to_qty: qty = risco / distância ao stop
         qty = math.floor(risk_amount / stop_distance)
         max_notional = equity * self.s.max_position_notional_pct
-        if available_funds is not None and available_funds >= 0:
+        if available_funds is not None:
+            if not math.isfinite(available_funds) or available_funds <= 0:
+                return SizingResult(0, 0.0, 0.0, stop_distance, risk_amount, atr_used, notes + ["sem fundos disponíveis"])
             max_notional = min(max_notional, available_funds)
         if qty * price > max_notional:
             qty = math.floor(max_notional / price)
@@ -143,6 +145,29 @@ class RiskGate:
         self._halted_day: Optional[date] = None
         self._day_start_equity: Optional[float] = None
         self._day_start_date: Optional[date] = None
+        self.restore(datetime.now(timezone.utc))
+
+    def restore(self, now: datetime) -> None:
+        """Recarrega pausas e kill-switch ainda ativos a partir da base de dados (sobrevive a reinícios)."""
+        self._pauses = {}
+        self._halted_day = None
+        for ev in self.db.active_protections(now):
+            until = datetime.fromisoformat(ev["until"])
+            if ev["name"] == "daily_loss":
+                self._halted_day = now.date()
+                continue
+            key = f"{ev['name']}:{ev['symbol']}" if ev["symbol"] else ev["name"]
+            if until > self._pauses.get(key, until - timedelta(seconds=1)):
+                self._pauses[key] = until
+        if self._pauses or self._halted_day:
+            log.warning("Proteções restauradas: %s%s", ", ".join(f"{k} até {v:%H:%M}" for k, v in self._pauses.items()),
+                        " + kill-switch diário" if self._halted_day else "")
+
+    def reset(self) -> None:
+        """Esquece baseline e pausas em memória (troca de conta/base de dados)."""
+        self._day_start_equity = None
+        self._day_start_date = None
+        self.restore(datetime.now(timezone.utc))
 
     # ------------------------------------------------------------ estado
     def pause(self, name: str, until: datetime, reason: str, symbol: Optional[str] = None) -> None:
@@ -200,15 +225,20 @@ class RiskGate:
         pct = self.day_pnl_pct(equity)
         if pct is not None and pct <= -self.s.daily_loss_limit_pct * 100.0:
             self._halted_day = today
-            self.db.add_protection_event("daily_loss", None, None, f"{pct:.2f}%")
+            end_of_day = datetime.combine(today + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
+            self.db.add_protection_event("daily_loss", None, end_of_day, f"{pct:.2f}%")
             log.critical("KILL-SWITCH: perda diária %.2f%% > limite %.1f%%. Sem novas entradas hoje.",
                          pct, self.s.daily_loss_limit_pct * 100)
             return result.block("kill-switch diário")
 
-        # Pausas ativas (StoplossGuard, drawdown, perdas consecutivas).
+        # Pausas ativas (StoplossGuard, drawdown, perdas consecutivas). Em lucro no dia, as pausas
+        # de StoplossGuard e de perdas seguidas são libertadas; a de drawdown multi-dia mantém-se.
         for key, until in self.active_pauses(now).items():
-            if ":" not in key:  # pausas globais
-                return result.block(f"pausa {key} até {until.astimezone().strftime('%H:%M')}")
+            if ":" in key:
+                continue
+            if in_profit and key in ("stoploss_guard", "consecutive_losses"):
+                continue
+            return result.block(f"pausa {key} até {until.astimezone().strftime('%H:%M')}")
 
         if not in_profit:
             # StoplossGuard: N stops numa janela.
@@ -219,8 +249,8 @@ class RiskGate:
                 self.pause("stoploss_guard", until, f"{stops} stops em {self.s.stoploss_guard_window_minutes} min")
                 return result.block("StoplossGuard")
 
-            # Perdas consecutivas.
-            losses = self.db.consecutive_losses()
+            # Perdas consecutivas (só as ocorridas depois da última pausa deste tipo).
+            losses = self.db.consecutive_losses(since=self.db.last_protection_ts("consecutive_losses"))
             if losses >= self.s.consecutive_loss_halt:
                 until = datetime.combine(today + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
                 self.pause("consecutive_losses", until, f"{losses} perdas seguidas")
@@ -251,7 +281,7 @@ class RiskGate:
 
         # VIX.
         if self.events is not None:
-            vix = self.events.vix()
+            vix = self.events.vix(cached_only=True)  # a rede corre no prefetch, nunca no loop
             if vix is not None:
                 if vix >= self.s.vix_block_threshold:
                     return result.block(f"VIX {vix:.1f} >= {self.s.vix_block_threshold:.0f}")
@@ -261,9 +291,9 @@ class RiskGate:
         return result
 
     def recent_drawdown_pct(self, now: datetime) -> Optional[float]:
+        """Pico-vale sobre TODOS os snapshots da janela (inclui quedas intradiárias)."""
         since = now - timedelta(days=self.s.max_drawdown_lookback_days)
-        series = [v for _, v in self.db.daily_equity(since)]
-        series += [v for _, v in self.db.equity_series(now - timedelta(hours=1))][-1:]
+        series = [v for _, v in self.db.equity_series(since)]
         if len(series) < 2:
             return None
         peak = series[0]

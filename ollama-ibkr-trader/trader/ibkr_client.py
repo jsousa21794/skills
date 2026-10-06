@@ -65,6 +65,8 @@ class IBKRClient:
         self._disconnect_handled = False
         self.data_delayed: Optional[bool] = None  # True quando o feed é atrasado (paper sem subscrição)
         self.accounts: list[str] = []
+        self.account: str = ""  # conta efetivamente usada pelo bot
+        self.base_currency: str = ""
         self._hist_times: list[float] = []  # pacing de pedidos históricos
         self._hist_lock: Optional[asyncio.Lock] = None
 
@@ -94,6 +96,12 @@ class IBKRClient:
             self._disconnect_handled = False
             accounts = self.ib.managedAccounts()
             self.accounts = list(accounts)
+            wanted = self.settings.ib_account.strip()
+            if wanted and wanted not in accounts:
+                log.critical("Conta configurada %s não está entre as contas geridas (%s). A desligar.", wanted, ", ".join(accounts))
+                self.ib.disconnect()
+                return False
+            self.account = wanted or (accounts[0] if accounts else "")
             is_paper_account = all(a.startswith("DU") for a in accounts) if accounts else None
             log.info("IBKR ligado (%s:%s) conta(s): %s [%s]",
                      self.settings.ib_host, self.settings.ib_port, ", ".join(accounts) or "?",
@@ -258,15 +266,22 @@ class IBKRClient:
         return [Bar(self.bar_time_utc(b), float(b.open), float(b.high), float(b.low), float(b.close), float(b.volume))
                 for b in raw]
 
-    def price_at(self, symbol: str, when: datetime) -> Optional[float]:
-        """Fecho da primeira vela em memória com tempo >= ``when`` (para settlement)."""
+    def price_at(self, symbol: str, when: datetime, max_gap_minutes: Optional[int] = None) -> Optional[float]:
+        """Fecho da primeira vela com tempo >= ``when``; None se estiver a mais de ``max_gap_minutes``."""
         raw = self._bars.get(symbol)
         if not raw:
             return None
+        gap = max_gap_minutes if max_gap_minutes is not None else self.settings.settlement_max_gap_minutes
         for b in raw:
-            if self.bar_time_utc(b) >= when:
+            t = self.bar_time_utc(b)
+            if t >= when:
+                if (t - when).total_seconds() > gap * 60:
+                    return None
                 return float(b.close)
         return None
+
+    def bars_between(self, symbol: str, start: datetime, end: datetime) -> list[Bar]:
+        return [b for b in self.bars_as_list(symbol) if start <= b.time <= end]
 
     def bars(self, symbol: str) -> Optional[BarDataList]:
         return self._bars.get(symbol)
@@ -287,32 +302,76 @@ class IBKRClient:
         return list(bars or [])
 
     # ---------------------------------------------------------- carteira
-    def _account_value(self, tag: str) -> Optional[float]:
+    def _account_values(self, tag: str) -> dict[str, float]:
+        """{moeda: valor} para uma tag, só da conta do bot."""
         assert self.ib is not None
-        best: Optional[float] = None
+        out: dict[str, float] = {}
         for av in self.ib.accountValues():
-            if av.tag != tag:
+            if av.tag != tag or (self.account and av.account and av.account != self.account):
                 continue
-            if av.currency in ("BASE", self.settings.currency, ""):
-                try:
-                    best = float(av.value)
-                except ValueError:
-                    continue
-                if av.currency == "BASE":
-                    break
-        return best
+            try:
+                out[av.currency or ""] = float(av.value)
+            except ValueError:
+                continue
+        return out
+
+    def _detect_base_currency(self) -> str:
+        if self.base_currency:
+            return self.base_currency
+        values = self._account_values("NetLiquidation")
+        base = values.get("BASE")
+        for cur, val in values.items():
+            if cur not in ("BASE", "") and (base is None or abs(val - base) < 1e-6):
+                self.base_currency = cur
+                break
+        if not self.base_currency and values:
+            self.base_currency = next((c for c in values if c not in ("BASE", "")), "USD")
+        return self.base_currency or "USD"
+
+    def exchange_rate(self, currency: str) -> Optional[float]:
+        """Quanto vale 1 unidade de ``currency`` na moeda base (tag ExchangeRate)."""
+        base = self._detect_base_currency()
+        if currency == base:
+            return 1.0
+        rates = self._account_values("ExchangeRate")
+        return rates.get(currency)
+
+    def _account_value(self, tag: str) -> Optional[float]:
+        """Valor na moeda base (prefere a linha BASE; senão a da moeda base; senão qualquer)."""
+        values = self._account_values(tag)
+        if not values:
+            return None
+        if "BASE" in values:
+            return values["BASE"]
+        base = self._detect_base_currency()
+        if base in values:
+            return values[base]
+        return next(iter(values.values()))
+
+    def _to_usd(self, value: Optional[float]) -> Optional[float]:
+        if value is None:
+            return None
+        rate = self.exchange_rate("USD")
+        if rate is None or rate <= 0:
+            return None if self._detect_base_currency() != "USD" else value
+        return value / rate
 
     def portfolio_state(self) -> dict[str, Any]:
         if not self.connected:
             return {"connected": False, "net_liq": None, "cash": None, "available_funds": None, "buying_power": None,
-                    "unrealized": None, "realized": None, "positions": []}
+                    "unrealized": None, "realized": None, "positions": [], "currency": self.base_currency or "USD",
+                    "net_liq_usd": None, "available_funds_usd": None, "account": self.account}
         assert self.ib is not None
         positions = []
         for item in self.ib.portfolio():
             if not item.position:
                 continue
+            if self.account and item.account and item.account != self.account:
+                continue
             positions.append({
                 "symbol": item.contract.symbol,
+                "con_id": item.contract.conId,
+                "sec_type": item.contract.secType,
                 "qty": float(item.position),
                 "avg_cost": float(item.averageCost or 0.0),
                 "market_price": float(item.marketPrice or 0.0),
@@ -320,11 +379,17 @@ class IBKRClient:
                 "unrealized_pnl": float(item.unrealizedPNL or 0.0),
                 "realized_pnl": float(item.realizedPNL or 0.0),
             })
+        net_liq = self._account_value("NetLiquidation")
+        available = self._account_value("AvailableFunds")
         return {
             "connected": True,
-            "net_liq": self._account_value("NetLiquidation"),
+            "account": self.account,
+            "currency": self._detect_base_currency(),
+            "net_liq": net_liq,
+            "net_liq_usd": self._to_usd(net_liq),
             "cash": self._account_value("TotalCashValue"),
-            "available_funds": self._account_value("AvailableFunds"),
+            "available_funds": available,
+            "available_funds_usd": self._to_usd(available),
             "buying_power": self._account_value("BuyingPower"),
             "unrealized": self._account_value("UnrealizedPnL"),
             "realized": self._account_value("RealizedPnL"),
@@ -335,21 +400,75 @@ class IBKRClient:
         if not self.connected:
             return 0.0
         assert self.ib is not None
+        con_id = self.con_id(symbol)
         for pos in self.ib.positions():
-            if pos.contract.symbol == symbol:
+            if self.account and pos.account and pos.account != self.account:
+                continue
+            if pos.contract.secType != "STK":
+                continue
+            if (con_id and pos.contract.conId == con_id) or (not con_id and pos.contract.symbol == symbol):
                 return float(pos.position)
         return 0.0
 
-    def open_trades_for(self, symbol: str) -> list[Trade]:
+    def con_id(self, symbol: str) -> Optional[int]:
+        contract = self._contracts.get(symbol)
+        return int(contract.conId) if contract is not None and contract.conId else None
+
+    def _is_ours(self, trade: Trade) -> bool:
+        order = trade.order
+        if self.settings.order_ref and getattr(order, "orderRef", "") != self.settings.order_ref:
+            return False
+        if self.account and getattr(order, "account", "") and order.account != self.account:
+            return False
+        return True
+
+    def open_trades_for(self, symbol: str, ours_only: bool = True) -> list[Trade]:
+        """Ordens abertas do símbolo (por defeito só as do bot: orderRef e conta)."""
         if not self.connected:
             return []
         assert self.ib is not None
-        return [t for t in self.ib.openTrades() if t.contract.symbol == symbol]
+        con_id = self.con_id(symbol)
+        out = []
+        for t in self.ib.openTrades():
+            if t.contract.secType != "STK":
+                continue
+            same = (t.contract.conId == con_id) if con_id else (t.contract.symbol == symbol)
+            if same and (not ours_only or self._is_ours(t)):
+                out.append(t)
+        return out
+
+    def recent_fills(self) -> list[Fill]:
+        """Execuções já conhecidas pela sessão (ib_async carrega as do dia ao ligar)."""
+        if not self.connected:
+            return []
+        assert self.ib is not None
+        fills = []
+        for f in self.ib.fills():
+            if f.contract.secType != "STK":
+                continue
+            if self.account and f.execution.acctNumber and f.execution.acctNumber != self.account:
+                continue
+            fills.append(f)
+        return fills
+
+    @staticmethod
+    def _order_qty(qty: float) -> Optional[int]:
+        """Quantidade inteira para a ordem; None se a parte inteira for zero (fração não suportada)."""
+        whole = int(abs(qty))
+        if abs(abs(qty) - whole) > 1e-9:
+            log.warning("Posição fracionária %.4f: só a parte inteira (%d) é gerida; o resto fica por cobrir.", qty, whole)
+        return whole if whole > 0 else None
+
+    def _tag(self, order: Order) -> Order:
+        order.orderRef = self.settings.order_ref
+        if self.account:
+            order.account = self.account
+        return order
 
     # ------------------------------------------------------------ ordens
     async def place_bracket(
         self, symbol: str, action: str, quantity: int, ref_price: float, *,
-        stop_price: float, tp_price: float, trailing: bool = False,
+        stop_price: float, tp_price: float, trailing: bool = False, limit_price: Optional[float] = None,
     ) -> Optional[dict[str, Any]]:
         """Entrada a MERCADO com filhos TP (limit) e SL (stop ou trailing) ligados por ``parentId``.
 
@@ -367,7 +486,10 @@ class IBKRClient:
         tp_price = round_tick(tp_price)
         stop_price = round_tick(stop_price)
 
-        parent = MarketOrder(action, quantity)
+        if limit_price is not None:
+            parent = LimitOrder(action, quantity, round_tick(limit_price))  # marketable: limita o slippage
+        else:
+            parent = MarketOrder(action, quantity)
         parent.orderId = self.ib.client.getReqId()
         parent.transmit = False
         parent.tif = "DAY"  # a entrada é só para hoje
@@ -392,6 +514,8 @@ class IBKRClient:
         stop_loss.ocaGroup = oca
         stop_loss.ocaType = 1
 
+        for o in (parent, take_profit, stop_loss):
+            self._tag(o)
         trades = [self.ib.placeOrder(contract, o) for o in (parent, take_profit, stop_loss)]
         log.info(
             "Bracket %s %s x%d @~%.2f | TP %.2f | SL %.2f%s (ids %d/%d/%d)",
@@ -405,7 +529,30 @@ class IBKRClient:
             "tp_price": tp_price,
             "sl_price": stop_price,
             "trades": trades,
+            "con_id": self.con_id(symbol),
+            "account": self.account,
         }
+
+    def cancel_order_id(self, order_id: int) -> bool:
+        if not self.connected:
+            return False
+        assert self.ib is not None
+        for t in self.ib.openTrades():
+            if t.order.orderId == order_id:
+                self.ib.cancelOrder(t.order)
+                return True
+        return False
+
+    async def wait_done(self, trades: list[Trade], timeout: float = 5.0) -> bool:
+        """Espera que todas as ordens atinjam estado terminal (cancelada/executada)."""
+        import time as _time
+
+        deadline = _time.monotonic() + timeout
+        while _time.monotonic() < deadline:
+            if all(t.isDone() for t in trades):
+                return True
+            await asyncio.sleep(0.25)
+        return all(t.isDone() for t in trades)
 
     async def ensure_protection(self, symbol: str, *, stop_price: float, tp_price: float) -> Optional[dict[str, Any]]:
         """Coloca TP+SL (OCA, GTC) numa posição que ficou sem ordens de proteção."""
@@ -421,7 +568,10 @@ class IBKRClient:
         if contract is None:
             return None
         reverse = "SELL" if qty > 0 else "BUY"
-        n = abs(int(qty))
+        n = self._order_qty(qty)
+        if n is None:
+            log.error("Posição %s de %.4f ações não pode ser protegida (quantidade inteira zero).", symbol, qty)
+            return None
         oca = f"OCA-{symbol}-FIX-{self.ib.client.getReqId()}"
         take_profit = LimitOrder(reverse, n, round_tick(tp_price))
         stop_loss = StopOrder(reverse, n, round_tick(stop_price))
@@ -431,15 +581,37 @@ class IBKRClient:
             o.ocaGroup = oca
             o.ocaType = 1
             o.transmit = True
+            self._tag(o)
         trades = [self.ib.placeOrder(contract, o) for o in (take_profit, stop_loss)]
         log.warning("Posição %s x%d SEM proteção: colocados TP %.2f / SL %.2f (ids %d/%d).",
                     symbol, n, tp_price, stop_price, take_profit.orderId, stop_loss.orderId)
         return {"tp_order_id": take_profit.orderId, "sl_order_id": stop_loss.orderId, "qty": n,
-                "direction": 1 if qty > 0 else -1, "trades": trades}
+                "direction": 1 if qty > 0 else -1, "trades": trades, "tp_price": round_tick(tp_price),
+                "sl_price": round_tick(stop_price)}
+
+    ACTIVE_STATUSES = ("PreSubmitted", "Submitted", "PendingSubmit", "ApiPending")
+
+    def protective_coverage(self, symbol: str) -> float:
+        """Quantidade coberta por ordens de stop ATIVAS do lado oposto à posição (conta e contrato do bot)."""
+        qty = self.position_qty(symbol)
+        if qty == 0:
+            return 0.0
+        needed_action = "SELL" if qty > 0 else "BUY"
+        covered = 0.0
+        for t in self.open_trades_for(symbol, ours_only=False):
+            o, st = t.order, t.orderStatus
+            if o.orderType not in ("STP", "TRAIL", "STP LMT") or o.action != needed_action:
+                continue
+            if st.status not in self.ACTIVE_STATUSES:
+                continue
+            remaining = float(st.remaining) if st.remaining else float(o.totalQuantity) - float(st.filled or 0)
+            covered += max(0.0, remaining)
+        return covered
 
     def has_protective_orders(self, symbol: str) -> bool:
-        return any(t.order.orderType in ("STP", "TRAIL", "STP LMT") and t.orderStatus.status not in ("Cancelled", "Filled", "Inactive")
-                   for t in self.open_trades_for(symbol))
+        """True só quando os stops ativos cobrem toda a posição."""
+        qty = abs(self.position_qty(symbol))
+        return qty > 0 and self.protective_coverage(symbol) + 1e-9 >= qty
 
     def has_pending_entry(self, symbol: str) -> bool:
         return any(t.order.parentId == 0 and t.order.orderType == "MKT"
@@ -447,7 +619,13 @@ class IBKRClient:
                    for t in self.open_trades_for(symbol))
 
     async def close_position(self, symbol: str) -> Optional[dict[str, Any]]:
-        """Cancela ordens pendentes do ativo e fecha a posição a mercado."""
+        """Fecha a posição a mercado com segurança contra corridas com o stop.
+
+        1. Cancela os filhos (TP/SL) do bot e espera o estado terminal de cada um.
+        2. Volta a ler a posição: se o stop entretanto a fechou, não envia nada.
+        3. Envia a quantidade remanescente. Devolve ``needs_protection`` se algo falhar
+           depois dos cancelamentos, para o motor repor a cobertura.
+        """
         if not self.connected:
             return None
         assert self.ib is not None
@@ -457,15 +635,36 @@ class IBKRClient:
         contract = await self.qualify(symbol)
         if contract is None:
             return None
-        for trade in self.open_trades_for(symbol):
+        children = self.open_trades_for(symbol)
+        for trade in children:
             self.ib.cancelOrder(trade.order)
-        await asyncio.sleep(0.5)  # dá tempo aos cancelamentos antes da ordem de fecho
-        action = "SELL" if qty > 0 else "BUY"
-        order = MarketOrder(action, abs(int(qty)))
+        done = await self.wait_done(children, timeout=5.0)
+        if not done:
+            log.error("Fecho de %s: cancelamentos não confirmados em 5 s; a abortar o fecho (cobertura mantida).", symbol)
+            return {"order_id": None, "qty": 0, "direction": 1 if qty > 0 else -1, "trade": None,
+                    "aborted": True, "needs_protection": False}
+        qty_now = self.position_qty(symbol)
+        if qty_now == 0 or (qty_now > 0) != (qty > 0):
+            log.warning("Fecho de %s: a posição já foi fechada pelo stop/TP durante os cancelamentos.", symbol)
+            return {"order_id": None, "qty": 0, "direction": 1 if qty > 0 else -1, "trade": None,
+                    "closed_by_children": True, "needs_protection": qty_now != 0}
+        n = self._order_qty(qty_now)
+        if n is None:
+            log.error("Fecho de %s: quantidade inteira zero (posição fracionária %.4f).", symbol, qty_now)
+            return {"order_id": None, "qty": 0, "direction": 1 if qty_now > 0 else -1, "trade": None,
+                    "aborted": True, "needs_protection": True}
+        action = "SELL" if qty_now > 0 else "BUY"
+        order = self._tag(MarketOrder(action, n))
         order.orderId = self.ib.client.getReqId()
-        trade = self.ib.placeOrder(contract, order)
-        log.info("Fecho de posição %s: %s x%d (id %d)", symbol, action, abs(int(qty)), order.orderId)
-        return {"order_id": order.orderId, "qty": abs(qty), "direction": 1 if qty > 0 else -1, "trade": trade}
+        try:
+            trade = self.ib.placeOrder(contract, order)
+        except Exception as exc:  # noqa: BLE001
+            log.error("Fecho de %s falhou ao colocar a ordem: %s", symbol, exc)
+            return {"order_id": None, "qty": 0, "direction": 1 if qty_now > 0 else -1, "trade": None,
+                    "aborted": True, "needs_protection": True}
+        log.info("Fecho de posição %s: %s x%d (id %d)", symbol, action, n, order.orderId)
+        return {"order_id": order.orderId, "qty": float(n), "direction": 1 if qty_now > 0 else -1, "trade": trade,
+                "needs_protection": False}
 
     @staticmethod
     def bar_time_utc(bar: Any) -> datetime:

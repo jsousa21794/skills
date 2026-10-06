@@ -49,7 +49,11 @@ CATEGORY_COLORS = {"ollama": C["purple"], "ordem": C["accent"]}
 FONT = "Segoe UI"
 
 
-def money(v: Any, suffix: str = " USD") -> str:
+CURRENCY = {"code": "USD"}
+
+
+def money(v: Any, suffix: Optional[str] = None) -> str:
+    suffix = f" {CURRENCY['code']}" if suffix is None else suffix
     return "—" if v is None else f"{v:,.2f}{suffix}".replace(",", " ")
 
 
@@ -581,6 +585,8 @@ class TraderApp(ctk.CTk):
 
     def _update_portfolio(self, p: dict[str, Any]) -> None:
         self._connected = bool(p.get("connected"))
+        if p.get("currency"):
+            CURRENCY["code"] = p["currency"]
         if self._connected and p.get("net_liq") is not None:
             now_iso = datetime.utcnow().isoformat()
             self._set_value(p["net_liq"], now_iso, live=True)
@@ -612,10 +618,12 @@ class TraderApp(ctk.CTk):
         existing = {self.tree.set(i, "symbol"): i for i in self.tree.get_children()}
         seen = set()
         for pos in positions:
+            covered = pos.get("covered")
+            stop_txt = (f"{pos['stop']:.2f}" if pos.get("stop") else "—") + ("" if covered in (None, True) else " ⚠ sem cobertura")
             values = (pos["symbol"], f"{pos['qty']:g}", f"{pos['avg_cost']:.2f}", f"{pos['market_price']:.2f}",
                       money(pos["market_value"], ""), f"{pos['unrealized_pnl']:+,.2f}",
-                      f"{pos['stop']:.2f}" if pos.get("stop") else "—", f"{pos['tp']:.2f}" if pos.get("tp") else "—")
-            tag = "pos" if pos["unrealized_pnl"] >= 0 else "neg"
+                      stop_txt, f"{pos['tp']:.2f}" if pos.get("tp") else "—")
+            tag = "review" if covered is False else ("pos" if pos["unrealized_pnl"] >= 0 else "neg")
             if pos["symbol"] in existing:
                 self.tree.item(existing[pos["symbol"]], values=values, tags=(tag,))
             else:
@@ -633,7 +641,9 @@ class TraderApp(ctk.CTk):
                                   text_color=C["red"] if live else C["green"])
         self.mode_var.set("Real" if live else "Paper")
         accounts = ", ".join(p.get("accounts") or []) or "—"
-        self.lbl_mode_note.configure(text=f"porta {p.get('port')} · conta {accounts}",
+        if p.get("currency"):
+            CURRENCY["code"] = p["currency"]
+        self.lbl_mode_note.configure(text=f"porta {p.get('port')} · conta {accounts} · {p.get('currency', 'USD')}",
                                      text_color=C["red"] if live else C["muted"])
         self.chip_ibkr.set(p["ibkr_connected"], "IBKR: ligado" if p["ibkr_connected"] else "IBKR: desligado")
         self.chip_ollama.set(p["ollama_ok"], f"Ollama: {p['model']}" if p["ollama_ok"] else "Ollama: indisponível")
@@ -651,6 +661,10 @@ class TraderApp(ctk.CTk):
         pauses = p.get("pauses") or {}
         prot = ["🛑 KILL-SWITCH DIÁRIO ATIVO: sem novas entradas hoje" if p.get("halted") else "✅ Kill-switch diário: inativo"]
         prot += [f"⏸ {k} em pausa até {v}" for k, v in pauses.items()] or ["✅ Sem pausas de proteção ativas"]
+        if p.get("pending_entries"):
+            prot.append(f"⏳ {p['pending_entries']} entrada(s) pendente(s) na corretora")
+        if p.get("pending_closes"):
+            prot.append("⏳ fecho pendente: " + ", ".join(p["pending_closes"]))
         rs = p.get("risk_summary") or {}
         prot.append(f"Kill-switch {rs.get('daily_loss', 0):.0%}/dia (para o ciclo) · StoplossGuard {rs.get('stoploss_guard')} stops e "
                     f"cooldown {rs.get('cooldown')} min só em perda · entradas ilimitadas em lucro (regra PDT e fundos disponíveis mandam)")

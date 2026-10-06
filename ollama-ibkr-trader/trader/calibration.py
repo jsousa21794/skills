@@ -133,13 +133,29 @@ def brier(probs: Sequence[float], outcomes: Sequence[int]) -> float:
 
 
 class Calibrator:
-    KV_KEY = "platt_model"
+    """Um ajuste de Platt por modelo de linguagem: trocar de modelo nunca herda a calibração de outro."""
 
-    def __init__(self, settings: Settings, db: Database) -> None:
+    FEATURE_VERSION = "v2"
+
+    def __init__(self, settings: Settings, db: Database, model_name: Optional[str] = None) -> None:
         self.s = settings
         self.db = db
+        self.model_name = model_name or settings.ollama_model
         self.model: Optional[PlattModel] = None
-        stored = db.get_kv(self.KV_KEY)
+        self.reload()
+
+    @property
+    def kv_key(self) -> str:
+        return f"platt_model:{self.FEATURE_VERSION}:{self.model_name}"
+
+    def set_model_name(self, model_name: str) -> None:
+        if model_name != self.model_name:
+            self.model_name = model_name
+            self.reload()
+
+    def reload(self) -> None:
+        self.model = None
+        stored = self.db.get_kv(self.kv_key)
         if stored:
             try:
                 self.model = PlattModel.from_json(stored)
@@ -163,7 +179,8 @@ class Calibrator:
 
     def fit_from_db(self) -> Optional[PlattModel]:
         rows = self.db.settled_decisions(directional_only=True)
-        rows = [r for r in rows if r.get("correct") is not None and r.get("agree_frac") is not None]
+        rows = [r for r in rows if r.get("correct") is not None and r.get("agree_frac") is not None
+                and (r.get("model") or "") == self.model_name]
         if len(rows) < self.s.calibration_min_samples:
             log.info("Calibração: %d/%d decisões settled; a usar heurística.", len(rows), self.s.calibration_min_samples)
             return None
@@ -186,9 +203,9 @@ class Calibrator:
         probs = [model.predict(ConfidenceSignals(*x[:3], x[3])) for x in X]
         model.brier_train = brier(probs, y)
         self.model = model
-        self.db.set_kv(self.KV_KEY, model.to_json())
-        log.warning("Calibração Platt ajustada com %d decisões (Brier treino %.3f, taxa base %.2f)",
-                    len(y), model.brier_train, model.base_rate)
+        self.db.set_kv(self.kv_key, model.to_json())
+        log.warning("Calibração Platt ajustada para %s com %d decisões (Brier treino %.3f, taxa base %.2f)",
+                    self.model_name, len(y), model.brier_train, model.base_rate)
         return model
 
 

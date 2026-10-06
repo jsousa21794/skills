@@ -15,12 +15,35 @@ escuro).
 > capital são as regras de risco, não o modelo. Nunca apontes isto para uma
 > conta real sem passar os gates estatísticos descritos abaixo.
 
-> O modo predefinido é a conta **real**. Risco por trade até **10%** do equity
-> (limitado pelos fundos disponíveis da corretora), **entradas ilimitadas
-> enquanto o dia está em lucro** (só a regra PDT e os fundos disponíveis
-> limitam) e **kill-switch a -20% no dia, que para o ciclo automaticamente**.
-> Em dia de perda aplicam-se o StoplossGuard, o travão de perdas seguidas e o
-> cooldown após saída em perda. Tudo ajustável em `config.json`.
+> O modo predefinido é a conta **real** (base de dados própria,
+> `trader_live.sqlite3`). Risco por trade até **10%** do equity (limitado pelos
+> fundos disponíveis da corretora), **entradas ilimitadas enquanto o dia está
+> em lucro** (só a regra PDT e os fundos disponíveis limitam) e **kill-switch a
+> -20% no dia, que para o ciclo automaticamente e persiste a reinícios**. Em dia
+> de perda aplicam-se o StoplossGuard, o travão de perdas seguidas e o cooldown
+> após saída em perda. Tudo ajustável em `config.json` (validado ao carregar).
+>
+> Versão 1.0.3: resposta à auditoria da 1.0.2 (40 achados), ver
+> `../reports/Resposta à auditoria 1.0.2.md`.
+
+## Invariantes de segurança (1.0.3)
+
+- **Geração de decisões**: parar, mudar de conta, de modelo ou de ativos
+  invalida qualquer decisão em curso; nenhuma ordem sai de uma decisão antiga.
+- **Revalidação antes de cada ordem**: ligação, conta, fundos, gates e idade da
+  decisão são relidos imediatamente antes de `placeOrder`.
+- **Fechos seguros**: cancelam-se os filhos, espera-se o estado terminal,
+  relê-se a posição e só então se envia a quantidade remanescente; fechos e
+  entradas pendentes têm máquina de estados, e entradas não executadas são
+  canceladas após `entry_timeout_seconds`.
+- **Cobertura verificada a cada ciclo**: stops ativos do lado certo, com
+  quantidade suficiente e estado confirmado; se faltar, é reposta e persistida.
+- **Isolamento**: só ordens com o `orderRef` do bot, na conta configurada, em
+  contratos `STK` identificados por `conId`; posições externas não são tocadas
+  (`manage_external_positions=False`).
+- **Moeda**: valores de conta na moeda base com conversão explícita para USD
+  no dimensionamento; a interface mostra a moeda da conta.
+- **Política única**: `trader/policy.py` é usada pelo live e pelo replay.
 
 ## Princípio: o LLM propõe, o código decide
 
@@ -49,7 +72,8 @@ trader/
   config.py                  Settings (config.json em ~/.ollamaibkrtrader/), ~100 parâmetros
   gui.py                     CustomTkinter: controlo, portefólio, consola, estados de risco
   ui_bus.py                  fila thread-safe motor → GUI + handler de logging
-  trading_engine.py          loop asyncio numa thread dedicada; ciclo de decisão e execução
+  trading_engine.py          loop asyncio numa thread dedicada; ciclo, supervisão e execução
+  policy.py                  política de execução partilhada (live e replay)
   ibkr_client.py             ib_async: ligação, velas, carteira, bracket GTC/OCA, pacing,
                              verificação de dados atrasados, reconciliação, proteção de posições
   ollama_brain.py            prompt neutro, 2 etapas (raciocínio → JSON schema), N amostras,
@@ -71,7 +95,7 @@ data/seed_lessons.json       lições iniciais com fonte (importadas uma vez)
   volmodel.py                Chronos-Bolt opcional com fallback EWMA (largura p90−p10)
   database.py                SQLite: decisões (c/ settlement), ordens, trades, fills, P&L,
                              lições, cache, experiências, protections, relatórios
-tests/                       76 testes offline (IBKR e Ollama simulados)
+tests/                       110 testes offline (IBKR e Ollama simulados; 31 regressões da auditoria)
 trader.spec, build.sh/.bat   PyInstaller
 ```
 

@@ -30,7 +30,7 @@ def test_heuristic_when_not_fitted_and_fit_from_db():
     s = Settings()
     s.calibration_min_samples = 30
     db = Database(":memory:")
-    cal = Calibrator(s, db)
+    cal = Calibrator(s, db, "m")
     assert not cal.is_fitted
     p = cal.probability(ConfidenceSignals(0.9, 1.0, 1.0, None))
     assert 0.8 <= p <= 1.0
@@ -46,8 +46,9 @@ def test_heuristic_when_not_fitted_and_fit_from_db():
                            correct=1 if rng.random() < agree else 0, horizon_min=30)
     model = cal.fit_from_db()
     assert model is not None and cal.is_fitted
-    assert db.get_kv("platt_model")
-    assert Calibrator(s, db).is_fitted  # persiste
+    assert db.get_kv(cal.kv_key)
+    assert Calibrator(s, db, "m").is_fitted  # persiste
+    assert not Calibrator(s, db, "outro-modelo").is_fitted  # outro modelo não herda a calibração
     assert abs(brier([0.9, 0.1], [1, 0]) - 0.01) < 1e-9
 
 

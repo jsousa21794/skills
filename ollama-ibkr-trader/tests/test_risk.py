@@ -121,10 +121,10 @@ class _Events:
     def __init__(self, vix=None, blackout=None):
         self._vix, self._blackout = vix, blackout
 
-    def vix(self):
+    def vix(self, cached_only=False):
         return self._vix
 
-    def in_earnings_blackout(self, symbol, before, after, today=None):
+    def in_earnings_blackout(self, symbol, before, after, today=None, cached_only=True):
         return self._blackout
 
 

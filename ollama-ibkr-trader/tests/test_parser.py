@@ -41,9 +41,14 @@ def test_missing_confidence_is_zero():
     assert d.confianca == 0.0  # nunca executado: abaixo de qualquer limiar
 
 
-@pytest.mark.parametrize("value, expected", [(0.5, 0.5), ("0.9", 0.9), ("80%", 0.8), (120, 1.0), (-3, 0.0), (None, 0.0), (True, 0.0), ("alta", 0.0)])
+@pytest.mark.parametrize("value, expected", [(0.5, 0.5), ("0.9", 0.9), ("80%", 0.8), (120, 1.0), (-3, 0.0)])
 def test_normalize_confidence(value, expected):
     assert normalize_confidence(value) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("value", [None, True, "alta", float("nan"), float("inf")])
+def test_normalize_confidence_invalid_is_none(value):
+    assert normalize_confidence(value) is None
 
 
 def test_hold_factory():

@@ -105,10 +105,14 @@ def build_snapshot(
     sma_fast_period: int = 20,
     sma_slow_period: int = 50,
     ema_period: int = 9,
+    bar_minutes: int = 1,
 ) -> Optional[MarketSnapshot]:
+    """``bar_minutes`` converte os horizontes de 5 e 30 minutos em número de velas."""
     if not closes:
         return None
     closes = list(closes)
+    bars_5m = max(1, round(5 / max(bar_minutes, 1)))
+    bars_30m = max(1, round(30 / max(bar_minutes, 1)))
     return MarketSnapshot(
         symbol=symbol,
         price=float(closes[-1]),
@@ -117,8 +121,8 @@ def build_snapshot(
         sma_fast=_round(sma(closes, sma_fast_period)),
         sma_slow=_round(sma(closes, sma_slow_period)),
         ema=_round(ema(closes, ema_period)),
-        change_5m_pct=_round(pct_change(closes, 5), 3),
-        change_30m_pct=_round(pct_change(closes, 30), 3),
+        change_5m_pct=_round(pct_change(closes, bars_5m), 3),
+        change_30m_pct=_round(pct_change(closes, bars_30m), 3),
         volume_last=float(volumes[-1]) if volumes else 0.0,
         bars_available=len(closes),
     )
@@ -188,13 +192,17 @@ def percentile(values: Sequence[float], pct: float) -> Optional[float]:
     return ordered[lo] + (ordered[hi] - ordered[lo]) * frac
 
 
-def aggregate_bars(bars: Sequence[Bar], minutes: int) -> list[Bar]:
-    """Agrega velas de 1 min em velas de ``minutes`` alinhadas ao relógio."""
+def aggregate_bars(bars: Sequence[Bar], minutes: int, *, drop_incomplete: bool = False) -> list[Bar]:
+    """Agrega velas de 1 min em velas de ``minutes`` alinhadas ao relógio.
+
+    Com ``drop_incomplete`` o último bucket só entra se a sua última vela de 1 min for a
+    última do intervalo (ex.: 09:34 para o bucket 09:30-09:34), isto é, se estiver fechado.
+    """
     if minutes <= 1:
         return list(bars)
     out: list[Bar] = []
     bucket: list[Bar] = []
-    bucket_key: Optional[int] = None
+    bucket_key: Optional[tuple] = None
     for b in bars:
         key = (b.time.hour * 60 + b.time.minute) // minutes
         day_key = (b.time.date(), key)
@@ -204,7 +212,10 @@ def aggregate_bars(bars: Sequence[Bar], minutes: int) -> list[Bar]:
         bucket.append(b)
         bucket_key = day_key
     if bucket:
-        out.append(_merge(bucket))
+        last = bucket[-1].time
+        complete = (last.hour * 60 + last.minute) % minutes == minutes - 1
+        if complete or not drop_incomplete:
+            out.append(_merge(bucket))
     return out
 
 

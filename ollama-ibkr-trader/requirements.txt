@@ -1,7 +1,8 @@
-ib_async>=2.0
-customtkinter>=5.2
-requests>=2.31
-yfinance>=0.2.40           # datas de resultados, VIX e notícias (blackout de eventos)
+# Dependências fixas (versões idênticas às dos binários publicados).
+ib_async==2.1.0
+customtkinter==6.0.0
+requests==2.34.2
+yfinance==1.7.0           # datas de resultados, VIX e notícias (blackout de eventos)
 tzdata>=2024.1 ; sys_platform == "win32"
 
 # Opcionais (fase 3 / relatórios). Instale só o que quiser usar:

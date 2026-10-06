@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import multiprocessing
+import os
 import sys
 
 from .config import Settings, app_data_dir
@@ -56,6 +57,12 @@ def main() -> int:
     from .gui import TraderApp  # import tardio: Tk só na thread principal
 
     app = TraderApp(engine, bus, settings)
+    smoke = os.environ.get("OLLAMA_TRADER_SMOKE")
+    if smoke:
+        # Modo de verificação do binário: arranca GUI e motor, espera N segundos, encerra limpo.
+        seconds = max(1, int(smoke)) if smoke.isdigit() else 3
+        log.info("Smoke test: a encerrar automaticamente em %ds", seconds)
+        app.after(seconds * 1000, app._on_close)
     try:
         app.mainloop()
     finally:
