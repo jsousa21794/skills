@@ -173,6 +173,26 @@ class Calibrator:
                 self.model = PlattModel.from_json(stored)
             except (ValueError, TypeError):
                 self.model = None
+        if self.model is not None and self._stale_by_labels(self.model):
+            # Modelo ajustado ANTES de rótulos terem sido corrigidos/finalizados: inválido também no arranque (Z06).
+            log.warning("Calibração %s: modelo guardado é anterior à última correção de rótulos; descartado (heurística até reajustar).",
+                        self.experiment)
+            self.invalidate()
+
+    def _stale_by_labels(self, model: PlattModel) -> bool:
+        changed = self.db.get_kv("labels_changed_at")
+        if not changed:
+            return False
+        try:
+            return datetime.fromisoformat(changed) > datetime.fromisoformat(model.fitted_at)
+        except (TypeError, ValueError):
+            return True
+
+    def invalidate(self) -> None:
+        """Retira o modelo em memória E do armazenamento: estado não calibrado (heurística) até um reajuste válido (Z06)."""
+        self.model = None
+        if self.db.get_kv(self.kv_key):
+            self.db.set_kv(self.kv_key, "")
 
     @property
     def is_fitted(self) -> bool:
@@ -199,6 +219,7 @@ class Calibrator:
                 and (self.prompt_version is None or r.get("prompt_version") == self.prompt_version)]
         if len(rows) < self.s.calibration_min_samples:
             log.info("Calibração: %d/%d decisões settled; a usar heurística.", len(rows), self.s.calibration_min_samples)
+            self._drop_if_stale()
             return None
         X, y = [], []
         for r in rows:
@@ -212,6 +233,7 @@ class Calibrator:
             y.append(int(r["correct"]))
         if len(set(y)) < 2:
             log.info("Calibração: todos os resultados iguais; sem ajuste.")
+            self._drop_if_stale()
             return None
         w, b = fit_logistic(X, y)
         model = PlattModel(weights=w, bias=b, n_samples=len(y), fitted_at=datetime.now(timezone.utc).isoformat(),
@@ -225,7 +247,15 @@ class Calibrator:
         return model
 
 
-def _margin_from_samples(samples_json: Any) -> float:
+    def _drop_if_stale(self) -> None:
+        """Um reajuste necessário que FALHA (amostras insuficientes ou uma só classe) não pode deixar o modelo
+        anterior em uso: se está invalidado (rótulos corrigidos ou prazo expirado), volta-se à heurística (Z06)."""
+        if self.model is not None and self.needs_refit():
+            log.warning("Calibração %s: reajuste necessário sem dados válidos; modelo anterior retirado (heurística).", self.experiment)
+            self.invalidate()
+
+
+def _margin_from_samples(samples_json: Any) -> float:  # noqa: E302
     try:
         samples = json.loads(samples_json) if isinstance(samples_json, str) else (samples_json or [])
     except json.JSONDecodeError:

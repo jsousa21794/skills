@@ -151,19 +151,83 @@ class RemoteSupervisor:
         self._audit("get_recent_decisions", {"limit": limit}, {"n": len(rows)})
         return result
 
+    def _own_exit_orders(self, symbol: str) -> list[dict[str, Any]]:
+        """Saídas PRÓPRIAS vivas do ativo (TP/SL/fecho), identificadas pela perna persistida ou pelo parentId."""
+        out = []
+        try:
+            for t in self.engine.ibkr.our_open_orders():
+                if t.contract.symbol != symbol or not self.engine.ibkr.is_live_order(t):
+                    continue
+                o = t.order
+                group = self.db.group_for_order(int(o.orderId), symbol=symbol)
+                leg = self.db.order_leg(group, int(o.orderId)) if group else None
+                is_exit = leg in ("TP", "SL") or (group is not None and group["role"] == "CLOSE") or \
+                    (leg is None and int(getattr(o, "parentId", 0) or 0) != 0)
+                if is_exit:
+                    out.append({"order_id": int(o.orderId), "action": o.action, "type": o.orderType, "qty": float(o.totalQuantity)})
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Comparação: não foi possível listar as ordens de %s: %s", symbol, exc)
+        return out
+
     def compare(self) -> dict[str, Any]:
-        pos = self.positions()["positions"]
+        """Ledger vs corretora com três estados distintos (Z07): ``consistent`` (ligado, reconciliado e sem problemas),
+        ``inconsistent`` (problemas concretos) e ``unknown`` (desligado, por reconciliar ou dados obsoletos: nunca se
+        conclui positivamente). Inclui ativos que só têm ordens vivas (saídas sem posição, excesso, lado errado)."""
+        ibkr = self.engine.ibkr
+        connected = bool(ibkr.connected)
+        reconciled = bool(self.engine._reconciled)
+        pos = self.positions()["positions"] if connected else []
         issues = []
+        seen = set()
         for p in pos:
+            seen.add(p["symbol"])
             if abs(p["difference"]) > 1e-6:
                 issues.append({"symbol": p["symbol"], "kind": "quantidade", "broker_qty": p["broker_qty"], "own_qty": p["own_qty"]})
             if p["broker_qty"] and p["covered"] is False:
                 issues.append({"symbol": p["symbol"], "kind": "cobertura", "detail": "posição sem stops confirmados suficientes"})
             if p["in_discrepancy"]:
                 issues.append({"symbol": p["symbol"], "kind": "discrepância", "detail": "reconciliação em curso; decisões bloqueadas"})
-        result = {"issues": issues, "ok": not issues, "reconciled": self.engine._reconciled,
-                  "unallocated_fills": len(self.db.unallocated_fills())}
-        self._audit("compare_ledger_with_broker", {}, result)
+        symbols_with_orders = set()
+        if connected:
+            try:
+                symbols_with_orders = {t.contract.symbol for t in ibkr.our_open_orders() if ibkr.is_live_order(t)}
+            except Exception as exc:  # noqa: BLE001
+                issues.append({"symbol": None, "kind": "ordens", "detail": f"não foi possível listar as ordens: {exc}"})
+        for symbol in sorted(symbols_with_orders | seen):
+            if not connected:
+                break
+            broker_qty = float(ibkr.position_qty(symbol) or 0.0)
+            exits = self._own_exit_orders(symbol)
+            if broker_qty == 0 and exits:
+                issues.append({"symbol": symbol, "kind": "saídas sem posição", "orders": exits,
+                               "detail": "ordens de saída do bot vivas sem posição: executariam uma posição nova"})
+                continue
+            if broker_qty and symbol in symbols_with_orders:
+                own = abs(self.engine._own_qty(symbol))
+                allowed = own if (own > 0 and not self.settings.manage_external_positions and abs(broker_qty) > own + 1e-6) else None
+                try:
+                    if ibkr.has_excess_exits(symbol, allowed_qty=allowed):
+                        issues.append({"symbol": symbol, "kind": "excesso de saídas", "exit_qty": ibkr.own_exit_quantity(symbol),
+                                       "broker_qty": broker_qty, "own_qty": own})
+                    wrong = ibkr.wrong_side_exit_quantity(symbol)
+                    if wrong > 1e-9:
+                        issues.append({"symbol": symbol, "kind": "saídas do lado errado", "qty": wrong})
+                except Exception as exc:  # noqa: BLE001
+                    issues.append({"symbol": symbol, "kind": "ordens", "detail": f"verificação de saídas falhou: {exc}"})
+        unallocated = len(self.db.unallocated_fills())
+        if unallocated:
+            issues.append({"symbol": None, "kind": "execuções por alocar", "n": unallocated})
+        conflicts = self.db.kv_with_prefix("conflict:") if hasattr(self.db, "kv_with_prefix") else {}
+        for symbol, note in conflicts.items():
+            issues.append({"symbol": symbol, "kind": "conflito por explicar", "detail": note})
+        if not connected or not reconciled:
+            status = "unknown"
+        else:
+            status = "inconsistent" if issues else "consistent"
+        result = {"status": status, "ok": status == "consistent", "issues": issues, "reconciled": reconciled,
+                  "ibkr_connected": connected, "unallocated_fills": unallocated,
+                  "note": None if status != "unknown" else "sem ligação ou estado por reconciliar: não é possível concluir"}
+        self._audit("compare_ledger_with_broker", {}, {"status": status, "n_issues": len(issues)})
         return result
 
     def diagnostics(self) -> dict[str, Any]:
@@ -201,34 +265,43 @@ class RemoteSupervisor:
 
     # ---- comando
     async def pause_entries(self, account: str, mode: str, reason: str) -> dict[str, Any]:
-        """Validação no servidor: conta e modo têm de coincidir com o estado atual; só depois se aplica."""
+        """Validação no servidor: conta e modo têm de coincidir com o estado atual; a identidade EXATA (conta completa,
+        modo, geração, base de dados) segue com o comando e é revalidada no loop do motor imediatamente antes da
+        escrita (Z08) — a máscara serve só para apresentação."""
         expected_mode = self.settings.trading_mode
-        expected_acct = mask_account(self.engine.ibkr.account)
+        exact_account = self.engine.ibkr.account
+        expected_acct = mask_account(exact_account)
+        args = {"account": account, "mode": mode, "reason": reason}
         if (mode or "").strip().lower() != expected_mode:
             result = {"applied": False, "error": f"modo '{mode}' não coincide com o modo atual '{expected_mode}'"}
-            self._audit("pause_new_entries", {"account": account, "mode": mode, "reason": reason}, result)
+            self._audit("pause_new_entries", args, result)
             return result
-        if expected_acct and (account or "").strip() not in (expected_acct, self.engine.ibkr.account):
+        if expected_acct and (account or "").strip() not in (expected_acct, exact_account):
             result = {"applied": False, "error": f"conta '{account}' não coincide com a conta atual '{expected_acct}'"}
-            self._audit("pause_new_entries", {"account": account, "mode": mode, "reason": reason}, result)
+            self._audit("pause_new_entries", args, result)
             return result
         if not reason or not reason.strip():
             result = {"applied": False, "error": "indica a razão da pausa"}
-            self._audit("pause_new_entries", {"account": account, "mode": mode, "reason": reason}, result)
+            self._audit("pause_new_entries", args, result)
             return result
-        fut = self.engine.call(self.engine.pause_entries(reason.strip(), actor=ACTOR))
+        expected = {"account": exact_account, "mode": expected_mode, "generation": self.engine.generation, "db": self.engine.db.path}
+        fut = self.engine.call(self.engine.pause_entries(reason.strip(), actor=ACTOR, expected=expected))
         if fut is None:
             result = {"applied": False, "error": "motor indisponível"}
         else:
             try:
                 outcome = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=15)
-                # Só é confirmada depois de aplicada E persistida.
-                persisted = self.db.get_kv("entries_paused") == "1"
-                result = {"applied": persisted, **outcome, "persisted": persisted,
-                          "note": "entradas já enviadas continuam pendentes; proteções e supervisão mantêm-se"}
+                if not outcome.get("applied", outcome.get("paused")):
+                    result = {"applied": False, **outcome}
+                else:
+                    # Só é confirmada depois de aplicada E persistida na base da conta validada.
+                    persisted = self.db.get_kv("entries_paused") == "1" and self.engine.db.path == expected["db"] \
+                        and self.engine.ibkr.account == exact_account
+                    result = {**outcome, "applied": persisted, "persisted": persisted,
+                              "note": "entradas já enviadas continuam pendentes; proteções e supervisão mantêm-se"}
             except Exception as exc:  # noqa: BLE001
                 result = {"applied": False, "error": f"falha ao aplicar: {exc}"}
-        self._audit("pause_new_entries", {"account": account, "mode": mode, "reason": reason}, result)
+        self._audit("pause_new_entries", {**args, "validated_account": expected_acct}, result)
         return result
 
 

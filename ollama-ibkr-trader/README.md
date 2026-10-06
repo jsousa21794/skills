@@ -23,11 +23,52 @@ escuro).
 > de perda aplicam-se o StoplossGuard, o travão de perdas seguidas e o cooldown
 > após saída em perda. Tudo ajustável em `config.json` (validado ao carregar).
 >
-> Versão 1.0.8: resposta à revisão da 1.0.7 (7 achados, 2 P0) e integração com
-> o ChatGPT via MCP, ver `../reports/Resposta à revisão 1.0.7.md`; antes, as
-> respostas às revisões anteriores e à auditoria da 1.0.2 na mesma pasta.
+> Versão 1.0.9: resposta à revisão da 1.0.8 (8 achados, 1 P0), ver
+> `../reports/Resposta à revisão 1.0.8.md`; antes, as respostas às revisões
+> anteriores e à auditoria da 1.0.2 na mesma pasta.
 
-## Invariantes de segurança (1.0.8)
+## Invariantes de segurança (1.0.9)
+
+- **Conflito externo persistente**: uma redução ou inversão fora do bot fica
+  gravada na base de dados (`conflict:<ativo>`) e sobrevive a reinícios; quando
+  toda a quantidade própria está explicada por ajustes provisórios, o que resta
+  na corretora NÃO é do bot: em nenhum ciclo (nem após reinício) se colocam
+  stops, TP ou fechos sobre essa posição, as saídas próprias que sobrem são
+  canceladas e as decisões no ativo ficam bloqueadas até as execuções
+  explicarem a diferença. Titularidade, direção e níveis são revalidados em
+  cada passagem do supervisor.
+- **A pausa revoga entradas em preparação**: o token de autorização que a
+  corretora reavalia imediatamente antes de `placeOrder` inclui a pausa de
+  novas entradas (local ou remota) e a discrepância do ativo; uma entrada que
+  estava a ser qualificada quando a pausa foi confirmada não sai.
+- **Pausa = só novas entradas**: a intenção é classificada antes de aplicar a
+  pausa; fechos por sinal contrário e proteções continuam sujeitos apenas às
+  suas próprias validações.
+- **Execuções pela identidade da ordem**: uma execução de saída só é
+  distribuída pelos trades que a ordem cobre (grupo da ordem, pernas
+  arquivadas e `exit_coverage` dos fechos por sinal), nunca por trades novos do
+  mesmo ativo; a execução tardia de um grupo já reconciliado corrige esse trade
+  (quantidade e P&L) sem o reabrir; sem saldo coberto fica por alocar.
+- **Ajustes ligados à evidência**: cada ajuste provisório guarda as saídas
+  vivas no instante da discrepância; só uma execução dessas ordens o consome.
+  Saídas colocadas depois fecham a quantidade viva e nunca explicam a redução
+  anterior. Um trade reconciliado com execuções por receber fica assinalado
+  (P&L indeterminado) até elas chegarem.
+- **Modelo inválido é retirado**: se um reajuste necessário (rótulos
+  corrigidos/finalizados ou prazo) falha por falta de amostras finais ou de
+  diversidade de classes, o modelo anterior é removido da memória e do
+  armazenamento e volta-se à heurística; no arranque, um modelo anterior à
+  última correção de rótulos não é carregado.
+- **Diagnóstico MCP honesto**: `compare_ledger_with_broker` distingue
+  `consistent`, `inconsistent` e `unknown` (desligado ou por reconciliar nunca
+  conclui positivamente), inclui ativos que só têm ordens vivas e deteta saídas
+  sem posição, excesso, lado errado, execuções por alocar e conflitos.
+- **Comando remoto com identidade exata**: a pausa transporta conta completa,
+  modo, geração e base de dados validados até ao loop do motor, onde são
+  reavaliados imediatamente antes da escrita; uma troca de conta/modo ou um
+  reinício entretanto recusa o pedido. A máscara da conta é só apresentação.
+
+## Invariantes de segurança herdados (1.0.8)
 
 - **Reconciliação única**: arranque e supervisão periódica usam a mesma rotina;
   um ativo fica gerido enquanto houver ordens próprias vivas, mesmo sem trade
@@ -412,8 +453,12 @@ lateral. A camada de risco continua local e independente da IA.
    Clientes que suportem cabeçalhos podem usar `Authorization: Bearer <token>`.
 4. Cada chamada fica registada em `remote_commands` (autor, pedido, instante,
    conta mascarada, modo, resultado). A pausa exige a conta (como mostrada em
-   `get_status`) e o modo atuais, e uma razão; só é confirmada depois de
-   aplicada e persistida.
+   `get_status`) e o modo atuais, e uma razão; a identidade exata validada
+   segue com o comando e é reavaliada no motor antes de escrever; só é
+   confirmada depois de aplicada e persistida na base da conta validada.
+5. `compare_ledger_with_broker` devolve `status` = `consistent` |
+   `inconsistent` | `unknown`; `ok` só é verdadeiro com ligação, reconciliação
+   concluída e zero problemas.
 
 Supervisão contínua (um serviço separado a vigiar eventos e a chamar o modelo
 pela API) não está incluída: a conversa com o ChatGPT só supervisiona enquanto

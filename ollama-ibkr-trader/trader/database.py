@@ -198,6 +198,12 @@ CREATE TABLE IF NOT EXISTS remote_commands (
 -- Histórico de TODAS as ordens que já pertenceram a um grupo (pai, TP, SL), incluindo as
 -- substituídas por uma reparação: um fill tardio de um filho antigo continua a encontrar o
 -- seu grupo/trade (N07).
+CREATE TABLE IF NOT EXISTS exit_coverage (
+    group_id INTEGER NOT NULL,     -- grupo cuja(s) ordem(ns) de saída cobre(m) o trade (Z04)
+    trade_id INTEGER NOT NULL,
+    PRIMARY KEY (group_id, trade_id)
+);
+
 CREATE TABLE IF NOT EXISTS order_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     group_id INTEGER NOT NULL,
@@ -246,6 +252,7 @@ DECISION_COLUMNS = {
     "provisional_correct": "INTEGER",  # rótulo provisório guardado quando o final o substitui (X06)
 }
 HISTORY_COLUMNS = {"perm_id": "INTEGER"}
+ADJUSTMENT_COLUMNS = {"order_ids": "TEXT"}  # saídas vivas no instante do ajuste: só as suas execuções o explicam (Z05)
 TRADE_COLUMNS = {"decision_action": "TEXT", "stop_price": "REAL", "tp_price": "REAL", "risk_amount": "REAL",
                  "commission": "REAL NOT NULL DEFAULT 0", "gross_pnl": "REAL NOT NULL DEFAULT 0", "account": "TEXT"}
 FILL_COLUMNS = {"commission": "REAL", "commission_estimated": "INTEGER NOT NULL DEFAULT 1", "account": "TEXT",
@@ -297,7 +304,8 @@ class Database:
     def _migrate(self) -> None:
         with self._lock:
             for table, columns in (("decisions", DECISION_COLUMNS), ("trades", TRADE_COLUMNS), ("fills", FILL_COLUMNS),
-                                   ("order_groups", GROUP_COLUMNS), ("order_history", HISTORY_COLUMNS)):
+                                   ("order_groups", GROUP_COLUMNS), ("order_history", HISTORY_COLUMNS),
+                                   ("ledger_adjustments", ADJUSTMENT_COLUMNS)):
                 existing = {row[1] for row in self._conn.execute(f"PRAGMA table_info({table})")}
                 for name, decl in columns.items():
                     if name not in existing:
@@ -951,34 +959,69 @@ class Database:
         return self._query("SELECT * FROM trades WHERE id=?", (trade_id,))[0]
 
     def add_adjustment(self, trade_id: int, qty: float, price_hint: Optional[float], reason: str,
-                       ts: Optional[datetime] = None) -> None:
-        self._execute("INSERT INTO ledger_adjustments (trade_id, ts, qty, price_hint, reason) VALUES (?,?,?,?,?)",
-                      (int(trade_id), iso(ts or utc_now()), float(qty), price_hint, reason))
+                       ts: Optional[datetime] = None, order_ids: Optional[Iterable[int]] = None) -> None:
+        """Ajuste PROVISÓRIO de quantidade ligado à evidência que o justifica (Z05): as saídas vivas do trade no
+        instante da discrepância (``order_ids``; por defeito, as pernas ativas/arquivadas dos grupos que o cobrem).
+        Só uma execução dessas ordens o explica; saídas colocadas DEPOIS fecham a quantidade viva e nunca o consomem."""
+        if order_ids is None:
+            order_ids = self.exit_order_ids_for_trade(int(trade_id))
+        self._execute("INSERT INTO ledger_adjustments (trade_id, ts, qty, price_hint, reason, order_ids) VALUES (?,?,?,?,?,?)",
+                      (int(trade_id), iso(ts or utc_now()), float(qty), price_hint, reason,
+                       json.dumps(sorted({int(o) for o in order_ids}))))
+
+    def exit_order_ids_for_trade(self, trade_id: int) -> set[int]:
+        """Ordens de saída (TP/SL ativas e arquivadas, fechos por sinal) de todos os grupos que cobrem o trade."""
+        ids: set[int] = set()
+        for g in self._query(
+                """SELECT g.* FROM order_groups g WHERE g.id IN (SELECT group_id FROM trades WHERE id=?)
+                   OR g.id IN (SELECT group_id FROM exit_coverage WHERE trade_id=?)""", (int(trade_id), int(trade_id))):
+            for col in ("tp_order_id", "sl_order_id"):
+                if g.get(col) is not None:
+                    ids.add(int(g[col]))
+            if g["role"] == "CLOSE" and g.get("parent_order_id") is not None:
+                ids.add(int(g["parent_order_id"]))
+            for h in self._query("SELECT order_id FROM order_history WHERE group_id=? AND leg IN ('TP','SL')", (int(g["id"]),)):
+                ids.add(int(h["order_id"]))
+        return ids
 
     def open_adjustment_qty(self, trade_id: int) -> float:
         rows = self._query("SELECT COALESCE(SUM(qty - consumed_qty), 0) AS q FROM ledger_adjustments WHERE trade_id=?", (int(trade_id),))
         return float(rows[0]["q"] or 0.0)
 
-    def open_adjustments_for_symbol(self, symbol: str) -> float:
+    def open_adjustments_for_symbol(self, symbol: str, include_closed: bool = False) -> float:
+        status = "" if include_closed else " AND t.status='OPEN'"
         rows = self._query(
-            """SELECT COALESCE(SUM(a.qty - a.consumed_qty), 0) AS q FROM ledger_adjustments a JOIN trades t ON t.id = a.trade_id
-               WHERE t.symbol=? AND t.status='OPEN'""", (symbol,))
+            f"""SELECT COALESCE(SUM(a.qty - a.consumed_qty), 0) AS q FROM ledger_adjustments a JOIN trades t ON t.id = a.trade_id
+               WHERE t.symbol=?{status}""", (symbol,))
         return float(rows[0]["q"] or 0.0)
 
-    def consume_adjustment(self, trade_id: int, qty: float) -> float:
-        """Uma execução REAL substitui o ajuste provisório na mesma quantidade (nunca se soma duas vezes) (Y03).
-        Devolve a quantidade consumida."""
+    def consume_adjustment(self, trade_id: int, qty: float, order_id: Optional[int] = None) -> float:
+        """Uma execução REAL substitui o ajuste provisório na mesma quantidade (nunca se soma duas vezes) (Y03) — mas
+        só se a EXPLICA (Z05): a ordem da execução tem de ser uma das saídas vivas quando o ajuste foi registado
+        (ajustes antigos sem essa lista aceitam qualquer ordem anterior ao ajuste). Devolve a quantidade consumida."""
         remaining = float(qty)
         consumed = 0.0
-        for row in self._query("SELECT id, qty, consumed_qty FROM ledger_adjustments WHERE trade_id=? AND qty - consumed_qty > 1e-9 ORDER BY id",
-                               (int(trade_id),)):
+        for row in self._query("SELECT id, ts, qty, consumed_qty, order_ids FROM ledger_adjustments WHERE trade_id=? "
+                               "AND qty - consumed_qty > 1e-9 ORDER BY id", (int(trade_id),)):
             if remaining <= 1e-9:
                 break
+            if order_id is not None and not self._explains_adjustment(row, int(order_id)):
+                continue
             portion = min(remaining, float(row["qty"]) - float(row["consumed_qty"]))
             self._execute("UPDATE ledger_adjustments SET consumed_qty=consumed_qty+? WHERE id=?", (portion, row["id"]))
             remaining -= portion
             consumed += portion
         return consumed
+
+    def _explains_adjustment(self, adjustment: dict[str, Any], order_id: int) -> bool:
+        raw = adjustment.get("order_ids")
+        if raw:
+            try:
+                return int(order_id) in {int(x) for x in json.loads(raw)}
+            except (ValueError, TypeError):
+                return False
+        placed = self._query("SELECT MIN(ts) AS ts FROM order_history WHERE order_id=?", (int(order_id),))
+        return not placed or placed[0]["ts"] is None or placed[0]["ts"] <= adjustment["ts"]
 
     def record_remote_command(self, *, actor: str, tool: str, args: Any, account: Optional[str], mode: str, result: str) -> int:
         cur = self._execute(
@@ -1035,6 +1078,48 @@ class Database:
     def allocate_fill(self, exec_id: str, trade_id: int, shares: float, commission: float) -> None:
         self._execute("INSERT INTO fill_allocations (exec_id, trade_id, shares, commission) VALUES (?,?,?,?)",
                       (exec_id, trade_id, shares, commission))
+
+    def add_exit_coverage(self, group_id: int, trade_ids: Iterable[int]) -> None:
+        """Relação EXPLÍCITA entre uma ordem de saída (grupo) e os trades que ela cobre (Z04)."""
+        for tid in trade_ids:
+            self._execute("INSERT OR IGNORE INTO exit_coverage (group_id, trade_id) VALUES (?,?)", (int(group_id), int(tid)))
+
+    def trades_for_order(self, order_id: int, symbol: Optional[str] = None) -> list[dict[str, Any]]:
+        """Trades que uma ordem de saída cobre: os dos grupos onde a ordem é/foi perna (ativa ou arquivada) e os
+        ligados explicitamente em ``exit_coverage``. Nunca inclui outros trades do mesmo ativo (Z04)."""
+        groups = [int(r["id"]) for r in self._query(
+            """SELECT id FROM order_groups WHERE parent_order_id=? OR tp_order_id=? OR sl_order_id=?
+               OR id IN (SELECT group_id FROM order_history WHERE order_id=?)""", (order_id, order_id, order_id, order_id))]
+        if not groups:
+            return []
+        marks = ",".join("?" * len(groups))
+        where_symbol = "AND symbol=?" if symbol else ""
+        rows = self._query(
+            f"""SELECT * FROM trades WHERE (group_id IN ({marks}) OR id IN (SELECT trade_id FROM exit_coverage WHERE group_id IN ({marks})))
+                {where_symbol} ORDER BY id""", (*groups, *groups, *([symbol] if symbol else [])))
+        if not rows:
+            # Fecho por sinal gravado por uma versão anterior (sem ``exit_coverage``): cobre, por CRONOLOGIA, os trades do
+            # ativo abertos ANTES da ordem de fecho — nunca os abertos depois (Z04).
+            for g in self._query(f"SELECT * FROM order_groups WHERE id IN ({marks}) AND role='CLOSE'", groups):
+                rows += self._query(
+                    """SELECT * FROM trades WHERE symbol=? AND filled_qty > 0 AND COALESCE(entry_ts, '') <= ?
+                       AND id NOT IN (SELECT trade_id FROM exit_coverage) ORDER BY id""", (g["symbol"], g["ts"]))
+        return rows
+
+    def record_late_exit_fill(self, trade_id: int, shares: float, price: float, ts: datetime, reason: str,
+                              commission: float = 0.0) -> dict[str, Any]:
+        """Execução que chega DEPOIS do trade ter sido fechado por reconciliação (sem execução disponível): corrige a
+        quantidade saída e o P&L desse trade sem o reabrir (Z04/Z05)."""
+        trade = self._query("SELECT * FROM trades WHERE id=?", (trade_id,))[0]
+        direction = int(trade["direction"])
+        entry = float(trade["entry_price"] or price)
+        gross_increment = (price - entry) * shares * direction
+        exit_qty = float(trade["exit_qty"] or 0) + shares
+        self._execute(
+            """UPDATE trades SET exit_qty=?, exit_price=?, exit_reason=?, gross_pnl=gross_pnl+?, pnl=pnl+?-?, commission=commission+?
+               WHERE id=?""",
+            (exit_qty, price, reason, gross_increment, gross_increment, commission, commission, trade_id))
+        return self._query("SELECT * FROM trades WHERE id=?", (trade_id,))[0]
 
     def allocations_for_fill(self, exec_id: str) -> list[dict[str, Any]]:
         return self._query("SELECT * FROM fill_allocations WHERE exec_id=? ORDER BY id", (exec_id,))
@@ -1106,6 +1191,10 @@ class Database:
     def get_kv(self, key: str, default: Optional[str] = None) -> Optional[str]:
         rows = self._query("SELECT value FROM kv WHERE key=?", (key,))
         return rows[0]["value"] if rows else default
+
+    def kv_with_prefix(self, prefix: str) -> dict[str, str]:
+        rows = self._query("SELECT key, value FROM kv WHERE key LIKE ? AND value IS NOT NULL AND value != ''", (prefix + "%",))
+        return {r["key"][len(prefix):]: r["value"] for r in rows}
 
     def set_kv(self, key: str, value: str) -> None:
         self._execute(

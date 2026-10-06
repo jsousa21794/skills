@@ -191,10 +191,13 @@ def test_d07_aggregated_exit_is_distributed_across_open_trades():
     r1 = db._query("SELECT exit_qty, status FROM trades WHERE id=?", (t1,))[0]
     r2 = db._query("SELECT exit_qty, status FROM trades WHERE id=?", (t2,))[0]
     assert r1["exit_qty"] <= 50 and r2["exit_qty"] <= 50 and r1["exit_qty"] + r2["exit_qty"] == 80
-    assert db.open_adjustment_qty(t1) + db.open_adjustment_qty(t2) == 0  # o ajuste provisório de 20 foi consumido
-    # a posição desapareceu na corretora: as 20 restantes do ledger são reconciliadas, sem exit_qty > filled_qty
+    # a saída NOVA fecha as 80 vivas e não explica as 20 que saíram antes: o ajuste provisório mantém-se (Z05)
+    assert db.open_adjustment_qty(t1) + db.open_adjustment_qty(t2) == 20 and engine._own_qty("AAPL") == 0
+    # a posição desapareceu na corretora: as 20 restantes do ledger são reconciliadas, sem exit_qty > filled_qty;
+    # o resultado fica assinalado como indeterminado até chegar a execução que as explique
     client.portfolio_state = lambda: {"positions": []}
     client.ib.positions = lambda: []
     asyncio.run(engine._supervise())
     rows = db._query("SELECT exit_qty, filled_qty, status FROM trades WHERE id IN (?, ?)", (t1, t2))
     assert all(r["exit_qty"] <= r["filled_qty"] and r["status"] == "CLOSED" for r in rows)
+    assert db.get_kv("conflict:AAPL") and "AAPL" not in engine._discrepancies

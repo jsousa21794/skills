@@ -455,4 +455,4 @@ def test_f38_close_commission_is_split_over_the_trades_it_closed(monkeypatch):
 
 # ---------------------------------------------------------------- F40
 def test_f40_version_matches_release_line():
-    assert __version__ == "1.0.8"
+    assert __version__ == "1.0.9"
