@@ -254,7 +254,8 @@ DECISION_COLUMNS = {
 HISTORY_COLUMNS = {"perm_id": "INTEGER"}
 ADJUSTMENT_COLUMNS = {"order_ids": "TEXT"}  # saídas vivas no instante do ajuste: só as suas execuções o explicam (Z05)
 TRADE_COLUMNS = {"decision_action": "TEXT", "stop_price": "REAL", "tp_price": "REAL", "risk_amount": "REAL",
-                 "commission": "REAL NOT NULL DEFAULT 0", "gross_pnl": "REAL NOT NULL DEFAULT 0", "account": "TEXT"}
+                 "commission": "REAL NOT NULL DEFAULT 0", "gross_pnl": "REAL NOT NULL DEFAULT 0", "account": "TEXT",
+                 "reconciled_ts": "TEXT"}  # instante da reconciliação, separado da data real de saída (AA06)
 FILL_COLUMNS = {"commission": "REAL", "commission_estimated": "INTEGER NOT NULL DEFAULT 1", "account": "TEXT",
                 "client_id": "INTEGER", "perm_id": "INTEGER", "order_ref": "TEXT", "con_id": "INTEGER"}  # identidade original (X02)
 GROUP_COLUMNS = {"account": "TEXT", "con_id": "INTEGER", "order_ref": "TEXT"}
@@ -846,8 +847,10 @@ class Database:
         self._execute(sql, params)
 
     def unallocated_fills(self, symbol: Optional[str] = None, order_id: Optional[int] = None) -> list[dict[str, Any]]:
-        """Execuções registadas que ainda não tocaram em nenhum trade (identidade indisponível na altura)."""
-        sql = "SELECT f.* FROM fills f WHERE NOT EXISTS (SELECT 1 FROM fill_allocations a WHERE a.exec_id = f.exec_id)"
+        """Execuções registadas com saldo POR ALOCAR: ``shares`` menos a soma das alocações já feitas (AA03). Inclui as
+        parcialmente alocadas (ex.: saída recebida antes do resto da entrada); ``remaining`` é o saldo recuperável."""
+        sql = """SELECT f.*, f.shares - COALESCE((SELECT SUM(a.shares) FROM fill_allocations a WHERE a.exec_id = f.exec_id), 0) AS remaining
+                 FROM fills f WHERE f.shares - COALESCE((SELECT SUM(a.shares) FROM fill_allocations a WHERE a.exec_id = f.exec_id), 0) > 1e-9"""
         params: list[Any] = []
         if symbol:
             sql += " AND f.symbol=?"
@@ -914,8 +917,9 @@ class Database:
         return int(cur.lastrowid)
 
     def close_trade_reconciled(self, trade_id: int, reason: str = "RECONCILED") -> None:
-        self._execute("UPDATE trades SET status='CLOSED', exit_ts=?, exit_reason=? WHERE id=? AND status='OPEN'",
-                      (iso(utc_now()), reason, trade_id))
+        now = iso(utc_now())
+        self._execute("UPDATE trades SET status='CLOSED', exit_ts=?, reconciled_ts=?, exit_reason=? WHERE id=? AND status='OPEN'",
+                      (now, now, reason, trade_id))
 
     def trade_for_group(self, group_id: int) -> Optional[dict[str, Any]]:
         rows = self._query("SELECT * FROM trades WHERE group_id=? ORDER BY id DESC LIMIT 1", (group_id,))
@@ -1084,12 +1088,26 @@ class Database:
         for tid in trade_ids:
             self._execute("INSERT OR IGNORE INTO exit_coverage (group_id, trade_id) VALUES (?,?)", (int(group_id), int(tid)))
 
-    def trades_for_order(self, order_id: int, symbol: Optional[str] = None) -> list[dict[str, Any]]:
+    def trades_for_order(self, order_id: int, symbol: Optional[str] = None, perm_id: Optional[int] = None,
+                         group_id: Optional[int] = None) -> list[dict[str, Any]]:
         """Trades que uma ordem de saída cobre: os dos grupos onde a ordem é/foi perna (ativa ou arquivada) e os
-        ligados explicitamente em ``exit_coverage``. Nunca inclui outros trades do mesmo ativo (Z04)."""
+        ligados explicitamente em ``exit_coverage``. Nunca inclui outros trades do mesmo ativo (Z04). A identidade
+        PERMANENTE acompanha a consulta (AA02): um grupo cujo ``permId`` conhecido para esta ordem difere do da
+        execução fica excluído (orderId reutilizado entre sessões); ``group_id`` é o grupo já validado no callback."""
         groups = [int(r["id"]) for r in self._query(
             """SELECT id FROM order_groups WHERE parent_order_id=? OR tp_order_id=? OR sl_order_id=?
                OR id IN (SELECT group_id FROM order_history WHERE order_id=?)""", (order_id, order_id, order_id, order_id))]
+        if symbol:
+            groups = [g for g in groups if self._query("SELECT 1 FROM order_groups WHERE id=? AND symbol=?", (g, symbol))]
+        if perm_id:
+            kept = []
+            for g in groups:
+                known = self.perm_id_for(g, int(order_id))
+                if known is None or int(known) == int(perm_id):
+                    kept.append(g)
+            groups = kept
+        if group_id is not None and int(group_id) not in groups:
+            groups.append(int(group_id))
         if not groups:
             return []
         marks = ",".join("?" * len(groups))
@@ -1115,14 +1133,25 @@ class Database:
         entry = float(trade["entry_price"] or price)
         gross_increment = (price - entry) * shares * direction
         exit_qty = float(trade["exit_qty"] or 0) + shares
+        # Data de fecho = execução comprovada mais recente que completa a saída; a data da reconciliação fica à parte (AA06).
+        when = iso(ts)
+        current = trade.get("exit_ts")
+        if current is None or current == trade.get("reconciled_ts") or when > current:
+            exit_ts = when
+        else:
+            exit_ts = current
         self._execute(
-            """UPDATE trades SET exit_qty=?, exit_price=?, exit_reason=?, gross_pnl=gross_pnl+?, pnl=pnl+?-?, commission=commission+?
-               WHERE id=?""",
-            (exit_qty, price, reason, gross_increment, gross_increment, commission, commission, trade_id))
+            """UPDATE trades SET exit_qty=?, exit_price=?, exit_ts=?, exit_reason=?, gross_pnl=gross_pnl+?, pnl=pnl+?-?,
+               commission=commission+? WHERE id=?""",
+            (exit_qty, price, exit_ts, reason, gross_increment, gross_increment, commission, commission, trade_id))
         return self._query("SELECT * FROM trades WHERE id=?", (trade_id,))[0]
 
     def allocations_for_fill(self, exec_id: str) -> list[dict[str, Any]]:
         return self._query("SELECT * FROM fill_allocations WHERE exec_id=? ORDER BY id", (exec_id,))
+
+    def allocated_shares(self, exec_id: str) -> float:
+        rows = self._query("SELECT COALESCE(SUM(shares), 0) AS q FROM fill_allocations WHERE exec_id=?", (exec_id,))
+        return float(rows[0]["q"] or 0.0)
 
     def commissions_since(self, since: datetime) -> float:
         rows = self._query("SELECT COALESCE(SUM(commission), 0) AS c FROM fills WHERE ts >= ?", (iso(since),))

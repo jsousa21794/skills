@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import hashlib
 import json
 import logging
 import secrets
@@ -72,10 +73,19 @@ class RemoteSupervisor:
         except Exception as exc:  # noqa: BLE001
             log.warning("Auditoria MCP falhou para %s: %s", tool, exc)
 
+    # ---- identidade do contexto
+    def context_id(self) -> str:
+        """Identificador OPACO e único do contexto operacional (conta completa, modo, geração, base de dados): devolvido
+        em ``get_status`` e exigido no comando, para que a identidade validada seja a que o cliente consultou — a máscara
+        da conta é só apresentação e pode colidir entre contas (AA05)."""
+        raw = f"{self.engine.ibkr.account or ''}|{self.settings.trading_mode}|{self.engine.generation}|{self.engine.db.path}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
     # ---- consultas
     def status(self) -> dict[str, Any]:
         snap = self.engine.remote_snapshot()
         snap["server_time_utc"] = datetime.now(timezone.utc).isoformat()
+        snap["context_id"] = self.context_id()
         self._audit("get_status", {}, {"ok": True})
         return snap
 
@@ -264,14 +274,24 @@ class RemoteSupervisor:
         return {"commands": self.db.recent_remote_commands(max(1, min(int(limit), 500)))}
 
     # ---- comando
-    async def pause_entries(self, account: str, mode: str, reason: str) -> dict[str, Any]:
+    async def pause_entries(self, account: str, mode: str, reason: str, context_id: str = "") -> dict[str, Any]:
         """Validação no servidor: conta e modo têm de coincidir com o estado atual; a identidade EXATA (conta completa,
         modo, geração, base de dados) segue com o comando e é revalidada no loop do motor imediatamente antes da
         escrita (Z08) — a máscara serve só para apresentação."""
         expected_mode = self.settings.trading_mode
         exact_account = self.engine.ibkr.account
         expected_acct = mask_account(exact_account)
-        args = {"account": account, "mode": mode, "reason": reason}
+        args = {"account": account, "mode": mode, "reason": reason, "context_id": context_id}
+        current_context = self.context_id()
+        if not (context_id or "").strip():
+            result = {"applied": False, "error": "indica o context_id devolvido por get_status (identidade do contexto consultado)"}
+            self._audit("pause_new_entries", args, result)
+            return result
+        if (context_id or "").strip() != current_context:
+            result = {"applied": False, "error": "contexto mudou desde a consulta (conta, modo, geração ou base de dados): "
+                                                  "volta a chamar get_status e repete o pedido com o novo context_id"}
+            self._audit("pause_new_entries", args, result)
+            return result
         if (mode or "").strip().lower() != expected_mode:
             result = {"applied": False, "error": f"modo '{mode}' não coincide com o modo atual '{expected_mode}'"}
             self._audit("pause_new_entries", args, result)
@@ -356,10 +376,11 @@ def build_server(supervisor: RemoteSupervisor) -> Any:
         return supervisor.remote_commands(limit)
 
     @server.tool(name="pause_new_entries", description="ÚNICO comando: pausa persistente e idempotente de NOVAS entradas. Exige a conta (como "
-                                                       "mostrada em get_status) e o modo atuais, e uma razão. Não cancela entradas já enviadas, "
+                                                       "mostrada em get_status), o modo atuais, o context_id devolvido por get_status e uma razão. "
+                                                       "Não cancela entradas já enviadas, "
                                                        "não remove proteções nem desliga a supervisão. Retomar só é possível na interface local.")
-    async def pause_new_entries(account: str, mode: str, reason: str) -> dict[str, Any]:
-        return await supervisor.pause_entries(account, mode, reason)
+    async def pause_new_entries(account: str, mode: str, reason: str, context_id: str) -> dict[str, Any]:
+        return await supervisor.pause_entries(account, mode, reason, context_id=context_id)
 
     return server
 

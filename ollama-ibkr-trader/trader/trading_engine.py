@@ -691,7 +691,10 @@ class TradingEngine:
                 log.critical("Posição %s x%g NÃO foi aberta pelo bot: não é gerida, fechada nem protegida "
                              "(manage_external_positions=False). Sinais para %s ficam bloqueados.", symbol, pos["qty"], symbol)
                 continue
-            await self._protect_if_naked(symbol, pos)
+            if symbol in self._pending_close:
+                continue
+            # A MESMA classificação da supervisão (inversão, redução, excesso, lado errado) antes de qualquer proteção (AA01).
+            await self._supervise_symbol(symbol, pos)
         self._reconciled = True
 
     def _restore_pending_orders(self) -> None:
@@ -742,7 +745,14 @@ class TradingEngine:
     async def _protect_if_naked_locked(self, symbol: str, pos: dict[str, Any]) -> None:
         if symbol in self._pending_close or symbol in self._external_positions:
             return
-        own = abs(self._own_qty(symbol))
+        own_signed = self._own_qty(symbol)
+        own = abs(own_signed)
+        if own > 1e-9 and float(pos["qty"]) != 0 and (own_signed > 0) != (float(pos["qty"]) > 0):
+            # A posição na corretora tem o sinal CONTRÁRIO ao do ledger: proteger "pelo valor absoluto" colocaria ordens a
+            # favor de uma posição que o bot não abriu (AA01). Conflito explícito; a supervisão trata a inversão.
+            self._mark_conflict(symbol, "posição invertida fora do bot")
+            log.critical("[%s] Proteção RECUSADA: ledger %+g vs corretora %+g (sinais opostos).", symbol, own_signed, float(pos["qty"]))
+            return
         if own <= 1e-9 and not self.settings.manage_external_positions and self.db.open_trades(symbol):
             # Há trades abertos mas nada da posição é do bot (tudo explicado por ajustes provisórios, ou entrada ainda
             # sem execução): nunca se colocam ordens sobre uma posição que o bot não abriu, em nenhum ciclo nem após
@@ -833,43 +843,49 @@ class TradingEngine:
             if not pos:
                 await self._reconcile_vanished_position(symbol)
                 continue
-            own_signed = self._own_qty(symbol)
-            broker_signed = float(pos["qty"])
-            if own_signed != 0 and broker_signed != 0 and (own_signed > 0) != (broker_signed > 0):
-                await self._reconcile_reversed_position(symbol, pos, own_signed, broker_signed)
-                continue
-            if own_signed == 0 and broker_signed != 0 and not self.settings.manage_external_positions \
-                    and self.db.open_adjustments_for_symbol(symbol) > 1e-9:
-                await self._hold_external_conflict(symbol, pos)
-                continue
-            own = abs(own_signed)
-            broker = abs(broker_signed)
-            if own > broker + 1e-6:
-                await self._reconcile_reduced_position(symbol, pos, own, broker)
-                continue
-            mixed = not self.settings.manage_external_positions and own > 0 and broker > own + 1e-6
-            needed = own if mixed else None
-            if self.ibkr.wrong_side_exit_quantity(symbol) > 1e-9 or self.ibkr.has_excess_exits(symbol, allowed_qty=needed):
-                await self._resize_exits(symbol, pos, needed, "saídas do bot maiores do que a posição ou do lado errado")
-                continue
-            if self.db.open_adjustments_for_symbol(symbol) > 1e-9:
-                self._discrepancies.add(symbol)  # ajuste provisório por explicar: bloqueio persiste até à execução real (Y03/Y06)
-            else:
-                self._discrepancies.discard(symbol)
-                if self.db.open_adjustments_for_symbol(symbol, include_closed=True) <= 1e-9:
-                    self._resolve_conflict(symbol)
-            if not self.ibkr.has_protective_orders(symbol, needed_qty=needed, ours_only=mixed):
-                log.critical("[%s] Posição x%g SEM cobertura completa (stops ativos %.0f): a repor proteção.",
-                             symbol, pos["qty"], self.ibkr.protective_coverage(symbol))
-                await self._protect_if_naked(symbol, pos)
-            elif self.ibkr.has_orphan_children(symbol):
-                log.warning("[%s] Par de proteção incompleto (TP sem stop ou stop sem TP): a repor o par.", symbol)
-                await self._protect_if_naked(symbol, pos)
+            await self._supervise_symbol(symbol, pos)
         for symbol, pc in list(self._pending_close.items()):
             if pc.get("state") == "CLOSING":
                 continue  # fecho em curso dentro do lock do ativo
             if (now - pc["ts"]).total_seconds() > 600 and self.ibkr.position_qty(symbol) == 0:
                 self._pending_close.pop(symbol, None)
+
+    async def _supervise_symbol(self, symbol: str, pos: dict[str, Any]) -> None:
+        """Classificação ÚNICA de um ativo gerido com posição na corretora — direção, titularidade, redução, excesso,
+        lado errado e só depois cobertura — usada pela supervisão periódica E pelo arranque (AA01): o primeiro
+        contacto após um período desligado nunca repõe proteção antes de reconhecer um conflito."""
+        own_signed = self._own_qty(symbol)
+        broker_signed = float(pos["qty"])
+        if own_signed != 0 and broker_signed != 0 and (own_signed > 0) != (broker_signed > 0):
+            await self._reconcile_reversed_position(symbol, pos, own_signed, broker_signed)
+            return
+        if own_signed == 0 and broker_signed != 0 and not self.settings.manage_external_positions \
+                and self.db.open_adjustments_for_symbol(symbol) > 1e-9:
+            await self._hold_external_conflict(symbol, pos)
+            return
+        own = abs(own_signed)
+        broker = abs(broker_signed)
+        if own > broker + 1e-6:
+            await self._reconcile_reduced_position(symbol, pos, own, broker)
+            return
+        mixed = not self.settings.manage_external_positions and own > 0 and broker > own + 1e-6
+        needed = own if mixed else None
+        if self.ibkr.wrong_side_exit_quantity(symbol) > 1e-9 or self.ibkr.has_excess_exits(symbol, allowed_qty=needed):
+            await self._resize_exits(symbol, pos, needed, "saídas do bot maiores do que a posição ou do lado errado")
+            return
+        if self.db.open_adjustments_for_symbol(symbol) > 1e-9:
+            self._discrepancies.add(symbol)  # ajuste provisório por explicar: bloqueio persiste até à execução real (Y03/Y06)
+        else:
+            self._discrepancies.discard(symbol)
+            if self.db.open_adjustments_for_symbol(symbol, include_closed=True) <= 1e-9:
+                self._resolve_conflict(symbol)
+        if not self.ibkr.has_protective_orders(symbol, needed_qty=needed, ours_only=mixed):
+            log.critical("[%s] Posição x%g SEM cobertura completa (stops ativos %.0f): a repor proteção.",
+                         symbol, pos["qty"], self.ibkr.protective_coverage(symbol))
+            await self._protect_if_naked(symbol, pos)
+        elif self.ibkr.has_orphan_children(symbol):
+            log.warning("[%s] Par de proteção incompleto (TP sem stop ou stop sem TP): a repor o par.", symbol)
+            await self._protect_if_naked(symbol, pos)
 
     async def _hold_external_conflict(self, symbol: str, pos: dict[str, Any]) -> None:
         """Toda a quantidade própria está explicada por ajustes provisórios e a corretora ainda mostra posição: o que
@@ -1509,12 +1525,20 @@ class TradingEngine:
                                   client_id=int(client_id) if client_id not in (None, "") else None, perm_id=perm_id,
                                   order_ref=exec_ref, con_id=getattr(fill.contract, "conId", None) or None)
         if not new:
-            # Já registada: só volta a ser processada se ainda não tocou em nenhum trade (reconciliação, W03).
-            if self.db.allocations_for_fill(execution.execId):
+            # Já registada: só o SALDO por alocar volta a ser processado (idempotente) — uma execução parcialmente
+            # alocada (saída recebida antes do resto da entrada) não se perde da recuperação (W03/AA03).
+            allocated = self.db.allocated_shares(execution.execId)
+            if allocated >= float(execution.shares) - 1e-9:
                 return
             stored = self.db.fill_by_exec(execution.execId)
             if stored is not None:
                 commission_value = float(stored.get("commission") or commission_value)
+            if allocated > 1e-9:
+                total = float(execution.shares)
+                remaining_shares = total - allocated
+                commission_value = commission_value * remaining_shares / max(total, 1e-9)
+                execution = SimpleNamespace(**{k: getattr(execution, k) for k in dir(execution) if not k.startswith("_")})
+                execution.shares = remaining_shares
         if new:
             log.info("Execução %s %s x%g @ %.2f (ordem %d) · comissão %.2f USD%s", symbol, execution.side, execution.shares,
                      execution.price, execution.orderId, commission_value, " (estimada)" if estimated else "",
@@ -1542,9 +1566,12 @@ class TradingEngine:
                     entry["filled"] += float(execution.shares)
                     if entry["filled"] + 1e-9 >= entry["qty"]:
                         self._pending_entries.pop(execution.orderId, None)
+                if not reprocess and self.db.unallocated_fills(symbol):
+                    # Uma saída recebida ANTES deste resto da entrada ficou com saldo por alocar: recupera-o agora (AA03).
+                    self._reconcile_unallocated_fills(symbol)
             else:
                 reason = "TP" if leg == "TP" else "SL"  # inclui filhos já substituídos (order_history, N07)
-                self._allocate_exit(symbol, trade_id, execution, ts, reason, commission_value)
+                self._allocate_exit(symbol, trade_id, execution, ts, reason, commission_value, group_id=int(group["id"]))
         elif group["role"] == "CLOSE":
             self._allocate_exit(symbol, None, execution, ts, "SIGNAL", commission_value, group_id=int(group["id"]))
             pc = self._pending_close.get(symbol)
@@ -1563,7 +1590,8 @@ class TradingEngine:
         shares = float(execution.shares)
         remaining = shares
         order_id = int(execution.orderId or 0)
-        covered = self.db.trades_for_order(order_id, symbol=symbol)
+        covered = self.db.trades_for_order(order_id, symbol=symbol, perm_id=getattr(execution, "permId", None) or None,
+                                           group_id=group_id)  # identidade completa até à cobertura (AA02)
         if group_id is not None:
             covered_ids = {int(r["id"]) for r in covered}
             covered += [r for r in self.db._query("SELECT * FROM trades WHERE id IN (SELECT trade_id FROM exit_coverage WHERE group_id=?)",
@@ -1592,6 +1620,7 @@ class TradingEngine:
                 log.warning("Trade #%d %s (fechado por %s) corrigido por execução tardia %s: %g ações @ %.2f, P&L bruto %+.2f.",
                             row["id"], symbol, row.get("exit_reason"), execution.execId, portion, float(execution.price),
                             float(updated.get("gross_pnl") or 0.0))
+                self._relabel_decision(updated)
             self.db.allocate_fill(execution.execId, int(row["id"]), portion, share)
             remaining -= portion
         if remaining > 1e-9:
@@ -1600,6 +1629,25 @@ class TradingEngine:
                          "alocar (discrepância registada).", symbol, execution.execId, shares, order_id, remaining)
         elif self.db.open_adjustments_for_symbol(symbol, include_closed=True) <= 1e-9 and self.db.get_kv(f"conflict:{symbol}"):
             self._resolve_conflict(symbol)  # as execuções explicaram toda a diferença
+        elif not self.db.unallocated_fills(symbol) and self.db.open_adjustments_for_symbol(symbol, include_closed=True) <= 1e-9:
+            self._discrepancies.discard(symbol)  # saldo por alocar recuperado na totalidade (AA03); o supervisor revalida o resto
+
+    def _relabel_decision(self, trade_row: dict[str, Any]) -> None:
+        """Uma correção tardia que muda o resultado de um trade encerrado atualiza, na mesma operação lógica, o rótulo
+        FINAL da decisão associada e marca ``labels_changed_at`` (invalida a calibração dependente) (AA04)."""
+        decision_id = trade_row.get("decision_id")
+        if not decision_id:
+            return
+        rows = self.db._query("SELECT settled_ts, correct, label_source FROM decisions WHERE id=?", (int(decision_id),))
+        if not rows or rows[0]["settled_ts"] is None:
+            return  # ainda não avaliada: o avaliador usará o ledger já corrigido
+        label, source = Settler._ledger_label(trade_row, datetime.now(timezone.utc))
+        source = source or "ledger:OUTRO"
+        if rows[0]["correct"] == label and rows[0]["label_source"] == source:
+            return
+        self.db.finalize_label(int(decision_id), correct=label, label_source=source)
+        log.warning("Decisão #%d: rótulo final atualizado por execução tardia (%s -> %s, acerto %s).",
+                    int(decision_id), rows[0]["label_source"], source, label)
 
     def _on_commission(self, trade: Any, fill: Any, report: Any) -> None:
         """CommissionReport real da IBKR: substitui a estimativa e corrige exatamente os trades que a execução tocou."""

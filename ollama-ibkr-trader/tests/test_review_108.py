@@ -214,6 +214,7 @@ def test_e08_mcp_pause_is_refused_when_the_account_changes_before_it_is_applied(
     engine.ibkr.account = "U11111"
     sup = RemoteSupervisor(engine, s, db)
     first_mask = mask_account(engine.ibkr.account)
+    ctx = sup.context_id()
 
     def queued_after_account_switch(coro):
         engine.ibkr.account = "U22222"
@@ -228,7 +229,7 @@ def test_e08_mcp_pause_is_refused_when_the_account_changes_before_it_is_applied(
         return f
 
     engine.call = queued_after_account_switch
-    result = asyncio.run(sup.pause_entries(first_mask, s.trading_mode, "pedido para conta anterior"))
+    result = asyncio.run(sup.pause_entries(first_mask, s.trading_mode, "pedido para conta anterior", context_id=ctx))
     assert result["applied"] is False and "conta" in result["error"] and not engine.entries_paused
     assert db.get_kv("entries_paused") is None
     record = db.recent_remote_commands()[0]
@@ -238,6 +239,7 @@ def test_e08_mcp_pause_is_refused_when_the_account_changes_before_it_is_applied(
 def test_z08_mcp_pause_is_refused_when_only_the_generation_changes():
     engine, db, s = make_engine()
     sup = RemoteSupervisor(engine, s, db)
+    ctx = sup.context_id()
 
     def queued_after_restart(coro):
         engine.generation += 1  # paragem/reinício do ciclo entre a validação e a aplicação
@@ -250,5 +252,5 @@ def test_z08_mcp_pause_is_refused_when_only_the_generation_changes():
         return f
 
     engine.call = queued_after_restart
-    result = asyncio.run(sup.pause_entries(mask_account(engine.ibkr.account), s.trading_mode, "geração anterior"))
+    result = asyncio.run(sup.pause_entries(mask_account(engine.ibkr.account), s.trading_mode, "geração anterior", context_id=ctx))
     assert result["applied"] is False and not engine.entries_paused

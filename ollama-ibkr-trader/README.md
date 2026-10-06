@@ -23,11 +23,41 @@ escuro).
 > de perda aplicam-se o StoplossGuard, o travão de perdas seguidas e o cooldown
 > após saída em perda. Tudo ajustável em `config.json` (validado ao carregar).
 >
-> Versão 1.0.9: resposta à revisão da 1.0.8 (8 achados, 1 P0), ver
-> `../reports/Resposta à revisão 1.0.8.md`; antes, as respostas às revisões
+> Versão 1.0.10: resposta à revisão da 1.0.9 (6 achados, 1 P0), ver
+> `../reports/Resposta à revisão 1.0.9.md`; antes, as respostas às revisões
 > anteriores e à auditoria da 1.0.2 na mesma pasta.
 
-## Invariantes de segurança (1.0.9)
+## Invariantes de segurança (1.0.10)
+
+- **Arranque = supervisão**: no primeiro contacto após um período desligado,
+  cada ativo gerido com posição passa pela MESMA classificação da supervisão
+  periódica (inversão de sinal, quantidade própria zero, redução, excesso,
+  lado errado) antes de qualquer reposição de proteção; uma inversão ocorrida
+  com o programa desligado cancela as saídas antigas, regista o conflito e não
+  coloca nenhuma ordem. A reposição de proteção recusa, por si só, uma posição
+  com sinal contrário ao do ledger.
+- **Identidade permanente até à alocação**: a distribuição de uma execução de
+  saída exclui grupos cujo `permId` conhecido para essa ordem difere do da
+  execução (orderId reutilizado entre sessões) e inclui sempre o grupo validado
+  no callback.
+- **Saldo por alocar é recuperável**: uma execução parcialmente alocada (saída
+  recebida antes do resto da entrada) fica na fila de recuperação com o saldo
+  `shares − alocado`; o resto da entrada recupera-a automaticamente, de forma
+  idempotente; a discrepância só sai quando o total está explicado.
+- **Correção tardia atualiza o rótulo**: quando uma execução tardia muda o
+  resultado de um trade já encerrado, a decisão associada (se já avaliada)
+  recebe o rótulo final do ledger na mesma operação e `labels_changed_at`
+  invalida a calibração dependente.
+- **Contexto opaco no comando remoto**: `get_status` devolve `context_id`
+  (conta completa, modo, geração e base de dados); `pause_new_entries` exige-o
+  e recusa qualquer divergência — a máscara da conta é só apresentação e pode
+  colidir entre contas.
+- **Data de saída = execução comprovada**: um trade reconciliado guarda
+  `reconciled_ts` à parte; a correção tardia põe em `exit_ts` a execução mais
+  recente que completa a saída (nunca a data da reconciliação), para que
+  contadores de stops recentes e relatórios usem a cronologia real.
+
+## Invariantes de segurança herdados (1.0.9)
 
 - **Conflito externo persistente**: uma redução ou inversão fora do bot fica
   gravada na base de dados (`conflict:<ativo>`) e sobrevive a reinícios; quando
@@ -453,7 +483,8 @@ lateral. A camada de risco continua local e independente da IA.
    Clientes que suportem cabeçalhos podem usar `Authorization: Bearer <token>`.
 4. Cada chamada fica registada em `remote_commands` (autor, pedido, instante,
    conta mascarada, modo, resultado). A pausa exige a conta (como mostrada em
-   `get_status`) e o modo atuais, e uma razão; a identidade exata validada
+   `get_status`), o modo atuais, o `context_id` devolvido por `get_status` e
+   uma razão; a identidade exata validada
    segue com o comando e é reavaliada no motor antes de escrever; só é
    confirmada depois de aplicada e persistida na base da conta validada.
 5. `compare_ledger_with_broker` devolve `status` = `consistent` |

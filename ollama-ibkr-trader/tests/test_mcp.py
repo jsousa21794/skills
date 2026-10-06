@@ -48,13 +48,14 @@ def test_pause_requires_matching_account_and_mode_and_is_idempotent_and_persiste
     try:
         monkeypatch.setattr("trader.trading_engine.datetime", _FixedDatetime)
         masked = mask_account(engine.ibkr.account)
-        assert asyncio.run(sup.pause_entries("XX", "live", "teste"))["applied"] is False
-        assert asyncio.run(sup.pause_entries(masked, "paper", "teste"))["applied"] is False
-        assert asyncio.run(sup.pause_entries(masked, "live", ""))["applied"] is False
+        ctx = sup.status()["context_id"]
+        assert asyncio.run(sup.pause_entries("XX", "live", "teste", context_id=ctx))["applied"] is False
+        assert asyncio.run(sup.pause_entries(masked, "paper", "teste", context_id=ctx))["applied"] is False
+        assert asyncio.run(sup.pause_entries(masked, "live", "", context_id=ctx))["applied"] is False
         assert db.get_kv("entries_paused") is None
-        first = asyncio.run(sup.pause_entries(masked, "live", "supervisão: dados desatualizados"))
+        first = asyncio.run(sup.pause_entries(masked, "live", "supervisão: dados desatualizados", context_id=ctx))
         assert first["applied"] is True and first["persisted"] is True and first["already_paused"] is False
-        second = asyncio.run(sup.pause_entries(masked, "live", "repetido"))
+        second = asyncio.run(sup.pause_entries(masked, "live", "repetido", context_id=ctx))
         assert second["applied"] is True and second["already_paused"] is True
         assert db.get_kv("entries_paused") == "1" and engine.entries_paused
         # o motor recusa novas entradas enquanto a pausa persistir; proteções e supervisão mantêm-se
