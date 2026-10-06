@@ -41,7 +41,7 @@ jobs:
           python-version: "3.12"
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y python3-tk
-      - run: pip install -r requirements.txt pyinstaller pytest
+      - run: pip install -r requirements.lock  # lock completo: runtime + PyInstaller + pytest (versões exatas)
       - name: Tests
         run: python -m pytest -q
       - run: pyinstaller --clean --noconfirm trader.spec

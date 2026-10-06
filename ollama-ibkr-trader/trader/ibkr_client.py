@@ -69,6 +69,19 @@ class IBKRClient:
         self.base_currency: str = ""
         self._hist_times: list[float] = []  # pacing de pedidos históricos
         self._hist_lock: Optional[asyncio.Lock] = None
+        self._cancelling: set[int] = set()  # ordens canceladas pelo bot (distinguir de rejeições)
+        self._fraction_warned: set[str] = set()
+
+    def _reset_session_state(self) -> None:
+        """Metadados que pertencem à sessão/conta anterior nunca sobrevivem a uma desligação (N09)."""
+        self._bars.clear()
+        self._contracts.clear()
+        self.accounts = []
+        self.account = ""
+        self.base_currency = ""
+        self.data_delayed = None
+        self._cancelling.clear()
+        self._fraction_warned.clear()
 
     # ----------------------------------------------------------- ligação
     @property
@@ -94,6 +107,8 @@ class IBKRClient:
             )
             self.ib.reqMarketDataType(self.settings.market_data_type)
             self._disconnect_handled = False
+            self.base_currency = ""  # detetada de novo para ESTA conta
+            self.data_delayed = None
             accounts = self.ib.managedAccounts()
             self.accounts = list(accounts)
             wanted = self.settings.ib_account.strip()
@@ -129,8 +144,7 @@ class IBKRClient:
     async def disconnect(self) -> None:
         if self.ib is not None and self.ib.isConnected():
             self.ib.disconnect()
-        self._bars.clear()
-        self._contracts.clear()
+        self._reset_session_state()
 
     def _handle_error(self, reqId: int, errorCode: int, errorString: str, contract: Any = None) -> None:
         # Códigos 2104/2106/2158 são mensagens informativas de "market data farm OK".
@@ -148,7 +162,7 @@ class IBKRClient:
             return
         self._disconnect_handled = True
         log.error("Ligação à IBKR perdida.")
-        self._bars.clear()
+        self._reset_session_state()
         if self._on_disconnect:
             self._on_disconnect()
 
@@ -336,6 +350,23 @@ class IBKRClient:
         rates = self._account_values("ExchangeRate")
         return rates.get(currency)
 
+    def display_rate(self, currency: str) -> tuple[str, float, bool]:
+        """(moeda, fator, exata) para converter montantes da moeda base na moeda de apresentação da GUI.
+
+        O fator multiplica um montante na moeda base; vem da tag ``ExchangeRate`` da conta. Sem taxa
+        conhecida (desligado ou moeda não cotada na conta) devolve a moeda base com fator 1 e ``exata=False``.
+        """
+        base = self._detect_base_currency() if self.connected else (self.base_currency or "USD")
+        wanted = (currency or "auto").strip().upper()
+        if wanted in ("", "AUTO", "CONTA") or wanted == base:
+            return base, 1.0, True
+        if not self.connected:
+            return base, 1.0, False
+        rate = self.exchange_rate(wanted)  # valor de 1 unidade de ``wanted`` em moeda base
+        if rate is None or rate <= 0:
+            return base, 1.0, False
+        return wanted, 1.0 / rate, True
+
     def _account_value(self, tag: str) -> Optional[float]:
         """Valor na moeda base (prefere a linha BASE; senão a da moeda base; senão qualquer)."""
         values = self._account_values(tag)
@@ -414,16 +445,25 @@ class IBKRClient:
         contract = self._contracts.get(symbol)
         return int(contract.conId) if contract is not None and contract.conId else None
 
+    def _same_account(self, order: Order) -> bool:
+        """Filtro de conta obrigatório: uma ordem de outra conta nunca conta para nada (N04)."""
+        acct = getattr(order, "account", "") or ""
+        return not self.account or not acct or acct == self.account
+
     def _is_ours(self, trade: Trade) -> bool:
         order = trade.order
-        if self.settings.order_ref and getattr(order, "orderRef", "") != self.settings.order_ref:
+        if not self._same_account(order):
             return False
-        if self.account and getattr(order, "account", "") and order.account != self.account:
+        if self.settings.order_ref and getattr(order, "orderRef", "") != self.settings.order_ref:
             return False
         return True
 
     def open_trades_for(self, symbol: str, ours_only: bool = True) -> list[Trade]:
-        """Ordens abertas do símbolo (por defeito só as do bot: orderRef e conta)."""
+        """Ordens abertas do símbolo na conta do bot; ``ours_only`` restringe ainda ao ``orderRef`` do bot.
+
+        O filtro de conta é independente do filtro de propriedade: ``ours_only=False`` continua a
+        excluir ordens de outras contas visíveis na mesma sessão da TWS.
+        """
         if not self.connected:
             return []
         assert self.ib is not None
@@ -433,9 +473,39 @@ class IBKRClient:
             if t.contract.secType != "STK":
                 continue
             same = (t.contract.conId == con_id) if con_id else (t.contract.symbol == symbol)
-            if same and (not ours_only or self._is_ours(t)):
+            if not same or not self._same_account(t.order):
+                continue
+            if not ours_only or self._is_ours(t):
                 out.append(t)
         return out
+
+    def our_open_orders(self) -> list[Trade]:
+        """Todas as ordens abertas do bot (orderRef + conta), para restaurar estado após reinício (N05)."""
+        if not self.connected:
+            return []
+        assert self.ib is not None
+        return [t for t in self.ib.openTrades() if t.contract.secType == "STK" and self._is_ours(t)]
+
+    def last_price(self, symbol: str) -> Optional[tuple[float, datetime]]:
+        """Último preço conhecido (fecho da vela em formação) e o seu instante (N15)."""
+        raw = self._bars.get(symbol)
+        if not raw:
+            return None
+        last = raw[-1]
+        return float(last.close), self.bar_time_utc(last)
+
+    # ----------------------------------------------------- cancelamentos
+    def cancel_trade(self, trade: Trade) -> None:
+        """Cancelamento intencional: fica registado para o motor o distinguir de uma rejeição (N02)."""
+        assert self.ib is not None
+        self._cancelling.add(int(trade.order.orderId))
+        self.ib.cancelOrder(trade.order)
+
+    def is_intentional_cancel(self, order_id: int) -> bool:
+        return int(order_id) in self._cancelling
+
+    def forget_cancel(self, order_id: int) -> None:
+        self._cancelling.discard(int(order_id))
 
     def recent_fills(self) -> list[Fill]:
         """Execuções já conhecidas pela sessão (ib_async carrega as do dia ao ligar)."""
@@ -469,17 +539,26 @@ class IBKRClient:
     async def place_bracket(
         self, symbol: str, action: str, quantity: int, ref_price: float, *,
         stop_price: float, tp_price: float, trailing: bool = False, limit_price: Optional[float] = None,
+        authorize: Optional[Callable[[], bool]] = None,
     ) -> Optional[dict[str, Any]]:
-        """Entrada a MERCADO com filhos TP (limit) e SL (stop ou trailing) ligados por ``parentId``.
+        """Entrada (limit marketable ou mercado) com filhos TP (limit) e SL (stop ou trailing) por ``parentId``.
 
         Os filhos partilham um ``ocaGroup`` (um cancela o outro) e são GTC explícitos:
         o default de ``tif`` cai em DAY e deixaria a posição sem proteção overnight.
+
+        ``authorize`` é o token de autorização do motor (geração + ciclo ativo); é reavaliado
+        depois de cada ``await`` e imediatamente antes de ``placeOrder`` (N01).
         """
         if not self.connected or quantity <= 0:
             return None
         assert self.ib is not None
         contract = await self.qualify(symbol)
         if contract is None:
+            return None
+        if authorize is not None and not authorize():
+            log.warning("Bracket %s %s x%d NÃO enviado: autorização revogada durante a qualificação.", action, symbol, quantity)
+            return None
+        if not self.connected:
             return None
         action = action.upper()
         reverse = "SELL" if action == "BUY" else "BUY"
@@ -516,6 +595,9 @@ class IBKRClient:
 
         for o in (parent, take_profit, stop_loss):
             self._tag(o)
+        if authorize is not None and not authorize():
+            log.warning("Bracket %s %s x%d NÃO enviado: autorização revogada antes de placeOrder.", action, symbol, quantity)
+            return None
         trades = [self.ib.placeOrder(contract, o) for o in (parent, take_profit, stop_loss)]
         log.info(
             "Bracket %s %s x%d @~%.2f | TP %.2f | SL %.2f%s (ids %d/%d/%d)",
@@ -538,8 +620,8 @@ class IBKRClient:
             return False
         assert self.ib is not None
         for t in self.ib.openTrades():
-            if t.order.orderId == order_id:
-                self.ib.cancelOrder(t.order)
+            if t.order.orderId == order_id and self._same_account(t.order):
+                self.cancel_trade(t)
                 return True
         return False
 
@@ -554,8 +636,54 @@ class IBKRClient:
             await asyncio.sleep(0.25)
         return all(t.isDone() for t in trades)
 
+    ACTIVE_STATUSES = ("PreSubmitted", "Submitted", "PendingSubmit", "ApiPending")
+    STOP_TYPES = ("STP", "TRAIL", "STP LMT")
+
+    @staticmethod
+    def _remaining(trade: Trade) -> float:
+        o, st = trade.order, trade.orderStatus
+        remaining = float(st.remaining) if st.remaining else float(o.totalQuantity) - float(st.filled or 0)
+        return max(0.0, remaining)
+
+    def _protective_children(self, symbol: str) -> list[Trade]:
+        """Ordens de saída ATIVAS do bot (TP limit e SL stop) do lado oposto à posição."""
+        qty = self.position_qty(symbol)
+        if qty == 0:
+            return []
+        needed_action = "SELL" if qty > 0 else "BUY"
+        out = []
+        for t in self.open_trades_for(symbol, ours_only=True):
+            o = t.order
+            if o.action != needed_action or t.orderStatus.status not in self.ACTIVE_STATUSES:
+                continue
+            if o.orderType in self.STOP_TYPES or o.orderType == "LMT":
+                out.append(t)
+        return out
+
+    def _orphan_children(self, symbol: str) -> list[Trade]:
+        """Filhos cujo grupo OCA perdeu a perna irmã (TP sem stop ou stop sem TP): candidatos a substituição (N07)."""
+        children = self._protective_children(symbol)
+        by_group: dict[str, list[Trade]] = {}
+        for t in children:
+            by_group.setdefault(getattr(t.order, "ocaGroup", "") or f"solo-{t.order.orderId}", []).append(t)
+        orphans: list[Trade] = []
+        for legs in by_group.values():
+            has_stop = any(t.order.orderType in self.STOP_TYPES for t in legs)
+            has_tp = any(t.order.orderType == "LMT" for t in legs)
+            if not (has_stop and has_tp):
+                orphans.extend(legs)
+        return orphans
+
     async def ensure_protection(self, symbol: str, *, stop_price: float, tp_price: float) -> Optional[dict[str, Any]]:
-        """Coloca TP+SL (OCA, GTC) numa posição que ficou sem ordens de proteção."""
+        """Repõe cobertura TP+SL (OCA, GTC) só na quantidade que FALTA cobrir (N03).
+
+        1. Filhos órfãos (TP sem stop ou stop sem TP, do bot) são cancelados e esperados: nunca
+           coexistem duas saídas para as mesmas ações.
+        2. A cobertura é recalculada e só o residual (posição − stops ativos) recebe um novo par.
+        3. Frações abaixo de uma ação não são negociáveis por API: ficam registadas e assinaladas
+           uma vez, sem gerar ordens repetidas.
+        A reposição de cobertura é uma ação de redução de risco: continua permitida depois de Parar.
+        """
         if not self.connected:
             return None
         assert self.ib is not None
@@ -567,11 +695,28 @@ class IBKRClient:
         contract = await self.qualify(symbol)
         if contract is None:
             return None
-        reverse = "SELL" if qty > 0 else "BUY"
-        n = self._order_qty(qty)
-        if n is None:
-            log.error("Posição %s de %.4f ações não pode ser protegida (quantidade inteira zero).", symbol, qty)
+        replaced: list[int] = []
+        orphans = self._orphan_children(symbol)
+        if orphans:
+            for t in orphans:
+                self.cancel_trade(t)
+                replaced.append(int(t.order.orderId))
+            if not await self.wait_done(orphans, timeout=5.0):
+                log.error("Reparação de %s: cancelamento de filhos órfãos (%s) não confirmado; sem nova ordem neste ciclo.",
+                          symbol, ", ".join(map(str, replaced)))
+                return None
+        qty = self.position_qty(symbol)
+        if qty == 0 or not self.connected:
             return None
+        residual = abs(qty) - self.protective_coverage(symbol)
+        n = int(residual + 1e-9)
+        if n <= 0:
+            if residual > 1e-9 and symbol not in self._fraction_warned:
+                self._fraction_warned.add(symbol)
+                log.error("Posição %s: %.4f ações sem cobertura possível (fração < 1 ação não é negociável por API).",
+                          symbol, residual)
+            return None
+        reverse = "SELL" if qty > 0 else "BUY"
         oca = f"OCA-{symbol}-FIX-{self.ib.client.getReqId()}"
         take_profit = LimitOrder(reverse, n, round_tick(tp_price))
         stop_loss = StopOrder(reverse, n, round_tick(stop_price))
@@ -583,48 +728,57 @@ class IBKRClient:
             o.transmit = True
             self._tag(o)
         trades = [self.ib.placeOrder(contract, o) for o in (take_profit, stop_loss)]
-        log.warning("Posição %s x%d SEM proteção: colocados TP %.2f / SL %.2f (ids %d/%d).",
-                    symbol, n, tp_price, stop_price, take_profit.orderId, stop_loss.orderId)
+        log.warning("Posição %s x%g com cobertura %g: colocados TP %.2f / SL %.2f para %d ações (ids %d/%d)%s.",
+                    symbol, qty, abs(qty) - residual, tp_price, stop_price, n, take_profit.orderId, stop_loss.orderId,
+                    f"; substituídos {replaced}" if replaced else "")
         return {"tp_order_id": take_profit.orderId, "sl_order_id": stop_loss.orderId, "qty": n,
                 "direction": 1 if qty > 0 else -1, "trades": trades, "tp_price": round_tick(tp_price),
-                "sl_price": round_tick(stop_price)}
-
-    ACTIVE_STATUSES = ("PreSubmitted", "Submitted", "PendingSubmit", "ApiPending")
+                "sl_price": round_tick(stop_price), "replaced_order_ids": replaced}
 
     def protective_coverage(self, symbol: str) -> float:
-        """Quantidade coberta por ordens de stop ATIVAS do lado oposto à posição (conta e contrato do bot)."""
+        """Quantidade coberta por stops ATIVOS do lado oposto à posição, na conta do bot (N04)."""
         qty = self.position_qty(symbol)
         if qty == 0:
             return 0.0
         needed_action = "SELL" if qty > 0 else "BUY"
         covered = 0.0
-        for t in self.open_trades_for(symbol, ours_only=False):
+        for t in self.open_trades_for(symbol, ours_only=False):  # conta filtrada sempre; orderRef não exigido
             o, st = t.order, t.orderStatus
-            if o.orderType not in ("STP", "TRAIL", "STP LMT") or o.action != needed_action:
+            if o.orderType not in self.STOP_TYPES or o.action != needed_action:
                 continue
             if st.status not in self.ACTIVE_STATUSES:
                 continue
-            remaining = float(st.remaining) if st.remaining else float(o.totalQuantity) - float(st.filled or 0)
-            covered += max(0.0, remaining)
+            covered += self._remaining(t)
         return covered
 
     def has_protective_orders(self, symbol: str) -> bool:
-        """True só quando os stops ativos cobrem toda a posição."""
+        """True quando os stops ativos cobrem toda a parte negociável da posição.
+
+        A parte inteira é o máximo que a API permite cobrir; a fração restante é assinalada
+        uma vez em ``ensure_protection`` em vez de disparar reparações a cada ciclo (N03/F10).
+        """
         qty = abs(self.position_qty(symbol))
-        return qty > 0 and self.protective_coverage(symbol) + 1e-9 >= qty
+        if qty <= 0:
+            return False
+        coverable = float(int(qty + 1e-9))
+        if coverable <= 0:
+            return False
+        return self.protective_coverage(symbol) + 1e-9 >= coverable
 
     def has_pending_entry(self, symbol: str) -> bool:
-        return any(t.order.parentId == 0 and t.order.orderType == "MKT"
-                   and t.orderStatus.status in ("PreSubmitted", "Submitted", "PendingSubmit")
+        """Entrada do bot ainda viva na corretora: pai (sem parentId) a mercado OU limit (N05)."""
+        return any(t.order.parentId == 0 and t.order.orderType in ("MKT", "LMT")
+                   and t.orderStatus.status in self.ACTIVE_STATUSES
                    for t in self.open_trades_for(symbol))
 
-    async def close_position(self, symbol: str) -> Optional[dict[str, Any]]:
+    async def close_position(self, symbol: str, authorize: Optional[Callable[[], bool]] = None) -> Optional[dict[str, Any]]:
         """Fecha a posição a mercado com segurança contra corridas com o stop.
 
-        1. Cancela os filhos (TP/SL) do bot e espera o estado terminal de cada um.
+        1. Cancela os filhos (TP/SL) do bot (cancelamento intencional) e espera o estado terminal.
         2. Volta a ler a posição: se o stop entretanto a fechou, não envia nada.
-        3. Envia a quantidade remanescente. Devolve ``needs_protection`` se algo falhar
-           depois dos cancelamentos, para o motor repor a cobertura.
+        3. Reavalia ``authorize`` (geração/ciclo) e só então envia a quantidade remanescente (N01).
+        Devolve ``needs_protection`` verdadeiro sempre que a cobertura possa ter ficado
+        incompleta (timeout parcial incluído), para o motor a repor (N02).
         """
         if not self.connected:
             return None
@@ -635,14 +789,20 @@ class IBKRClient:
         contract = await self.qualify(symbol)
         if contract is None:
             return None
+        if authorize is not None and not authorize():
+            log.warning("Fecho de %s não iniciado: autorização revogada.", symbol)
+            return {"order_id": None, "qty": 0, "direction": 1 if qty > 0 else -1, "trade": None,
+                    "aborted": True, "needs_protection": not self.has_protective_orders(symbol)}
         children = self.open_trades_for(symbol)
         for trade in children:
-            self.ib.cancelOrder(trade.order)
+            self.cancel_trade(trade)
         done = await self.wait_done(children, timeout=5.0)
-        if not done:
-            log.error("Fecho de %s: cancelamentos não confirmados em 5 s; a abortar o fecho (cobertura mantida).", symbol)
+        if not done or not self.connected:
+            still_covered = self.connected and self.has_protective_orders(symbol)
+            log.error("Fecho de %s: cancelamentos não confirmados em 5 s; a abortar o fecho (cobertura %s).",
+                      symbol, "mantida" if still_covered else "INCOMPLETA: será reposta")
             return {"order_id": None, "qty": 0, "direction": 1 if qty > 0 else -1, "trade": None,
-                    "aborted": True, "needs_protection": False}
+                    "aborted": True, "needs_protection": not still_covered}
         qty_now = self.position_qty(symbol)
         if qty_now == 0 or (qty_now > 0) != (qty > 0):
             log.warning("Fecho de %s: a posição já foi fechada pelo stop/TP durante os cancelamentos.", symbol)
@@ -656,6 +816,10 @@ class IBKRClient:
         action = "SELL" if qty_now > 0 else "BUY"
         order = self._tag(MarketOrder(action, n))
         order.orderId = self.ib.client.getReqId()
+        if authorize is not None and not authorize():
+            log.warning("Fecho de %s NÃO enviado: autorização revogada depois dos cancelamentos; a repor cobertura.", symbol)
+            return {"order_id": None, "qty": 0, "direction": 1 if qty_now > 0 else -1, "trade": None,
+                    "aborted": True, "needs_protection": True}
         try:
             trade = self.ib.placeOrder(contract, order)
         except Exception as exc:  # noqa: BLE001

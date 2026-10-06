@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import shutil
 import sys
 import tempfile
 from dataclasses import asdict, dataclass, field, fields
@@ -86,7 +87,8 @@ class Settings:
     skip_close_minutes: int = 10  # nem nos últimos N min
     max_bar_age_seconds: int = 180  # ignora dados mais velhos que isto
     decision_max_age_seconds: int = 180  # uma decisão mais velha que isto não é executada
-    max_entry_slippage_pct: float = 0.003  # entrada em limit marketable: ref × (1 ± 0,3%)
+    max_entry_slippage_pct: float = 0.003  # entrada em limit marketable: ref × (1 ± 0,3%); 0 = limit AO preço de referência
+    entry_order_type: str = "limit"  # "limit" (predefinido) | "market": a única forma de entrar sem limite de preço (N13)
     entry_timeout_seconds: int = 120  # entrada não executada ao fim deste tempo é cancelada
     max_trades_per_day: int = 0  # 0 = sem limite (aplica-se só quando o dia está em perda)
     relax_limits_when_in_profit: bool = True  # em lucro no dia: sem limite de entradas, sem StoplossGuard, sem travão de perdas seguidas
@@ -191,6 +193,7 @@ class Settings:
     alpaca_api_secret: str = ""
 
     # ---- UI ------------------------------------------------------------------------
+    display_currency: str = "auto"  # moeda em que a GUI mostra os valores: "auto" = moeda da conta; ex.: "EUR" (taxa da IBKR)
     ui_poll_ms: int = 100
     log_max_lines: int = 2000
 
@@ -208,19 +211,38 @@ class Settings:
         cls.load_warnings = []
         path = cls.config_path()
         if path.exists():
+            data: Any = {}
             try:
-                data: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
+                data = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
                 cls.load_warnings.append(f"config.json ilegível ({exc}); a usar valores por defeito")
+                cls._preserve_invalid(path)
+                data = {}
+            if not isinstance(data, dict):
+                # JSON válido mas não é um objeto (ex.: null, lista): recuperação controlada (N16).
+                cls.load_warnings.append(f"config.json não é um objeto JSON ({type(data).__name__}); a usar valores por defeito")
+                cls._preserve_invalid(path)
                 data = {}
             settings.apply(data)
         settings.save()
         return settings
 
-    def apply(self, data: dict[str, Any]) -> list[str]:
+    @staticmethod
+    def _preserve_invalid(path: Path) -> None:
+        """Guarda uma cópia do ficheiro inválido para diagnóstico antes de o reescrever."""
+        try:
+            shutil.copyfile(path, path.with_suffix(".json.invalid"))
+        except OSError:
+            pass
+
+    def apply(self, data: Any) -> list[str]:
         """Aplica valores com coerção de tipo e validação; devolve os avisos."""
         warnings: list[str] = []
         defaults = type(self)()
+        if not isinstance(data, dict):
+            warnings.append(f"configuração ignorada: esperado objeto JSON, recebido {type(data).__name__}")
+            type(self).load_warnings.extend(warnings)
+            return warnings
         for f in fields(self):
             if f.name not in data:
                 continue
@@ -245,6 +267,17 @@ class Settings:
         if self.stop_mode not in ("atr", "fixed"):
             warnings.append(f"stop_mode inválido ({self.stop_mode!r}); a usar 'atr'")
             self.stop_mode = "atr"
+        cur = (self.display_currency or "auto").strip().upper()
+        if cur in ("", "AUTO", "CONTA"):
+            self.display_currency = "auto"
+        elif len(cur) == 3 and cur.isalpha():
+            self.display_currency = cur
+        else:
+            warnings.append(f"display_currency inválida ({self.display_currency!r}); a usar 'auto'")
+            self.display_currency = "auto"
+        if self.entry_order_type not in ("limit", "market"):
+            warnings.append(f"entry_order_type inválido ({self.entry_order_type!r}); a usar 'limit'")
+            self.entry_order_type = "limit"
         type(self).load_warnings.extend(warnings)
         return warnings
 
@@ -267,9 +300,19 @@ class Settings:
     def ib_port(self) -> int:
         return self.ib_port_live if self.is_live else self.ib_port_paper
 
-    def db_path(self) -> Path:
-        """Base de dados separada por modo de conta (paper e real nunca se misturam)."""
-        return app_data_dir() / f"trader_{self.trading_mode}.sqlite3"
+    def db_path(self, account: str = "") -> Path:
+        """Base de dados por modo (antes de ligar) e por CONTA depois de a conhecer (N09).
+
+        ``trader_live.sqlite3`` guarda o estado pré-ligação; ao ligar à conta ``U123`` o motor
+        passa para ``trader_live_U123.sqlite3`` (copiando a primeira vez), para que duas contas
+        nunca partilhem histórico, pausas, calibração ou IDs de ordens.
+        """
+        suffix = f"_{_safe_name(account)}" if account else ""
+        return app_data_dir() / f"trader_{self.trading_mode}{suffix}.sqlite3"
+
+    def legacy_db_path(self) -> Path:
+        """Ficheiro único das versões <= 1.0.2 (sem separação paper/real)."""
+        return app_data_dir() / "trader.sqlite3"
 
     def log_path(self) -> Path:
         return app_data_dir() / "trader.log"
@@ -296,6 +339,10 @@ _NON_NEGATIVE_FIELDS = ("max_open_positions", "max_trades_per_day", "skip_open_m
                         "min_net_gain_multiple", "sentiment_veto_min_news", "sentiment_window_hours",
                         "volmodel_horizon_bars", "max_drawdown_lookback_days", "max_drawdown_pause_sessions",
                         "retro_lookahead_minutes", "calibration_refit_every_hours")
+
+
+def _safe_name(value: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in value.strip())
 
 
 def _coerce(raw: Any, default: Any) -> tuple[bool, Any]:

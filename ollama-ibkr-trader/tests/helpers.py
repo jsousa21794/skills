@@ -76,6 +76,21 @@ class FakeIBKR:
     def has_pending_entry(self, symbol):
         return self.pending_entry
 
+    def our_open_orders(self):
+        return list(self.open_orders_all) if hasattr(self, "open_orders_all") else []
+
+    def last_price(self, symbol):
+        if getattr(self, "quote", None) is not None:
+            return self.quote
+        bars = self._bars.get(symbol)
+        return (bars[-1].close, bars[-1].time) if bars else None
+
+    def is_intentional_cancel(self, order_id):
+        return order_id in getattr(self, "intentional", set())
+
+    def forget_cancel(self, order_id):
+        getattr(self, "intentional", set()).discard(order_id)
+
     def protective_coverage(self, symbol):
         qty = self.positions.get(symbol, 0.0)
         if not qty:
@@ -108,6 +123,9 @@ class FakeIBKR:
         self.cancelled.append(order_id)
         return True
 
+    def display_rate(self, currency):
+        return self.base_currency, 1.0, True
+
     def portfolio_state(self):
         return {"connected": True, "account": self.account, "currency": self.base_currency,
                 "net_liq": self.equity, "net_liq_usd": self.equity, "cash": self.equity / 2,
@@ -119,7 +137,12 @@ class FakeIBKR:
                               for s, q in self.positions.items() if q]}
 
     async def place_bracket(self, symbol, action, quantity, ref_price, *, stop_price, tp_price, trailing=False,
-                            limit_price=None):
+                            limit_price=None, authorize=None):
+        if getattr(self, "slow_qualify", None):
+            await self.slow_qualify()  # simula qualificação assíncrona (R01)
+        if authorize is not None and not authorize():
+            self.refused = getattr(self, "refused", 0) + 1
+            return None
         ids = [self._next_id, self._next_id + 1, self._next_id + 2]
         self._next_id += 3
         self.brackets.append((symbol, action, quantity, ref_price, stop_price, tp_price, limit_price))
@@ -127,10 +150,16 @@ class FakeIBKR:
                 "tp_price": tp_price, "sl_price": stop_price, "trades": [], "con_id": self.con_id(symbol),
                 "account": self.account}
 
-    async def close_position(self, symbol):
+    async def close_position(self, symbol, authorize=None):
         qty = self.positions.get(symbol, 0.0)
         if not qty:
             return None
+        if getattr(self, "slow_cancel", None):
+            await self.slow_cancel()  # simula a espera pelos cancelamentos (R21)
+        if authorize is not None and not authorize():
+            self.refused = getattr(self, "refused", 0) + 1
+            return {"order_id": None, "qty": 0, "direction": 1 if qty > 0 else -1, "trade": None,
+                    "aborted": True, "needs_protection": True}
         if self.close_behaviour == "closed_by_children":
             self.positions[symbol] = 0.0
             return {"order_id": None, "qty": 0, "direction": 1 if qty > 0 else -1, "trade": None,

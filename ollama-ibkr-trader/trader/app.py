@@ -41,12 +41,45 @@ def _import_seed_lessons(settings: Settings, db: Database, log: logging.Logger) 
         log.error("Falha a importar lições iniciais: %s", exc)
 
 
+def _migrate_legacy_db(settings: Settings, log: logging.Logger) -> None:
+    """Base de dados única das versões <= 1.0.2 (``trader.sqlite3``) (N08).
+
+    A 1.0.3 passou a ficheiros por modo e deixou o antigo sem ser lido: histórico, pausas, kill-switch
+    e associações de ordens abertas desapareciam. Agora, uma única vez, o ficheiro antigo é copiado para
+    a base do modo configurado (o mesmo ``trading_mode`` com que foi usado, lido do mesmo config.json),
+    o original fica como ``trader.sqlite3.migrated-1.0.2`` e a reconciliação ao ligar reconstrói o
+    estado antes de qualquer decisão.
+    """
+    import shutil
+
+    legacy = settings.legacy_db_path()
+    if not legacy.exists():
+        return
+    target = settings.db_path()
+    if target.exists():
+        log.warning("Base de dados antiga %s encontrada mas %s já existe: o ficheiro antigo NÃO foi tocado. "
+                    "Verifica manualmente qual dos dois tem o histórico correto.", legacy.name, target.name)
+        return
+    try:
+        src = Database(legacy)
+        try:
+            src.copy_to(target)
+        finally:
+            src.close()
+        shutil.move(str(legacy), str(legacy.with_name(legacy.name + ".migrated-1.0.2")))
+        log.warning("Base de dados da versão <= 1.0.2 migrada para %s (modo %s); original preservado como %s.",
+                    target.name, settings.trading_mode, legacy.name + ".migrated-1.0.2")
+    except Exception as exc:  # noqa: BLE001
+        log.error("Falha a migrar a base de dados antiga %s: %s. A continuar com %s.", legacy, exc, target.name)
+
+
 def main() -> int:
     multiprocessing.freeze_support()  # inofensivo fora do PyInstaller; necessário no Windows
     settings = Settings.load()
     bus = UIBus()
     log = setup_logging(bus, str(settings.log_path()))
     log.info("Dados em %s", app_data_dir())
+    _migrate_legacy_db(settings, log)
 
     db = Database(settings.db_path())
     _import_seed_lessons(settings, db, log)

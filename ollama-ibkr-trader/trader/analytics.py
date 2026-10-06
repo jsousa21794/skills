@@ -234,14 +234,19 @@ class Analytics:
         self.s = settings
         self.db = db
 
-    def build_report(self, now: Optional[datetime] = None, since_days: int = 90) -> dict[str, Any]:
+    def build_report(self, now: Optional[datetime] = None, since_days: int = 90,
+                     model: Optional[str] = None) -> dict[str, Any]:
+        """Relatório e gates da EXPERIÊNCIA ``model``: só decisões e trades desse modelo (N11).
+
+        Sem ``model`` o relatório é agregado e os gates não devem validar nenhum modelo em particular.
+        """
         now = now or datetime.now(timezone.utc)
         since = now - timedelta(days=since_days)
         settled = [r for r in self.db.settled_decisions(since=since, directional_only=True)
-                   if r.get("correct") is not None]
+                   if r.get("correct") is not None and (model is None or (r.get("model") or "") == model)]
         probs = [float(r["calibrated_prob"] if r.get("calibrated_prob") is not None else r["confidence"]) for r in settled]
         outcomes = [int(r["correct"]) for r in settled]
-        closed = self.db.closed_trades_between(since)
+        closed = self.db.closed_trades_between(since, model=model)
         pnls = [float(t["pnl"]) for t in closed]  # líquidos de comissões
         commissions = sum(float(t.get("commission") or 0) for t in closed)
         gross = sum(float(t.get("gross_pnl") or 0) for t in closed)
@@ -255,7 +260,7 @@ class Analytics:
             by_model[model] = {"n": len(rows), "hit_rate": round(sum(int(r["correct"]) for r in rows) / len(rows), 4)}
 
         report = {
-            "ts": now.isoformat(), "window_days": since_days,
+            "ts": now.isoformat(), "window_days": since_days, "experiment": model or "(agregado)",
             "calibration": calibration_metrics(probs, outcomes),
             "permutation": permutation_hit_rate(settled),
             "trades": {**trade_metrics(pnls), "commissions": round(commissions, 2), "gross_pnl": round(gross, 2),
@@ -285,8 +290,11 @@ class Analytics:
             "ruina_ok": bool(mc.get("n", 0) >= 10) and mc.get("ruin_probability", 1) <= self.s.gate_max_ruin_prob,
         }
         passed = all(checks.values())
-        return {"checks": checks, "all_passed": passed, "risk_multiplier": 1.0 if passed else 0.5,
-                "risk_per_trade": self.s.risk_per_trade_pct_validated if passed else self.s.risk_per_trade_pct}
+        # O mesmo estado de risco que o motor aplica (N18/F31): sem gates, risco base × multiplicador de aprendizagem.
+        multiplier = 1.0 if passed else self.s.learning_risk_multiplier
+        risk = self.s.risk_per_trade_pct_validated if passed else self.s.risk_per_trade_pct * multiplier
+        return {"checks": checks, "all_passed": passed, "risk_multiplier": multiplier, "risk_per_trade": risk,
+                "experiment": report.get("experiment")}
 
     @staticmethod
     def render_markdown(report: dict[str, Any]) -> str:

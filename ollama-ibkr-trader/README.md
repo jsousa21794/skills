@@ -23,10 +23,47 @@ escuro).
 > de perda aplicam-se o StoplossGuard, o travão de perdas seguidas e o cooldown
 > após saída em perda. Tudo ajustável em `config.json` (validado ao carregar).
 >
-> Versão 1.0.3: resposta à auditoria da 1.0.2 (40 achados), ver
-> `../reports/Resposta à auditoria 1.0.2.md`.
+> Versão 1.0.4: resposta à revisão da 1.0.3 (18 entradas, 4 P0), ver
+> `../reports/Resposta à revisão 1.0.3.md`; antes, a resposta à auditoria da
+> 1.0.2 em `../reports/Resposta à auditoria 1.0.2.md`.
 
-## Invariantes de segurança (1.0.3)
+## Invariantes de segurança (1.0.4)
+
+- **Token de autorização até ao `placeOrder`**: a geração e o estado do ciclo
+  são reavaliados depois de cada `await` (qualificação, cancelamentos) e
+  imediatamente antes de enviar qualquer ordem; Parar durante uma operação em
+  curso impede a ordem. Só a reposição de cobertura (redução de risco) continua
+  permitida depois de Parar.
+- **Fecho serializado por ativo**: o estado `CLOSING` é instalado ANTES de
+  cancelar os filhos; fecho e reproteção partilham um lock por ativo;
+  cancelamentos intencionais são distinguidos de rejeições; um timeout parcial
+  declara a cobertura em falta para ser reposta.
+- **Cobertura por quantidade residual**: a reparação cancela filhos órfãos
+  (TP sem stop ou vice-versa) e coloca só o que falta cobrir; frações abaixo de
+  uma ação ficam assinaladas uma vez, sem ordens repetidas. O filtro de conta é
+  obrigatório e independente do filtro de propriedade (`orderRef`).
+- **Identidade das execuções**: um fill só toca num trade se conta, contrato
+  (`conId`), símbolo e `clientId` coincidirem; os filhos substituídos ficam em
+  `order_history`, por isso um fill tardio de um TP antigo fecha o trade certo.
+- **Estado restaurado antes de decidir**: ao ligar, as entradas (MKT e LMT) e
+  fechos ainda vivos na corretora são reconstruídos; o ciclo de decisão não
+  corre até a reconciliação terminar. O supervisor (prazos monotónicos de
+  entradas, cobertura) corre numa tarefa própria, independente da inferência.
+- **Uma base de dados por conta**: ao conhecer a conta, o bot passa para
+  `trader_<modo>_<conta>.sqlite3`; uma base associada a outra conta nunca é
+  usada. A base única das versões ≤ 1.0.2 é migrada uma vez (original
+  preservado). Posições não abertas pelo bot não são geridas, fechadas nem
+  protegidas sem `manage_external_positions`, e bloqueiam sinais nesse ativo.
+- **Cotação fresca**: antes de enviar, o último preço é comparado com a
+  referência da decisão; além do limite ou com desvio excessivo, não entra.
+  Tolerância de slippage zero significa limit AO preço de referência; só
+  `entry_order_type="market"` dispensa o limite.
+- **Rótulos honestos**: o instante de mercado é o fecho da vela agregada; o
+  percurso do settlement começa depois da decisão; sem toque em TP nem stop a
+  decisão fica censurada. Calibração, relatórios e gates são por experiência
+  (modelo + versão do prompt); o A/B usa o calibrador do modelo que respondeu.
+
+## Invariantes de segurança herdados (1.0.3)
 
 - **Geração de decisões**: parar, mudar de conta, de modelo ou de ativos
   invalida qualquer decisão em curso; nenhuma ordem sai de uma decisão antiga.
@@ -212,29 +249,46 @@ aceitar adaptadores LoRA (só GGUF já fundidos). O que existe e é usável:
 - **Cabeçalho permanente** com o valor da carteira (Net Liquidation), variação do
   dia, estado IBKR/Ollama/ciclo/dados. Sem ligação, mostra o **último valor
   conhecido** com a hora, lido do histórico em SQLite; o título da janela
-  repete o valor para ficar visível na barra de tarefas. Interruptor "Janela
-  sempre visível" (always-on-top).
+  repete o valor para ficar visível na barra de tarefas.
+- **Barra lateral** só com controlo (Iniciar/Parar), estado da ligação e
+  análise (retrospetiva, relatório estatístico, atalho para Configurações).
+- **Separador Configurações**: TODAS as opções do programa vivem aqui, por
+  secções: *Conta e modelo* (Paper/Real com confirmação, modelo Ollama com
+  lista de `/api/tags`, ativos; aplicação imediata), *Ligação à IBKR* (host,
+  portas, client ID, conta, adoção de posições externas), *Ollama* (URL,
+  cadência, amostras, acordo mínimo, duas etapas, anonimização), *Trading e
+  risco* (posições, risco por operação, kill-switch diário, entradas
+  ilimitadas em lucro, short, slippage, stop ATR, R:R, persistência do sinal),
+  *Custos* (comissões e gate de custos) e *Apresentação* (**moeda em que os
+  valores são mostrados**, dados de mercado, janela sempre visível).
+  "Guardar e aplicar" valida com as mesmas regras do `config.json` (valores
+  inválidos são rejeitados e assinalados), grava e aplica no motor; alterações
+  de ligação reiniciam a ligação à IBKR.
+- **Moeda de apresentação**: "Conta (auto)" mostra a moeda base da conta; uma
+  moeda explícita (EUR, GBP, …) converte todos os montantes de conta com a
+  taxa `ExchangeRate` publicada pela própria IBKR. Sem taxa disponível, a
+  interface diz que está a mostrar a moeda da conta. Preços e quantidades das
+  posições ficam sempre na moeda do ativo.
 - **Conta**: o modo predefinido é **Real** (porta 7496, TWS). Na primeira
   vez que carregas em *Iniciar trading* é pedida uma confirmação única
   (escrever `REAL`), que fica guardada no `config.json` (`live_confirmed`).
-  O seletor *Paper* / *Real* na barra lateral permite mudar para paper (7497)
+  O seletor *Paper* / *Real* em Configurações permite mudar para paper (7497)
   se a tiveres. Ao ligar, o bot confirma o tipo de conta pelo identificador
   (`DU…` = paper): em modo paper com conta real desliga-se por segurança; em
   modo real com conta paper avisa. A camada de risco, o kill-switch e os
-  brackets funcionam igual em ambos os modos; os gates estatísticos apenas
-  decidem se o risco por trade é 0,5% ou 1%.
-- **Separadores**: *Visão geral* (cartões, gráfico do valor da carteira nas
-  últimas 48 h, posições com stop e take-profit), *Decisões* (cada proposta do
-  LLM com confiança verbal, acordo, probabilidade calibrada e o veredicto da
-  camada de risco), *Risco* (proteções ativas, gates, calibração, lições) e
-  *Consola*.
+  brackets funcionam igual em ambos os modos.
+- **Outros separadores**: *Visão geral* (cartões, gráfico do valor da carteira
+  nas últimas 48 h, posições com stop e take-profit), *Decisões* (cada proposta
+  do LLM com confiança verbal, acordo, probabilidade calibrada e o veredicto da
+  camada de risco), *Risco* (proteções ativas, reconciliação, posições externas
+  não geridas, base de dados da conta, gates, calibração, lições) e *Consola*.
 
 ## Instalação
 
 ```bash
 cd ollama-ibkr-trader
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+pip install -r requirements.txt          # ou requirements.lock para as versões exatas dos binários
 python main.py
 ```
 

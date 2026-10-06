@@ -1,0 +1,45 @@
+# Lock COMPLETO de runtime + ferramentas de build/teste (N18/F39): gerado com `pip freeze` num
+# ambiente limpo Python 3.12 a partir de requirements.txt + pyinstaller + pytest.
+# O workflow de build instala ESTE ficheiro; requirements.txt fica para instalação manual.
+# Dependências só de uma plataforma levam marcador (não aparecem no freeze Linux).
+Pygments==2.21.0
+aeventkit==2.1.0
+altgraph==0.17.5
+beautifulsoup4==4.15.0
+certifi==2026.7.22
+cffi==2.1.1
+charset-normalizer==3.5.2
+curl_cffi==0.16.3
+customtkinter==6.0.0
+darkdetect==0.8.0
+ib_async==2.1.0
+idna==3.20
+iniconfig==2.3.0
+lxml==6.1.3
+multitasking==0.0.13
+nest-asyncio==1.6.0
+numpy==2.5.3
+packaging==26.3
+pandas==3.0.6
+peewee==4.5.2
+platformdirs==4.12.3
+pluggy==1.6.0
+protobuf==7.36.2
+pycparser==3.0
+pyinstaller-hooks-contrib==2026.8
+pyinstaller==6.18.0
+pytest==9.1.1
+python-dateutil==2.9.0.post0
+pytz==2026.5
+requests==2.34.2
+six==1.17.0
+soupsieve==2.10
+typing_extensions==4.16.0
+tzdata==2025.3
+urllib3==2.8.0
+websockets==17.2
+yfinance==1.7.0
+# --- só Windows / macOS (dependências do PyInstaller nessas plataformas)
+pefile==2024.8.26 ; sys_platform == "win32"
+pywin32-ctypes==0.2.3 ; sys_platform == "win32"
+macholib==1.16.3 ; sys_platform == "darwin"

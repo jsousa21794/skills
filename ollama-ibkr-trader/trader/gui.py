@@ -7,7 +7,9 @@ motor de trading corre na sua própria thread com um loop ``asyncio``:
 - GUI -> motor: ``engine.call(coroutine)`` (``run_coroutine_threadsafe``).
 
 Layout: cabeçalho permanente com o valor da carteira e o modo de conta,
-barra lateral de controlo e separadores (Visão geral, Decisões, Risco, Consola).
+barra lateral de controlo e separadores (Visão geral, Decisões, Risco, Consola,
+Configurações). Todas as opções (conta, modelo, ativos, ligação, risco, custos,
+moeda de apresentação, janela) vivem no separador Configurações.
 """
 
 from __future__ import annotations
@@ -49,11 +51,14 @@ CATEGORY_COLORS = {"ollama": C["purple"], "ordem": C["accent"]}
 FONT = "Segoe UI"
 
 
-CURRENCY = {"code": "USD"}
+CURRENCY = {"code": "USD", "rate": 1.0, "exact": True}  # moeda de apresentação e fator a partir da moeda base
 
 
 def money(v: Any, suffix: Optional[str] = None) -> str:
+    """Formata um montante da moeda base na moeda de apresentação escolhida em Configurações."""
     suffix = f" {CURRENCY['code']}" if suffix is None else suffix
+    if isinstance(v, (int, float)):
+        v = v * CURRENCY["rate"]
     return "—" if v is None else f"{v:,.2f}{suffix}".replace(",", " ")
 
 
@@ -301,58 +306,27 @@ class TraderApp(ctk.CTk):
                                       command=self._stop, state="disabled")
         self.btn_stop.grid(row=2, column=0, sticky="ew", pady=(0, 16), **pad)
 
-        ctk.CTkLabel(side, text="CONTA", text_color=C["muted"], font=ctk.CTkFont(FONT, 11, "bold")).grid(
+        ctk.CTkLabel(side, text="LIGAÇÃO", text_color=C["muted"], font=ctk.CTkFont(FONT, 11, "bold")).grid(
             row=3, column=0, sticky="w", pady=(0, 6), **pad)
-        self.mode_var = tk.StringVar(value="Real" if self.settings.is_live else "Paper")
-        self.mode_seg = ctk.CTkSegmentedButton(side, values=["Paper", "Real"], variable=self.mode_var,
-                                               command=self._on_mode_change, selected_color=C["accent"],
-                                               selected_hover_color=C["accent_hover"], fg_color=C["card_alt"],
-                                               unselected_color=C["card_alt"], unselected_hover_color=C["border"],
-                                               font=ctk.CTkFont(FONT, 13, "bold"), height=36)
-        self.mode_seg.grid(row=4, column=0, sticky="ew", pady=(0, 4), **pad)
-        self.lbl_mode_note = ctk.CTkLabel(side, text=f"porta {self.settings.ib_port}", text_color=C["muted"],
-                                          font=ctk.CTkFont(FONT, 11))
-        self.lbl_mode_note.grid(row=5, column=0, sticky="w", pady=(0, 16), **pad)
-
-        ctk.CTkLabel(side, text="MODELO OLLAMA", text_color=C["muted"], font=ctk.CTkFont(FONT, 11, "bold")).grid(
-            row=6, column=0, sticky="w", pady=(0, 6), **pad)
-        model_row = ctk.CTkFrame(side, fg_color="transparent")
-        model_row.grid(row=7, column=0, sticky="ew", pady=(0, 16), **pad)
-        model_row.grid_columnconfigure(0, weight=1)
-        self.model_var = tk.StringVar(value=self.settings.ollama_model)
-        self.model_menu = ctk.CTkOptionMenu(model_row, variable=self.model_var, values=[self.settings.ollama_model],
-                                            command=self._on_model_change, fg_color=C["card_alt"],
-                                            button_color=C["accent"], button_hover_color=C["accent_hover"], height=36)
-        self.model_menu.grid(row=0, column=0, sticky="ew")
-        ctk.CTkButton(model_row, text="↻", width=36, height=36, fg_color=C["card_alt"], hover_color=C["border"],
-                      command=self._refresh_models).grid(row=0, column=1, padx=(6, 0))
-
-        ctk.CTkLabel(side, text="ATIVOS", text_color=C["muted"], font=ctk.CTkFont(FONT, 11, "bold")).grid(
-            row=8, column=0, sticky="w", pady=(0, 6), **pad)
-        sym_row = ctk.CTkFrame(side, fg_color="transparent")
-        sym_row.grid(row=9, column=0, sticky="ew", pady=(0, 16), **pad)
-        sym_row.grid_columnconfigure(0, weight=1)
-        self.symbols_var = tk.StringVar(value=", ".join(self.settings.symbols))
-        ctk.CTkEntry(sym_row, textvariable=self.symbols_var, fg_color=C["card_alt"], border_color=C["border"],
-                     height=36).grid(row=0, column=0, sticky="ew")
-        ctk.CTkButton(sym_row, text="OK", width=44, height=36, fg_color=C["accent"], hover_color=C["accent_hover"],
-                      command=self._apply_symbols).grid(row=0, column=1, padx=(6, 0))
+        self.lbl_mode_note = ctk.CTkLabel(side, text=f"{'REAL' if self.settings.is_live else 'PAPER'} · porta {self.settings.ib_port}",
+                                          text_color=C["red"] if self.settings.is_live else C["muted"],
+                                          font=ctk.CTkFont(FONT, 11), justify="left", anchor="w", wraplength=230)
+        self.lbl_mode_note.grid(row=4, column=0, sticky="ew", pady=(0, 16), **pad)
 
         ctk.CTkLabel(side, text="ANÁLISE", text_color=C["muted"], font=ctk.CTkFont(FONT, 11, "bold")).grid(
-            row=10, column=0, sticky="w", pady=(0, 6), **pad)
+            row=5, column=0, sticky="w", pady=(0, 6), **pad)
         ctk.CTkButton(side, text="🧠   Retrospetiva agora", fg_color=C["card_alt"], hover_color=C["border"],
-                      anchor="w", height=38, corner_radius=10, command=self._retro).grid(row=11, column=0, sticky="ew", pady=(0, 6), **pad)
+                      anchor="w", height=38, corner_radius=10, command=self._retro).grid(row=6, column=0, sticky="ew", pady=(0, 6), **pad)
         ctk.CTkButton(side, text="📊   Relatório estatístico", fg_color=C["card_alt"], hover_color=C["border"],
-                      anchor="w", height=38, corner_radius=10, command=self._report).grid(row=12, column=0, sticky="ew", pady=(0, 16), **pad)
+                      anchor="w", height=38, corner_radius=10, command=self._report).grid(row=7, column=0, sticky="ew", pady=(0, 6), **pad)
+        ctk.CTkButton(side, text="⚙   Configurações", fg_color=C["card_alt"], hover_color=C["border"],
+                      anchor="w", height=38, corner_radius=10,
+                      command=lambda: self.tabs.set("Configurações")).grid(row=8, column=0, sticky="ew", pady=(0, 16), **pad)
 
-        self.top_var = tk.BooleanVar(value=self.settings.ui_always_on_top)
-        ctk.CTkSwitch(side, text="Janela sempre visível", variable=self.top_var, command=self._toggle_top,
-                      progress_color=C["accent"], font=ctk.CTkFont(FONT, 12)).grid(row=13, column=0, sticky="w", **pad)
-
-        side.grid_rowconfigure(14, weight=1)
+        side.grid_rowconfigure(9, weight=1)
         self.lbl_meta = ctk.CTkLabel(side, text="", text_color=C["muted"], justify="left", anchor="w",
-                                     font=ctk.CTkFont(FONT, 11))
-        self.lbl_meta.grid(row=15, column=0, sticky="ew", pady=(0, 16), **pad)
+                                     font=ctk.CTkFont(FONT, 11), wraplength=230)
+        self.lbl_meta.grid(row=10, column=0, sticky="ew", pady=(0, 16), **pad)
 
     # ----------------------------------------------------------------- tabs
     def _build_tabs(self) -> None:
@@ -362,12 +336,13 @@ class TraderApp(ctk.CTk):
                                    segmented_button_unselected_color=C["panel"],
                                    segmented_button_unselected_hover_color=C["border"], corner_radius=12)
         self.tabs.grid(row=1, column=1, sticky="nsew", padx=(10, 14), pady=(10, 14))
-        for name in ("Visão geral", "Decisões", "Risco", "Consola"):
+        for name in ("Visão geral", "Decisões", "Risco", "Consola", "Configurações"):
             self.tabs.add(name)
         self._build_overview(self.tabs.tab("Visão geral"))
         self._build_decisions(self.tabs.tab("Decisões"))
         self._build_risk(self.tabs.tab("Risco"))
         self._build_console(self.tabs.tab("Consola"))
+        self._build_settings(self.tabs.tab("Configurações"))
 
     def _build_overview(self, tab: Any) -> None:
         tab.grid_columnconfigure((0, 1, 2, 3), weight=1)
@@ -451,6 +426,175 @@ class TraderApp(ctk.CTk):
             self.console.tag_config(cat, foreground=color)
         self.console.tag_config("time", foreground=C["muted"])
         self.console.configure(state="disabled")
+
+    # --------------------------------------------------------- configurações
+    CURRENCIES = ["Conta (auto)", "EUR", "USD", "GBP", "CHF", "CAD", "JPY", "AUD"]
+    MARKET_DATA = {"Tempo real (subscrição)": 1, "Atrasados 15 min (sem subscrição)": 3}
+    # (campo, rótulo, tipo) — tipo: str | int | float | pct (apresentado em %, guardado em fração) | bool
+    SETTINGS_FORM: dict[str, list[tuple[str, str, str]]] = {
+        "Ligação à IBKR": [
+            ("ib_host", "Host da TWS / Gateway", "str"), ("ib_port_live", "Porta conta REAL", "int"),
+            ("ib_port_paper", "Porta conta Paper", "int"), ("ib_client_id", "Client ID da API", "int"),
+            ("ib_account", "Conta (vazio = primeira conta gerida)", "str"),
+            ("manage_external_positions", "Adotar posições não abertas pelo bot (proteger e gerir)", "bool"),
+        ],
+        "Ollama": [
+            ("ollama_url", "URL do Ollama", "str"), ("llm_interval_minutes", "Consultar o modelo a cada (min)", "int"),
+            ("llm_samples", "Amostras por decisão", "int"), ("llm_min_agreement", "Acordo mínimo entre amostras (%)", "pct"),
+            ("llm_two_stage", "Duas etapas (raciocínio livre → JSON)", "bool"),
+            ("anonymize_prompt", "Ocultar ticker e níveis de preço ao modelo", "bool"),
+        ],
+        "Trading e risco": [
+            ("max_open_positions", "Máximo de posições abertas", "int"), ("risk_per_trade_pct", "Risco por operação (% do equity)", "pct"),
+            ("daily_loss_limit_pct", "Kill-switch: perda diária máxima (%)", "pct"),
+            ("relax_limits_when_in_profit", "Entradas ilimitadas enquanto o dia está em lucro", "bool"),
+            ("allow_short", "Permitir vendas a descoberto (short)", "bool"),
+            ("max_entry_slippage_pct", "Slippage máximo na entrada (%; 0 = limit ao preço de referência)", "pct"),
+            ("atr_stop_multiple", "Stop = k × ATR (k)", "float"), ("reward_risk_ratio", "Take-profit = R × distância do stop (R)", "float"),
+            ("signal_persistence_cycles", "Sinal tem de repetir-se N consultas seguidas", "int"),
+        ],
+        "Custos": [
+            ("commission_per_share", "Comissão por ação (USD)", "float"), ("commission_min", "Comissão mínima por ordem (USD)", "float"),
+            ("max_cost_fraction_of_tp", "Custo ida+volta máximo (% do ganho no TP)", "pct"),
+            ("min_net_gain_multiple", "Ganho líquido no TP ≥ N × custo", "float"),
+        ],
+    }
+
+    def _build_settings(self, tab: Any) -> None:
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(1, weight=1)
+        head = ctk.CTkFrame(tab, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew", pady=(4, 6))
+        head.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(head, text="Todas as opções do programa. As alterações aplicam-se ao gravar; conta e modelo aplicam-se de imediato.",
+                     text_color=C["muted"], font=ctk.CTkFont(FONT, 12), anchor="w").grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(head, text="💾  Guardar e aplicar", fg_color=C["accent"], hover_color=C["accent_hover"], height=36,
+                      font=ctk.CTkFont(FONT, 13, "bold"), command=self._save_settings).grid(row=0, column=1, padx=(8, 0))
+        self.lbl_settings_status = ctk.CTkLabel(head, text="", text_color=C["muted"], font=ctk.CTkFont(FONT, 11), anchor="w",
+                                                wraplength=900, justify="left")
+        self.lbl_settings_status.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        body = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        body.grid(row=1, column=0, sticky="nsew")
+        body.grid_columnconfigure((0, 1), weight=1, uniform="cols")
+        self._setting_vars: dict[str, tuple[tk.Variable, str]] = {}
+
+        def section(title: str, r: int, c: int, colspan: int = 1) -> ctk.CTkFrame:
+            frame = ctk.CTkFrame(body, fg_color=C["card"], corner_radius=14, border_width=1, border_color=C["border"])
+            frame.grid(row=r, column=c, columnspan=colspan, sticky="nsew", padx=(0 if c == 0 else 6, 0 if c + colspan == 2 else 6), pady=(0, 10))
+            frame.grid_columnconfigure(0, weight=1)
+            ctk.CTkLabel(frame, text=title.upper(), text_color=C["muted"], font=ctk.CTkFont(FONT, 11, "bold")).grid(
+                row=0, column=0, columnspan=2, sticky="w", padx=14, pady=(10, 4))
+            return frame
+
+        def row(frame: ctk.CTkFrame, r: int, label: str, widget: Any) -> None:
+            ctk.CTkLabel(frame, text=label, font=ctk.CTkFont(FONT, 12), anchor="w", wraplength=330, justify="left").grid(
+                row=r, column=0, sticky="w", padx=14, pady=4)
+            widget.grid(row=r, column=1, sticky="e", padx=14, pady=4)
+
+        def field(frame: ctk.CTkFrame, r: int, name: str, label: str, kind: str) -> None:
+            value = getattr(self.settings, name)
+            if kind == "bool":
+                var: tk.Variable = tk.BooleanVar(value=bool(value))
+                widget: Any = ctk.CTkSwitch(frame, text="", variable=var, progress_color=C["accent"], width=48)
+            else:
+                text = f"{value * 100:g}" if kind == "pct" else (", ".join(value) if isinstance(value, list) else str(value))
+                var = tk.StringVar(value=text)
+                widget = ctk.CTkEntry(frame, textvariable=var, width=170, fg_color=C["card_alt"], border_color=C["border"], justify="right")
+            self._setting_vars[name] = (var, kind)
+            row(frame, r, label, widget)
+
+        # --- Conta e modelo (aplicação imediata) ---
+        acc = section("Conta e modelo", 0, 0, colspan=2)
+        acc.grid_columnconfigure(1, weight=0)
+        self.mode_var = tk.StringVar(value="Real" if self.settings.is_live else "Paper")
+        self.mode_seg = ctk.CTkSegmentedButton(acc, values=["Paper", "Real"], variable=self.mode_var,
+                                               command=self._on_mode_change, selected_color=C["accent"],
+                                               selected_hover_color=C["accent_hover"], fg_color=C["card_alt"],
+                                               unselected_color=C["card_alt"], unselected_hover_color=C["border"],
+                                               font=ctk.CTkFont(FONT, 13, "bold"), height=34, width=220)
+        row(acc, 1, f"Conta (Real = porta {self.settings.ib_port_live}, Paper = porta {self.settings.ib_port_paper}); a mudança é imediata e pede confirmação", self.mode_seg)
+        model_row = ctk.CTkFrame(acc, fg_color="transparent")
+        self.model_var = tk.StringVar(value=self.settings.ollama_model)
+        self.model_menu = ctk.CTkOptionMenu(model_row, variable=self.model_var, values=[self.settings.ollama_model],
+                                            command=self._on_model_change, fg_color=C["card_alt"], width=220,
+                                            button_color=C["accent"], button_hover_color=C["accent_hover"], height=34)
+        self.model_menu.grid(row=0, column=0)
+        ctk.CTkButton(model_row, text="↻", width=34, height=34, fg_color=C["card_alt"], hover_color=C["border"],
+                      command=self._refresh_models).grid(row=0, column=1, padx=(6, 0))
+        row(acc, 2, "Modelo Ollama (lista de /api/tags; a mudança é imediata e reinicia a calibração desse modelo)", model_row)
+        sym_row = ctk.CTkFrame(acc, fg_color="transparent")
+        self.symbols_var = tk.StringVar(value=", ".join(self.settings.symbols))
+        ctk.CTkEntry(sym_row, textvariable=self.symbols_var, width=220, fg_color=C["card_alt"], border_color=C["border"],
+                     height=34).grid(row=0, column=0)
+        ctk.CTkButton(sym_row, text="OK", width=40, height=34, fg_color=C["accent"], hover_color=C["accent_hover"],
+                      command=self._apply_symbols).grid(row=0, column=1, padx=(6, 0))
+        row(acc, 3, "Ativos negociados (separados por vírgula)", sym_row)
+
+        # --- Secções do formulário ---
+        r, c = 1, 0
+        for title, items in self.SETTINGS_FORM.items():
+            frame = section(title, r, c)
+            for i, (name, label, kind) in enumerate(items, start=1):
+                field(frame, i, name, label, kind)
+            c += 1
+            if c == 2:
+                c, r = 0, r + 1
+
+        # --- Apresentação ---
+        pres = section("Apresentação", r, c)
+        cur = self.settings.display_currency
+        self.currency_var = tk.StringVar(value="Conta (auto)" if cur in ("auto", "") else cur)
+        row(pres, 1, "Moeda em que os valores são mostrados (taxa de câmbio da IBKR)",
+            ctk.CTkOptionMenu(pres, variable=self.currency_var, values=self.CURRENCIES, fg_color=C["card_alt"], width=170,
+                              button_color=C["accent"], button_hover_color=C["accent_hover"], height=32))
+        mdt = {v: k for k, v in self.MARKET_DATA.items()}
+        self.market_data_var = tk.StringVar(value=mdt.get(self.settings.market_data_type, next(iter(self.MARKET_DATA))))
+        row(pres, 2, "Dados de mercado", ctk.CTkOptionMenu(pres, variable=self.market_data_var, values=list(self.MARKET_DATA),
+                                                           fg_color=C["card_alt"], width=170, button_color=C["accent"],
+                                                           button_hover_color=C["accent_hover"], height=32))
+        self.top_var = tk.BooleanVar(value=self.settings.ui_always_on_top)
+        row(pres, 3, "Janela sempre visível (always-on-top)",
+            ctk.CTkSwitch(pres, text="", variable=self.top_var, command=self._toggle_top, progress_color=C["accent"], width=48))
+        ctk.CTkLabel(pres, text=f"Ficheiro: {self.settings.config_path()}", text_color=C["muted"], font=ctk.CTkFont(FONT, 10),
+                     anchor="w", wraplength=330, justify="left").grid(row=4, column=0, columnspan=2, sticky="w", padx=14, pady=(2, 10))
+
+    def _save_settings(self) -> None:
+        """Lê o formulário, valida com ``Settings.apply`` (coerção + limites), grava e aplica no motor."""
+        data: dict[str, Any] = {}
+        for name, (var, kind) in self._setting_vars.items():
+            raw = var.get()
+            if kind == "bool":
+                data[name] = bool(raw)
+            elif kind == "pct":
+                try:
+                    data[name] = float(str(raw).strip().replace(",", ".").rstrip("%")) / 100.0
+                except ValueError:
+                    data[name] = raw  # apply() reporta o valor inválido
+            else:
+                data[name] = raw
+        cur = self.currency_var.get()
+        data["display_currency"] = "auto" if cur.startswith("Conta") else cur
+        data["market_data_type"] = self.MARKET_DATA.get(self.market_data_var.get(), 3)
+        before = {k: getattr(self.settings, k) for k in ("ib_host", "ib_port_live", "ib_port_paper", "ib_client_id",
+                                                           "ib_account", "market_data_type", "symbols", "ollama_url")}
+        warnings = self.settings.apply(data)
+        self.settings.save()
+        self.settings.load_warnings.clear()
+        # Repor o formulário com os valores efetivamente aceites.
+        for name, (var, kind) in self._setting_vars.items():
+            value = getattr(self.settings, name)
+            var.set(bool(value) if kind == "bool" else (f"{value * 100:g}" if kind == "pct" else str(value)))
+        connection_changed = any(getattr(self.settings, k) != before[k]
+                                 for k in ("ib_host", "ib_port_live", "ib_port_paper", "ib_client_id", "ib_account", "market_data_type"))
+        self.engine.call(self.engine.settings_changed())
+        if connection_changed:
+            self.engine.call(self.engine.reconnect())
+        status = "Configurações guardadas e aplicadas." + (" Ligação à IBKR reiniciada." if connection_changed else "")
+        if warnings:
+            status += "  Rejeitado: " + "; ".join(warnings)
+        self.lbl_settings_status.configure(text=status, text_color=C["amber"] if warnings else C["green"])
+        self.append_log("WARNING" if warnings else "INFO", status)
 
     # ------------------------------------------------------------- comandos
     def _start(self) -> None:
@@ -580,13 +724,18 @@ class TraderApp(ctk.CTk):
         when = (ts or "")[11:16]
         note = f"em tempo real · {datetime.now().strftime('%H:%M:%S')}" if live else \
             f"último valor conhecido · {(ts or '')[:10]} {when} UTC · sem ligação"
+        if not CURRENCY.get("exact", True):
+            note += f" · sem taxa para {self.settings.display_currency}: valores na moeda da conta"
         self.lbl_value_note.configure(text=note, text_color=C["muted"] if live else C["amber"])
         self.title(f"{money(value)}  ·  Ollama × IBKR Trader {'[REAL]' if self.settings.is_live else '[Paper]'}")
 
     def _update_portfolio(self, p: dict[str, Any]) -> None:
         self._connected = bool(p.get("connected"))
-        if p.get("currency"):
-            CURRENCY["code"] = p["currency"]
+        if p.get("display_currency"):
+            CURRENCY["code"], CURRENCY["rate"] = p["display_currency"], float(p.get("display_rate") or 1.0)
+            CURRENCY["exact"] = bool(p.get("display_exact", True))
+        elif p.get("currency"):
+            CURRENCY["code"], CURRENCY["rate"] = p["currency"], 1.0
         if self._connected and p.get("net_liq") is not None:
             now_iso = datetime.utcnow().isoformat()
             self._set_value(p["net_liq"], now_iso, live=True)
@@ -600,17 +749,18 @@ class TraderApp(ctk.CTk):
             self.lbl_day.configure(text=f"{'▲' if day >= 0 else '▼'} {day:+.2f}% hoje",
                                    text_color=C["green"] if day >= 0 else C["red"])
 
-        def signed(v: Any, suffix: str = " USD") -> tuple[str, Optional[str]]:
+        def signed(v: Any, suffix: Optional[str] = None) -> tuple[str, Optional[str]]:
             if v is None:
                 return "—", None
-            return f"{v:+,.2f}{suffix}".replace(",", " "), C["green"] if v >= 0 else C["red"]
+            suffix = f" {CURRENCY['code']}" if suffix is None else suffix
+            return f"{v * CURRENCY['rate']:+,.2f}{suffix}".replace(",", " "), C["green"] if v >= 0 else C["red"]
 
         self.c_cash.set(money(p.get("cash")))
         self.c_unreal.set(*signed(p.get("unrealized")))
         realized_text, realized_color = signed(p.get("realized"))
         comm = p.get("commissions_today")
         self.c_real.set(realized_text, realized_color,
-                        note=f"comissões hoje: {comm:.2f} USD" if comm is not None else "")
+                        note=f"comissões hoje: {money(comm)}" if comm is not None else "")
         positions = p.get("positions", [])
         self.c_pos.set(f"{len(positions)} / {self.settings.max_open_positions}",
                        note="máximo configurado")
@@ -641,9 +791,8 @@ class TraderApp(ctk.CTk):
                                   text_color=C["red"] if live else C["green"])
         self.mode_var.set("Real" if live else "Paper")
         accounts = ", ".join(p.get("accounts") or []) or "—"
-        if p.get("currency"):
-            CURRENCY["code"] = p["currency"]
-        self.lbl_mode_note.configure(text=f"porta {p.get('port')} · conta {accounts} · {p.get('currency', 'USD')}",
+        self.lbl_mode_note.configure(text=f"{'REAL' if live else 'PAPER'} · porta {p.get('port')} · conta {accounts} · "
+                                          f"moeda da conta {p.get('currency', 'USD')} · modelo {p.get('model', '—')}",
                                      text_color=C["red"] if live else C["muted"])
         self.chip_ibkr.set(p["ibkr_connected"], "IBKR: ligado" if p["ibkr_connected"] else "IBKR: desligado")
         self.chip_ollama.set(p["ollama_ok"], f"Ollama: {p['model']}" if p["ollama_ok"] else "Ollama: indisponível")
@@ -665,6 +814,12 @@ class TraderApp(ctk.CTk):
             prot.append(f"⏳ {p['pending_entries']} entrada(s) pendente(s) na corretora")
         if p.get("pending_closes"):
             prot.append("⏳ fecho pendente: " + ", ".join(p["pending_closes"]))
+        if p.get("ibkr_connected") and not p.get("reconciled", True):
+            prot.append("⏳ a reconciliar o estado da corretora (sem decisões até terminar)")
+        if p.get("external_positions"):
+            prot.append("⚠ posições NÃO abertas pelo bot (não geridas): " + ", ".join(p["external_positions"]))
+        if p.get("bound_account"):
+            prot.append(f"Base de dados da conta {p['bound_account']} · experiência {p.get('experiment', '—')}")
         rs = p.get("risk_summary") or {}
         prot.append(f"Kill-switch {rs.get('daily_loss', 0):.0%}/dia (para o ciclo) · StoplossGuard {rs.get('stoploss_guard')} stops e "
                     f"cooldown {rs.get('cooldown')} min só em perda · entradas ilimitadas em lucro (regra PDT e fundos disponíveis mandam)")

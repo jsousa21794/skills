@@ -88,6 +88,7 @@ def decide_execution(
     vol_width: Optional[float] = None,
     risk_multiplier: float = 1.0,
     gates_passed: bool = False,
+    external_position: bool = False,
 ) -> ExecutionPlan | Skip:
     decision = outcome.decision
     action = decision.acao
@@ -99,16 +100,20 @@ def decide_execution(
         return Skip("resposta inválida")
     if action not in ("BUY", "SELL"):
         return Skip(f"ação desconhecida {action}")
-    # Validade temporal da decisão (inferência lenta, dados antigos).
+    # Validade temporal da decisão: ``bar_time`` é o FECHO da vela agregada usada (N10).
     age = (now - snapshot.bar_time).total_seconds()
-    if age > settings.decision_max_age_seconds + settings.decision_bar_minutes * 60:
-        return Skip(f"decisão expirada ({age:.0f}s desde a vela)")
+    if age > settings.decision_max_age_seconds:
+        return Skip(f"decisão expirada ({age:.0f}s desde o fecho da vela)")
     if outcome.agree_frac < settings.llm_min_agreement:
         return Skip(f"acordo {outcome.agree_frac:.0%} < {settings.llm_min_agreement:.0%}")
     if len(persistence) < settings.signal_persistence_cycles or any(a != action for a in persistence):
         return Skip(f"sinal ainda não persistente ({'/'.join(persistence)})")
     if pending_close:
         return Skip("fecho de posição ainda pendente")
+    # Posição que não foi aberta pelo bot (sem trade na base de dados): nunca é fechada nem
+    # aumentada sem adoção explícita (manage_external_positions) (N09/F08).
+    if position_qty != 0 and external_position:
+        return Skip("posição externa (não aberta pelo bot) não é gerida sem manage_external_positions")
 
     # Mesma direção da posição: nada (sem pirâmide). Direção oposta: fechar, não inverter.
     if (action == "BUY" and position_qty > 0) or (action == "SELL" and position_qty < 0):
@@ -165,7 +170,8 @@ def decide_execution(
         return Skip(cost_gate.reason)
 
     sign = 1 if action == "BUY" else -1
-    limit = snapshot.price * (1 + sign * settings.max_entry_slippage_pct) if settings.max_entry_slippage_pct > 0 else None
+    # Tolerância zero = limit AO preço de referência; só ``entry_order_type="market"`` dispensa o limite (N13).
+    limit = None if settings.entry_order_type == "market" else snapshot.price * (1 + sign * max(0.0, settings.max_entry_slippage_pct))
     return ExecutionPlan("ENTRY", action, symbol, qty=sizing.qty, sizing=sizing, threshold=threshold, probability=prob,
                          cost=cost, limit_price=limit,
                          notes=sizing.notes + cost_gate.notes + global_gate.notes + sym_gate.notes)

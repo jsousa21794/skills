@@ -192,30 +192,45 @@ def percentile(values: Sequence[float], pct: float) -> Optional[float]:
     return ordered[lo] + (ordered[hi] - ordered[lo]) * frac
 
 
+def bucket_is_complete(bucket: Sequence[Bar], minutes: int) -> bool:
+    """Um bucket está completo quando tem exatamente os ``minutes`` minutos do intervalo, sem falhas."""
+    if len(bucket) != minutes:
+        return False
+    first = bucket[0].time.hour * 60 + bucket[0].time.minute
+    if first % minutes != 0:
+        return False
+    return all(b.time.hour * 60 + b.time.minute == first + i for i, b in enumerate(bucket))
+
+
 def aggregate_bars(bars: Sequence[Bar], minutes: int, *, drop_incomplete: bool = False) -> list[Bar]:
     """Agrega velas de 1 min em velas de ``minutes`` alinhadas ao relógio.
 
-    Com ``drop_incomplete`` o último bucket só entra se a sua última vela de 1 min for a
-    última do intervalo (ex.: 09:34 para o bucket 09:30-09:34), isto é, se estiver fechado.
+    Política explícita (N17): velas de 1 min duplicadas (mesmo minuto) ficam pela última
+    recebida; com ``drop_incomplete`` QUALQUER bucket a que falte um minuto (interno ou o último,
+    ainda em formação) é descartado em vez de alimentar os indicadores como vela completa.
     """
     if minutes <= 1:
         return list(bars)
     out: list[Bar] = []
     bucket: list[Bar] = []
     bucket_key: Optional[tuple] = None
+
+    def flush() -> None:
+        if bucket and (not drop_incomplete or bucket_is_complete(bucket, minutes)):
+            out.append(_merge(bucket))
+
     for b in bars:
         key = (b.time.hour * 60 + b.time.minute) // minutes
         day_key = (b.time.date(), key)
         if bucket and day_key != bucket_key:
-            out.append(_merge(bucket))
+            flush()
             bucket = []
-        bucket.append(b)
+        if bucket and bucket[-1].time.replace(second=0, microsecond=0) == b.time.replace(second=0, microsecond=0):
+            bucket[-1] = b  # duplicado do mesmo minuto: a última atualização prevalece
+        else:
+            bucket.append(b)
         bucket_key = day_key
-    if bucket:
-        last = bucket[-1].time
-        complete = (last.hour * 60 + last.minute) % minutes == minutes - 1
-        if complete or not drop_incomplete:
-            out.append(_merge(bucket))
+    flush()
     return out
 
 

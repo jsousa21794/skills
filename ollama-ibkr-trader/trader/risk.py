@@ -170,12 +170,13 @@ class RiskGate:
         self.restore(datetime.now(timezone.utc))
 
     # ------------------------------------------------------------ estado
-    def pause(self, name: str, until: datetime, reason: str, symbol: Optional[str] = None) -> None:
+    def pause(self, name: str, until: datetime, reason: str, symbol: Optional[str] = None,
+              now: Optional[datetime] = None) -> None:
         key = f"{name}:{symbol}" if symbol else name
         if self._pauses.get(key) and self._pauses[key] >= until:
             return
         self._pauses[key] = until
-        self.db.add_protection_event(name, symbol, until, reason)
+        self.db.add_protection_event(name, symbol, until, reason, ts=now)  # relógio de quem chama (N18)
         log.warning("PROTECTION %s%s ativa até %s: %s", name, f" [{symbol}]" if symbol else "",
                     until.astimezone().strftime("%H:%M"), reason)
 
@@ -226,7 +227,7 @@ class RiskGate:
         if pct is not None and pct <= -self.s.daily_loss_limit_pct * 100.0:
             self._halted_day = today
             end_of_day = datetime.combine(today + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
-            self.db.add_protection_event("daily_loss", None, end_of_day, f"{pct:.2f}%")
+            self.db.add_protection_event("daily_loss", None, end_of_day, f"{pct:.2f}%", ts=now)
             log.critical("KILL-SWITCH: perda diária %.2f%% > limite %.1f%%. Sem novas entradas hoje.",
                          pct, self.s.daily_loss_limit_pct * 100)
             return result.block("kill-switch diário")
@@ -246,14 +247,14 @@ class RiskGate:
             stops = self.db.recent_stop_count(window_start)
             if stops >= self.s.stoploss_guard_count:
                 until = now + timedelta(minutes=self.s.stoploss_guard_pause_minutes)
-                self.pause("stoploss_guard", until, f"{stops} stops em {self.s.stoploss_guard_window_minutes} min")
+                self.pause("stoploss_guard", until, f"{stops} stops em {self.s.stoploss_guard_window_minutes} min", now=now)
                 return result.block("StoplossGuard")
 
             # Perdas consecutivas (só as ocorridas depois da última pausa deste tipo).
             losses = self.db.consecutive_losses(since=self.db.last_protection_ts("consecutive_losses"))
             if losses >= self.s.consecutive_loss_halt:
                 until = datetime.combine(today + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
-                self.pause("consecutive_losses", until, f"{losses} perdas seguidas")
+                self.pause("consecutive_losses", until, f"{losses} perdas seguidas", now=now)
                 return result.block("perdas consecutivas")
 
         # Drawdown multi-dia (pico-vale do equity nos últimos N dias).
@@ -262,7 +263,7 @@ class RiskGate:
             if dd >= self.s.max_drawdown_pct * 100.0:
                 sessions = max(1, self.s.max_drawdown_pause_sessions)
                 until = datetime.combine(today + timedelta(days=sessions), datetime.min.time(), tzinfo=timezone.utc)
-                self.pause("max_drawdown", until, f"drawdown {dd:.2f}% em {self.s.max_drawdown_lookback_days} dias")
+                self.pause("max_drawdown", until, f"drawdown {dd:.2f}% em {self.s.max_drawdown_lookback_days} dias", now=now)
                 return result.block("MaxDrawdown")
             if dd >= self.s.reduce_size_drawdown_pct * 100.0:
                 result.size_multiplier *= 0.5

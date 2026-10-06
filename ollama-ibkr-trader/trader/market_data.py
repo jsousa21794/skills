@@ -136,11 +136,18 @@ class EventData:
             return None
 
     # ---------------------------------------------------------------- news
-    def recent_news(self, symbol: str, hours: int) -> list[dict[str, Any]]:
-        """Manchetes recentes [{ts, title}] para o módulo de sentimento."""
+    def recent_news(self, symbol: str, hours: int, cached_only: bool = False) -> list[dict[str, Any]]:
+        """Manchetes recentes [{ts, title}] para o módulo de sentimento.
+
+        ``cached_only=True`` (o que o loop do motor usa) nunca faz rede: devolve a cache ainda que
+        expirada, ou lista vazia se nunca foi preenchida (N15/F36). A rede corre no ``prefetch``.
+        """
         cached = self.db.event_cache_get(f"news:{symbol}", max_age_hours=0.25)
         if cached is not None:
             items = cached
+        elif cached_only:
+            stale = self.db.event_cache_get(f"news:{symbol}", max_age_hours=1e9)
+            items = stale if stale is not None else []
         else:
             items = self._fetch_news(symbol)
             self.db.event_cache_put(f"news:{symbol}", items)

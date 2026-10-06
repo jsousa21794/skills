@@ -5,11 +5,13 @@ horizonte de minutos: para cada decisão sem ``settled_ts`` cujo ``ts`` já
 tenha ``horizon`` minutos, procura-se o preço do ativo e do benchmark nesse
 instante, calcula-se o retorno, o alpha e um rótulo ``correct``.
 
-Rótulo: para BUY/SELL, se existirem velas do percurso e os níveis de stop/TP da
-decisão, o rótulo é o do evento negociado (TP tocado antes do stop = 1, stop
-antes = 0); sem toque em nenhum, cai no rótulo direcional: BUY correta se
-retorno >= +limiar; SELL correta se <= -limiar; HOLD correta se |retorno| <
-limiar de oportunidade perdida. O limiar é metade da
+Rótulo: para BUY/SELL com níveis de stop/TP conhecidos, o rótulo é o do evento
+negociado no percurso posterior à vela da decisão (TP tocado antes do stop = 1,
+stop antes = 0); sem toque em nenhum dentro do horizonte, a decisão fica
+censurada (``correct`` NULL) e não entra na calibração. Só sem níveis (ou para
+HOLD) se usa o rótulo direcional: BUY correta se retorno >= +limiar; SELL
+correta se <= -limiar; HOLD correta se |retorno| < limiar de oportunidade
+perdida. O limiar é metade da
 distância do stop em % quando há ATR, com um mínimo de 0,1%, e nunca abaixo
 do custo estimado ida+volta em % (``cost_pct``): um movimento que não paga a
 comissão é prejuízo, não acerto.
@@ -108,15 +110,16 @@ class Settler:
             cost_pct = float(d.get("cost_pct") or 0.0)
             thr = max(thr, cost_pct)
             missed = max(thr * 2, 0.5)
-            correct = None
-            # Rótulo do evento realmente negociado: o bracket (primeiro toque em TP ou stop).
+            correct: Optional[int]
+            # Rótulo do evento realmente negociado: o bracket (primeiro toque em TP ou stop) no percurso
+            # POSTERIOR à vela da decisão (market_ts é o fecho dessa vela). Sem toque em nenhuma barreira
+            # dentro do horizonte, a decisão fica CENSURADA (correct=None): a probabilidade calibrada
+            # significa sempre "TP antes do stop" e nunca mistura o rótulo direcional (N10/F29).
             if d["action"] in ("BUY", "SELL") and self.bars_between is not None and d.get("stop_pct") and d.get("tp_pct"):
-                path = self.bars_between(d["symbol"], ts, target)
+                path = [b for b in self.bars_between(d["symbol"], ts, target) if b.time >= ts]
                 direction = 1 if d["action"] == "BUY" else -1
-                touched = first_touch_label(path, entry, float(d["stop_pct"]), float(d["tp_pct"]), direction)
-                if touched is not None:
-                    correct = touched
-            if correct is None:
+                correct = first_touch_label(path, entry, float(d["stop_pct"]), float(d["tp_pct"]), direction)
+            else:
                 correct = label(d["action"], ret, thr, missed)
             self.db.settle_decision(d["id"], settled_price=price, settled_return=round(ret, 4),
                                     bench_return=round(bench_ret, 4) if bench_ret is not None else None,

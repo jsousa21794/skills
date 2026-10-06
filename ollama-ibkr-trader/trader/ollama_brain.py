@@ -405,8 +405,15 @@ class OllamaBrain:
             self.prompt_version = int(latest["id"])
 
     def update_lessons(self, lessons: list[str], stats: dict[str, Any]) -> int:
+        """Nova versão do prompt SÓ quando o texto muda: a versão identifica a experiência (calibração,
+        gates) e não deve avançar a cada retrospetiva sem alteração (N11)."""
         self.lessons = lessons[: self.settings.retro_max_lessons]
-        self.prompt_version = self.db.save_prompt_version(self.addendum_text(), self.lessons, stats)
+        latest = self.db.latest_prompt_version()
+        text = self.addendum_text()
+        if latest is not None and latest.get("addendum") == text:
+            self.prompt_version = int(latest["id"])
+            return self.prompt_version
+        self.prompt_version = self.db.save_prompt_version(text, self.lessons, stats)
         self.db.record_experiment("prompt", f"v{self.prompt_version}")
         return self.prompt_version
 

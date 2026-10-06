@@ -67,13 +67,14 @@ class Retrospective:
             "lessons_active": len(lessons),
         }
         version = self.brain.update_lessons(texts, stats)
+        self.calibrator.set_prompt_version(version)  # a calibração pertence a (modelo, prompt) (N11)
 
         model = None
         if self.calibrator.needs_refit():
             model = self.calibrator.fit_from_db()
         report = None
         if full_report:
-            report = self.analytics.build_report(now)
+            report = self.analytics.build_report(now, model=self.calibrator.model_name)  # gates da experiência atual (N11)
 
         result = {
             "ts": now.isoformat(),

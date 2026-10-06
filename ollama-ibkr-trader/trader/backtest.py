@@ -104,6 +104,7 @@ class Replayer:
         self._index: dict[datetime, int] = {}
         self._bench: dict[datetime, float] = {}
         self._next_order_id = 1
+        self._mark: Optional[float] = None  # último preço conhecido, para marcar a posição a mercado (N12)
         self.settler = Settler(settings, self.db, self._price_at, bars_between=self._bars_between)
 
     # ------------------------------------------------------------- dados
@@ -123,8 +124,16 @@ class Replayer:
         return [b for b in self._bars if start <= b.time <= end]
 
     @property
+    def unrealized(self) -> float:
+        if self.position is None or self._mark is None:
+            return 0.0
+        p = self.position
+        return (self._mark - p.entry_price) * p.qty * p.direction
+
+    @property
     def equity(self) -> float:
-        return self.start_equity + self.realized
+        """Equity MARCADA A MERCADO (realizado + não realizado), como o NetLiquidation da corretora (N12/F32)."""
+        return self.start_equity + self.realized + self.unrealized
 
     # --------------------------------------------------------------- run
     def run(self, symbol: str, bars: list[Bar], bench: Optional[list[Bar]] = None) -> dict[str, Any]:
@@ -139,11 +148,13 @@ class Replayer:
         for i in range(self.s.sma_slow + 5, len(bars)):
             bar = bars[i]
             now = bar.time
-            if last_day != now.date():
-                last_day = now.date()
-                self.db.snapshot_pnl(net_liq=self.equity, cash=self.equity, unrealized=0.0, realized=self.realized, ts=now)
             if self.position:
                 self._check_exit(bar)
+            self._mark = bar.close
+            if last_day != now.date():
+                last_day = now.date()
+                self.db.snapshot_pnl(net_liq=self.equity, cash=self.start_equity + self.realized,
+                                     unrealized=self.unrealized, realized=self.realized, ts=now)
             self.settler.run(now)
             if last_llm and now - last_llm < interval:
                 continue
@@ -156,11 +167,11 @@ class Replayer:
             if self.gate.halted:
                 continue
             position_qty = self.position.qty * self.position.direction if self.position else 0.0
-            portfolio = {"net_liq": self.equity, "positions": [], "unrealized": 0.0,
+            portfolio = {"net_liq": self.equity, "positions": [], "unrealized": self.unrealized,
                          "day_pnl_pct": self.gate.day_pnl_pct(self.equity)}
             if self.position:
                 portfolio["positions"] = [{"symbol": symbol, "qty": position_qty, "avg_cost": self.position.entry_price,
-                                           "unrealized_pnl": (bar.close - self.position.entry_price) * self.position.qty * self.position.direction}]
+                                           "unrealized_pnl": self.unrealized}]
             recent = self.db.recent_decisions(5, symbol)
             lessons = []
             outcome = self.brain.decide(ctx.snapshot, portfolio, recent, dynamics=ctx.dynamics, lessons=lessons, cache=self.db)
@@ -187,7 +198,9 @@ class Replayer:
                 calibrated=calibrated, snapshot=ctx.snapshot, agg_bars=ctx.agg_bars, now=now, position_qty=position_qty,
                 open_positions=1 if self.position else 0, pending_entries=0, equity_usd=self.equity,
                 available_funds_usd=max(self.equity - open_notional, 0.0), reserved_notional=0.0,
-                persistence=persistence, pending_close=False, pending_entry=False, global_gate=global_gate)
+                persistence=persistence, pending_close=False, pending_entry=False, global_gate=global_gate,
+                # O mesmo estado de risco do motor sem gates validados: risco base × multiplicador de aprendizagem (N12).
+                risk_multiplier=self.s.learning_risk_multiplier, gates_passed=False)
             if isinstance(plan, Skip):
                 self.db.mark_decision(decision_id, executed=False, skip_reason=plan.reason)
                 continue
@@ -234,26 +247,24 @@ class Replayer:
         return True
 
     def _check_exit(self, bar: Bar) -> None:
+        """Ordem de resolução (N12/F34): 1) eventos observáveis na ABERTURA (gap através do stop ou do TP
+        executa à abertura); 2) só depois a ambiguidade intrabar, em que o pior caso (stop) prevalece."""
         p = self.position
         assert p is not None
         if p.direction == 1:
-            if bar.open <= p.stop:
-                return self._close(bar, bar.open, "SL", adverse_slippage=True)
-            if bar.low <= p.stop:
-                return self._close(bar, p.stop, "SL", adverse_slippage=True)
-            if bar.open >= p.tp:
-                return self._close(bar, bar.open, "TP", adverse_slippage=False)
-            if bar.high >= p.tp:
-                return self._close(bar, p.tp, "TP", adverse_slippage=False)
+            gap_stop, gap_tp = bar.open <= p.stop, bar.open >= p.tp
+            hit_stop, hit_tp = bar.low <= p.stop, bar.high >= p.tp
         else:
-            if bar.open >= p.stop:
-                return self._close(bar, bar.open, "SL", adverse_slippage=True)
-            if bar.high >= p.stop:
-                return self._close(bar, p.stop, "SL", adverse_slippage=True)
-            if bar.open <= p.tp:
-                return self._close(bar, bar.open, "TP", adverse_slippage=False)
-            if bar.low <= p.tp:
-                return self._close(bar, p.tp, "TP", adverse_slippage=False)
+            gap_stop, gap_tp = bar.open >= p.stop, bar.open <= p.tp
+            hit_stop, hit_tp = bar.high >= p.stop, bar.low <= p.tp
+        if gap_stop:
+            return self._close(bar, bar.open, "SL", adverse_slippage=True)
+        if gap_tp:
+            return self._close(bar, bar.open, "TP", adverse_slippage=False)
+        if hit_stop:  # ambíguo na mesma vela: assume-se o pior caso
+            return self._close(bar, p.stop, "SL", adverse_slippage=True)
+        if hit_tp:
+            return self._close(bar, p.tp, "TP", adverse_slippage=False)
 
     def _close(self, bar: Bar, price: float, reason: str, *, adverse_slippage: bool) -> None:
         p = self.position
@@ -265,12 +276,11 @@ class Replayer:
         self._next_order_id += 1
         self.db.insert_fill(exec_id=f"sim-x-{oid}", order_id=oid, symbol=row["symbol"], side="SLD" if p.direction > 0 else "BOT",
                             shares=p.qty, price=fill, ts=bar.time, commission=commission, commission_estimated=True)
-        self.realized += float(row["pnl"]) - 0.0  # pnl líquido do ledger
         # pnl do ledger já inclui ambas as comissões; realized é a soma dos pnl dos trades fechados
         self.realized = sum(float(t["pnl"]) for t in self.db.closed_trades_between(datetime(2000, 1, 1, tzinfo=timezone.utc)))
         self.closed.append(dict(row))
-        self.db.snapshot_pnl(net_liq=self.equity, cash=self.equity, unrealized=0.0, realized=self.realized, ts=bar.time)
         self.position = None
+        self.db.snapshot_pnl(net_liq=self.equity, cash=self.equity, unrealized=0.0, realized=self.realized, ts=bar.time)
 
     def summary(self, bars: list[Bar]) -> dict[str, Any]:
         span_days = max(1, (bars[-1].time - bars[0].time).days + 2)

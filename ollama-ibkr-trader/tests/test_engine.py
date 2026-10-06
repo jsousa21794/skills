@@ -39,6 +39,7 @@ def make_engine(bars=None, **overrides):
     engine.ibkr = FakeIBKR(bars or {"AAPL": make_bars(600, vol=0.2), "TSLA": make_bars(600, vol=0.3, seed=2)})
     engine.gate.events = None
     engine.trading_enabled = True
+    engine._reconciled = True
     return engine, db, settings
 
 
@@ -65,6 +66,20 @@ def run_exec(engine, db, out, position=0.0, symbol="AAPL", generation=None):
     gen = engine.generation if generation is None else generation
     asyncio.run(engine._execute(out, cal, ctx, did, gen, (None, 0), None))
     return db._query("SELECT * FROM decisions WHERE id=?", (did,))[0]
+
+
+def own_position(engine, db, symbol, qty, price=100.0, stop=98.0, tp=104.0):
+    """Posição ABERTA PELO BOT: existe grupo + trade na base de dados (sem isto é externa e não é gerida)."""
+    gid = db.insert_order_group(symbol=symbol, decision_id=None, role="ENTRY", direction=1 if qty > 0 else -1,
+                                qty=abs(qty), parent_order_id=engine.ibkr._next_id, tp_order_id=engine.ibkr._next_id + 1,
+                                sl_order_id=engine.ibkr._next_id + 2, ref_price=price, tp_price=tp, sl_price=stop,
+                                account=engine.ibkr.account, con_id=engine.ibkr.con_id(symbol))
+    engine.ibkr._next_id += 3
+    tid = db.open_trade(symbol=symbol, decision_id=None, group_id=gid, direction=1 if qty > 0 else -1, qty=abs(qty),
+                        stop_price=stop, tp_price=tp)
+    db.record_entry_fill(tid, abs(qty), price, NOW)
+    engine.ibkr.positions[symbol] = float(qty)
+    return gid, tid
 
 
 def fill(engine, order_id, symbol, side, shares, price, exec_id, commission=None):
@@ -178,14 +193,19 @@ def test_reconcile_imports_fills_closes_orphans_and_persists_protection():
                                 tp_order_id=2, sl_order_id=3, ref_price=100, tp_price=104, sl_price=98)
     tid = db.open_trade(symbol="AAPL", decision_id=None, group_id=gid, direction=1, qty=5)
     db.record_entry_fill(tid, 5, 100.0, NOW)
-    # posição sem registo e sem stop (TSLA) e posição no benchmark negociado (SPY): ambas protegidas e persistidas
+    # posições sem registo do bot (TSLA, SPY no benchmark negociado, NVDA fora da lista): sem adoção explícita
+    # NENHUMA é gerida, fechada ou protegida; os sinais para esses ativos ficam bloqueados (N09/R17)
     engine.ibkr.positions["TSLA"] = 10
     engine.ibkr.positions["SPY"] = 3
-    # posição externa fora dos ativos: não gerida
     engine.ibkr.positions["NVDA"] = 7
     asyncio.run(engine._reconcile())
     assert db._query("SELECT status FROM trades WHERE id=?", (tid,))[0]["status"] == "CLOSED"
-    assert set(engine.ibkr.protections) == {"TSLA", "SPY"}
+    assert engine.ibkr.protections == [] and engine._external_positions == {"TSLA", "SPY", "NVDA"}
+    assert engine._reconciled
+    # com adoção explícita, todas as posições da conta são protegidas e persistidas
+    s.manage_external_positions = True
+    asyncio.run(engine._reconcile())
+    assert set(engine.ibkr.protections) == {"TSLA", "SPY", "NVDA"} and engine._external_positions == set()
     tsla = db.open_trades("TSLA")[0]
     assert tsla["filled_qty"] == 10 and tsla["stop_price"] and tsla["tp_price"]
     group = db._query("SELECT * FROM order_groups WHERE symbol='TSLA'")[0]

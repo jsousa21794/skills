@@ -53,7 +53,7 @@ def test_report_and_gates_fail_in_learning_phase():
     db = Database(":memory:")
     report = Analytics(s, db).build_report()
     assert report["gates"]["all_passed"] is False
-    assert report["gates"]["risk_multiplier"] == 0.5
+    assert report["gates"]["risk_multiplier"] == s.learning_risk_multiplier  # o mesmo estado de risco do motor (N18)
     md = Analytics.render_markdown(report)
     assert "Gates" in md and "NÃO PASSA" in md
     assert db.latest_report("weekly") is not None

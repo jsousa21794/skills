@@ -137,20 +137,32 @@ class Calibrator:
 
     FEATURE_VERSION = "v2"
 
-    def __init__(self, settings: Settings, db: Database, model_name: Optional[str] = None) -> None:
+    def __init__(self, settings: Settings, db: Database, model_name: Optional[str] = None,
+                 prompt_version: Optional[int] = None) -> None:
         self.s = settings
         self.db = db
         self.model_name = model_name or settings.ollama_model
+        self.prompt_version = prompt_version  # None = sem partição por prompt (replay/testes)
         self.model: Optional[PlattModel] = None
         self.reload()
 
     @property
+    def experiment(self) -> str:
+        """Identificador da experiência calibrada: modelo + versão do prompt (N11)."""
+        return f"{self.model_name}" + (f":p{self.prompt_version}" if self.prompt_version is not None else "")
+
+    @property
     def kv_key(self) -> str:
-        return f"platt_model:{self.FEATURE_VERSION}:{self.model_name}"
+        return f"platt_model:{self.FEATURE_VERSION}:{self.experiment}"
 
     def set_model_name(self, model_name: str) -> None:
         if model_name != self.model_name:
             self.model_name = model_name
+            self.reload()
+
+    def set_prompt_version(self, prompt_version: Optional[int]) -> None:
+        if prompt_version != self.prompt_version:
+            self.prompt_version = prompt_version
             self.reload()
 
     def reload(self) -> None:
@@ -180,7 +192,8 @@ class Calibrator:
     def fit_from_db(self) -> Optional[PlattModel]:
         rows = self.db.settled_decisions(directional_only=True)
         rows = [r for r in rows if r.get("correct") is not None and r.get("agree_frac") is not None
-                and (r.get("model") or "") == self.model_name]
+                and (r.get("model") or "") == self.model_name
+                and (self.prompt_version is None or r.get("prompt_version") == self.prompt_version)]
         if len(rows) < self.s.calibration_min_samples:
             log.info("Calibração: %d/%d decisões settled; a usar heurística.", len(rows), self.s.calibration_min_samples)
             return None

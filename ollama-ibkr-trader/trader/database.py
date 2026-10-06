@@ -170,6 +170,19 @@ CREATE TABLE IF NOT EXISTS fill_allocations (
     commission REAL NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_alloc_exec ON fill_allocations(exec_id);
+
+-- Histórico de TODAS as ordens que já pertenceram a um grupo (pai, TP, SL), incluindo as
+-- substituídas por uma reparação: um fill tardio de um filho antigo continua a encontrar o
+-- seu grupo/trade (N07).
+CREATE TABLE IF NOT EXISTS order_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id INTEGER NOT NULL,
+    leg TEXT NOT NULL,             -- PARENT | TP | SL
+    order_id INTEGER NOT NULL,
+    ts TEXT NOT NULL,
+    replaced_ts TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_order_history_order ON order_history(order_id);
 """
 
 # Colunas acrescentadas à tabela decisions depois da v1.0 (migração idempotente).
@@ -241,6 +254,15 @@ class Database:
             self._conn.executescript(SCHEMA)
             self._conn.commit()
         self._migrate()
+
+    def copy_to(self, target: Path | str) -> None:
+        """Cópia consistente do ficheiro atual (API de backup do SQLite) para ``target``."""
+        with self._lock:
+            dest = sqlite3.connect(str(target))
+            try:
+                self._conn.backup(dest)
+            finally:
+                dest.close()
 
     def _migrate(self) -> None:
         with self._lock:
@@ -347,13 +369,22 @@ class Database:
         return int(self._query("SELECT COUNT(*) AS n FROM decisions WHERE settled_ts IS NOT NULL")[0]["n"])
 
     # -------------------------------------------------------- protections
-    def closed_trades_between(self, since: datetime, until: Optional[datetime] = None) -> list[dict[str, Any]]:
-        sql = "SELECT * FROM trades WHERE status='CLOSED' AND exit_ts >= ?"
-        params: list[Any] = [iso(since)]
+    def closed_trades_between(self, since: datetime, until: Optional[datetime] = None,
+                              model: Optional[str] = None) -> list[dict[str, Any]]:
+        """Trades fechados; com ``model`` só os originados por decisões desse modelo (N11)."""
+        sql = "SELECT t.* FROM trades t"
+        params: list[Any] = []
+        if model is not None:
+            sql += " JOIN decisions d ON d.id = t.decision_id"
+        sql += " WHERE t.status='CLOSED' AND t.exit_ts >= ?"
+        params.append(iso(since))
         if until:
-            sql += " AND exit_ts <= ?"
+            sql += " AND t.exit_ts <= ?"
             params.append(iso(until))
-        return self._query(sql + " ORDER BY exit_ts", params)
+        if model is not None:
+            sql += " AND d.model = ?"
+            params.append(model)
+        return self._query(sql + " ORDER BY t.exit_ts", params)
 
     def recent_stop_count(self, since: datetime) -> int:
         rows = self._query(
@@ -429,10 +460,12 @@ class Database:
         )
         return [(r["day"], float(r["net_liq"])) for r in rows]
 
-    def add_protection_event(self, name: str, symbol: Optional[str], until: Optional[datetime], reason: str) -> None:
+    def add_protection_event(self, name: str, symbol: Optional[str], until: Optional[datetime], reason: str,
+                             ts: Optional[datetime] = None) -> None:
+        """``ts`` é o relógio de quem chama (histórico no replay, atual no live) (N18/F35)."""
         self._execute(
             "INSERT INTO protection_events (ts, name, symbol, until, reason) VALUES (?,?,?,?,?)",
-            (iso(utc_now()), name, symbol, iso(until) if until else None, reason),
+            (iso(ts or utc_now()), name, symbol, iso(until) if until else None, reason),
         )
 
     def active_protections(self, now: datetime) -> list[dict[str, Any]]:
@@ -552,29 +585,79 @@ class Database:
         con_id: Optional[int] = None,
         ts: Optional[datetime] = None,
     ) -> int:
+        when = iso(ts or utc_now())
         cur = self._execute(
             """INSERT INTO order_groups (ts, symbol, decision_id, role, direction, qty,
                parent_order_id, tp_order_id, sl_order_id, ref_price, tp_price, sl_price, account, con_id)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
-                iso(ts or utc_now()), symbol, decision_id, role, direction, qty, parent_order_id,
+                when, symbol, decision_id, role, direction, qty, parent_order_id,
                 tp_order_id, sl_order_id, ref_price, tp_price, sl_price, account, con_id,
             ),
         )
-        return int(cur.lastrowid)
+        group_id = int(cur.lastrowid)
+        for leg, oid in (("PARENT", parent_order_id), ("TP", tp_order_id), ("SL", sl_order_id)):
+            if oid is not None:
+                self._execute("INSERT INTO order_history (group_id, leg, order_id, ts) VALUES (?,?,?,?)",
+                              (group_id, leg, int(oid), when))
+        return group_id
 
     def update_group_orders(self, group_id: int, *, tp_order_id: Optional[int] = None,
-                            sl_order_id: Optional[int] = None) -> None:
+                            sl_order_id: Optional[int] = None, ts: Optional[datetime] = None) -> None:
+        """Substitui os filhos ativos do grupo, ARQUIVANDO os anteriores em ``order_history`` (N07)."""
+        when = iso(ts or utc_now())
+        for leg, oid in (("TP", tp_order_id), ("SL", sl_order_id)):
+            if oid is None:
+                continue
+            self._execute("UPDATE order_history SET replaced_ts=? WHERE group_id=? AND leg=? AND replaced_ts IS NULL",
+                          (when, group_id, leg))
+            self._execute("INSERT INTO order_history (group_id, leg, order_id, ts) VALUES (?,?,?,?)",
+                          (group_id, leg, int(oid), when))
         self._execute("UPDATE order_groups SET tp_order_id=COALESCE(?, tp_order_id), sl_order_id=COALESCE(?, sl_order_id) WHERE id=?",
                       (tp_order_id, sl_order_id, group_id))
 
-    def group_for_order(self, order_id: int) -> Optional[dict[str, Any]]:
+    def order_leg(self, group: dict[str, Any], order_id: int) -> Optional[str]:
+        """PARENT | TP | SL para uma ordem do grupo (ativa ou já substituída)."""
+        if order_id == group.get("parent_order_id"):
+            return "PARENT"
+        if order_id == group.get("tp_order_id"):
+            return "TP"
+        if order_id == group.get("sl_order_id"):
+            return "SL"
+        rows = self._query("SELECT leg FROM order_history WHERE group_id=? AND order_id=? ORDER BY id DESC LIMIT 1",
+                           (int(group["id"]), int(order_id)))
+        return rows[0]["leg"] if rows else None
+
+    def group_for_order(self, order_id: int, *, symbol: Optional[str] = None, con_id: Optional[int] = None,
+                        account: Optional[str] = None) -> Optional[dict[str, Any]]:
+        """Grupo a que a ordem pertence (ativa ou arquivada), validando símbolo, contrato e conta (N06).
+
+        Um grupo gravado sem ``con_id``/``account`` (versões antigas) só é aceite se o símbolo coincidir.
+        """
         rows = self._query(
-            """SELECT * FROM order_groups
-               WHERE parent_order_id=? OR tp_order_id=? OR sl_order_id=?
-               ORDER BY id DESC LIMIT 1""",
-            (order_id, order_id, order_id),
+            """SELECT g.* FROM order_groups g
+               WHERE g.parent_order_id=? OR g.tp_order_id=? OR g.sl_order_id=?
+                  OR g.id IN (SELECT group_id FROM order_history WHERE order_id=?)
+               ORDER BY g.id DESC""",
+            (order_id, order_id, order_id, order_id),
         )
+        for row in rows:
+            if symbol is not None and row["symbol"] != symbol:
+                continue
+            if con_id and row.get("con_id") and int(row["con_id"]) != int(con_id):
+                continue
+            if account and row.get("account") and row["account"] != account:
+                continue
+            return row
+        return None
+
+    def group_by_parent(self, parent_order_id: int, role: Optional[str] = None) -> Optional[dict[str, Any]]:
+        if role:
+            rows = self._query("SELECT * FROM order_groups WHERE parent_order_id=? AND role=? ORDER BY id DESC LIMIT 1",
+                               (parent_order_id, role))
+        else:
+            rows = self._query("SELECT * FROM order_groups WHERE parent_order_id=? ORDER BY id DESC LIMIT 1",
+                               (parent_order_id,))
         return rows[0] if rows else None
 
     def open_trade(self, *, symbol: str, decision_id: Optional[int], group_id: int,

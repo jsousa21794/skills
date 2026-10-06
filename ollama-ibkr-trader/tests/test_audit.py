@@ -18,7 +18,7 @@ from trader.settlement import Settler, first_touch_label
 from trader.ui_bus import UIBus
 from tests.helpers import FakeIBKR, FakeOrder, make_bars, NY_OPEN_UTC
 from tests.test_brain_pipeline import FakeOllama
-from tests.test_engine import NOW, _FixedDatetime, fill, make_engine, outcome, run_exec
+from tests.test_engine import NOW, _FixedDatetime, fill, make_engine, outcome, own_position, run_exec
 
 
 # ---------------------------------------------------------------- F01
@@ -38,7 +38,7 @@ def test_f01_stop_or_mode_change_invalidates_in_flight_decision(monkeypatch):
 def test_f02_close_does_not_send_order_when_children_already_closed(monkeypatch):
     engine, db, _ = make_engine()
     monkeypatch.setattr("trader.trading_engine.datetime", _FixedDatetime)
-    engine.ibkr.positions["AAPL"] = 100
+    own_position(engine, db, "AAPL", 100)
     engine.ibkr.close_behaviour = "closed_by_children"
     row = run_exec(engine, db, outcome("SELL"), position=100)
     assert row["executed"] == 0 and "já fechada" in row["skip_reason"]
@@ -56,13 +56,14 @@ def test_f02_real_client_waits_cancellations_and_requantifies():
                                 client=SimpleNamespace(getReqId=lambda: 999))
     calls = {"qty": [100, 0]}  # 100 antes dos cancelamentos, 0 depois (stop executou)
     client.position_qty = lambda symbol: calls["qty"].pop(0)
-    client.open_trades_for = lambda symbol, ours_only=True: [SimpleNamespace(order=SimpleNamespace(), isDone=lambda: True)]
+    client.open_trades_for = lambda symbol, ours_only=True: [SimpleNamespace(order=SimpleNamespace(orderId=5), isDone=lambda: True)]
 
     async def qualify(symbol):
         return SimpleNamespace(conId=1)
     client.qualify = qualify
     result = asyncio.run(client.close_position("AAPL"))
     assert result["closed_by_children"] and result["order_id"] is None
+    assert client.is_intentional_cancel(5)  # o cancelamento dos filhos fica registado como intencional (N02)
 
 
 # ---------------------------------------------------------------- F03
@@ -446,4 +447,4 @@ def test_f38_close_commission_is_split_over_the_trades_it_closed(monkeypatch):
 
 # ---------------------------------------------------------------- F40
 def test_f40_version_matches_release_line():
-    assert __version__ == "1.0.3"
+    assert __version__ == "1.0.4"
