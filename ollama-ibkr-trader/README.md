@@ -23,11 +23,32 @@ escuro).
 > de perda aplicam-se o StoplossGuard, o travão de perdas seguidas e o cooldown
 > após saída em perda. Tudo ajustável em `config.json` (validado ao carregar).
 >
-> Versão 1.0.7: resposta à revisão da 1.0.6 (6 achados, 1 P0), ver
-> `../reports/Resposta à revisão 1.0.6.md`; antes, as respostas às revisões da
-> 1.0.5, 1.0.4 e 1.0.3 e à auditoria da 1.0.2 na mesma pasta.
+> Versão 1.0.8: resposta à revisão da 1.0.7 (7 achados, 2 P0) e integração com
+> o ChatGPT via MCP, ver `../reports/Resposta à revisão 1.0.7.md`; antes, as
+> respostas às revisões anteriores e à auditoria da 1.0.2 na mesma pasta.
 
-## Invariantes de segurança (1.0.7)
+## Invariantes de segurança (1.0.8)
+
+- **Reconciliação única**: arranque e supervisão periódica usam a mesma rotina;
+  um ativo fica gerido enquanto houver ordens próprias vivas, mesmo sem trade
+  aberto; as saídas são canceladas e confirmadas ANTES de fechar o vínculo, e
+  sem confirmação o conflito persiste.
+- **Entradas ≠ saídas**: uma entrada ainda por executar (e os seus filhos)
+  nunca é tratada como posição desaparecida; só o prazo da entrada a cancela.
+- **Nenhuma execução inventada**: uma redução ou inversão da posição fora do
+  bot gera um ajuste PROVISÓRIO de quantidade (P&L indeterminado), consumido
+  pela execução real quando chega, nunca somado duas vezes; a inversão de sinal
+  é um conflito explícito e persistente com todas as saídas próprias
+  canceladas e sem proteção nova.
+- **Identidade durável na deduplicação**: `permId` conhecido e diferente nunca
+  é duplicado; coincidência parcial é conflito assinalado, nunca descarte.
+- **Só rótulos finais aprendem**: calibração, lições e métricas ignoram
+  rótulos provisórios; finalizar um rótulo invalida os modelos anteriores.
+- **Saídas agregadas distribuídas**: uma proteção que cobre vários trades fica
+  associada a todos e a sua execução é repartida pelos saldos, sem `exit_qty`
+  acima de `filled_qty`.
+
+## Invariantes de segurança herdados (1.0.7)
 
 - **Nenhuma saída excede a posição reconciliada**: o supervisor compara a
   posição líquida com a quantidade própria do ledger em ambos os sentidos. Se
@@ -366,6 +387,37 @@ aceitar adaptadores LoRA (só GGUF já fundidos). O que existe e é usável:
   do LLM com confiança verbal, acordo, probabilidade calibrada e o veredicto da
   camada de risco), *Risco* (proteções ativas, reconciliação, posições externas
   não geridas, base de dados da conta, gates, calibração, lições) e *Consola*.
+
+## Integração com o ChatGPT (MCP): supervisão técnica
+
+O programa inclui um servidor MCP (Model Context Protocol) local, desligado
+por defeito, que expõe ao ChatGPT um conjunto FECHADO de ferramentas: consultar
+estado, posições (ledger vs IBKR), ordens vivas, log, decisões, comparar o
+ledger com a corretora, correr diagnósticos sem enviar ordens, ver o registo
+auditado dos pedidos, e **um único comando**: pausar novas entradas (persistente
+e idempotente; não cancela entradas já enviadas, não remove proteções nem
+desliga a supervisão). Retomar entradas, reiniciar o motor, alterar risco ou
+tocar em ordens **não** existem como ferramentas; retomar faz-se na barra
+lateral. A camada de risco continua local e independente da IA.
+
+1. Em Configurações → *Integração ChatGPT (MCP)* ativa o servidor (porta 8765
+   por defeito) e reinicia o programa. O token é gerado uma vez e fica no
+   `config.json`; o endereço do conector aparece em *Ligação do ChatGPT*.
+2. O ChatGPT só alcança servidores HTTPS públicos: cria um túnel para o teu PC,
+   por exemplo `cloudflared tunnel --url http://127.0.0.1:8765` (ou
+   `ngrok http 8765`), e põe a URL pública no campo *URL pública do túnel*.
+3. No ChatGPT: Definições → Conectores → Criar; URL do servidor MCP =
+   `https://<túnel>/t/<token>/mcp`; autenticação: nenhuma (o token viaja no
+   caminho e é validado pelo servidor; sem token válido a resposta é 401).
+   Clientes que suportem cabeçalhos podem usar `Authorization: Bearer <token>`.
+4. Cada chamada fica registada em `remote_commands` (autor, pedido, instante,
+   conta mascarada, modo, resultado). A pausa exige a conta (como mostrada em
+   `get_status`) e o modo atuais, e uma razão; só é confirmada depois de
+   aplicada e persistida.
+
+Supervisão contínua (um serviço separado a vigiar eventos e a chamar o modelo
+pela API) não está incluída: a conversa com o ChatGPT só supervisiona enquanto
+está aberta.
 
 ## Instalação
 

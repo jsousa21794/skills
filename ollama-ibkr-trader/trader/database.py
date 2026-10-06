@@ -171,6 +171,30 @@ CREATE TABLE IF NOT EXISTS fill_allocations (
 );
 CREATE INDEX IF NOT EXISTS idx_alloc_exec ON fill_allocations(exec_id);
 
+-- Ajustes PROVISÓRIOS de quantidade (posição reduzida fora do bot sem execução comprovada): reduzem a
+-- quantidade própria sem fabricar uma saída definitiva; são consumidos quando chega a execução real (Y03).
+CREATE TABLE IF NOT EXISTS ledger_adjustments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_id INTEGER NOT NULL,
+    ts TEXT NOT NULL,
+    qty REAL NOT NULL,
+    consumed_qty REAL NOT NULL DEFAULT 0,
+    price_hint REAL,
+    reason TEXT
+);
+
+-- Comandos remotos (MCP) auditados: autor, pedido, instante, conta, modo e resultado.
+CREATE TABLE IF NOT EXISTS remote_commands (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    actor TEXT,
+    tool TEXT NOT NULL,
+    args_json TEXT,
+    account TEXT,
+    mode TEXT,
+    result TEXT
+);
+
 -- Histórico de TODAS as ordens que já pertenceram a um grupo (pai, TP, SL), incluindo as
 -- substituídas por uma reparação: um fill tardio de um filho antigo continua a encontrar o
 -- seu grupo/trade (N07).
@@ -303,33 +327,40 @@ class Database:
         sozinho não é identidade global (sessões/clientes diferentes reutilizam-no) (X04)."""
         keys: set[tuple] = set()
         rows = self._query(
-            """SELECT g.symbol, g.account, g.con_id, h.order_id FROM order_history h JOIN order_groups g ON g.id = h.group_id
-               UNION SELECT symbol, account, con_id, parent_order_id FROM order_groups WHERE parent_order_id IS NOT NULL
-               UNION SELECT symbol, account, con_id, tp_order_id FROM order_groups WHERE tp_order_id IS NOT NULL
-               UNION SELECT symbol, account, con_id, sl_order_id FROM order_groups WHERE sl_order_id IS NOT NULL""")
+            """SELECT g.symbol, g.account, g.con_id, h.order_id, h.perm_id FROM order_history h JOIN order_groups g ON g.id = h.group_id
+               UNION SELECT symbol, account, con_id, parent_order_id, NULL FROM order_groups WHERE parent_order_id IS NOT NULL
+               UNION SELECT symbol, account, con_id, tp_order_id, NULL FROM order_groups WHERE tp_order_id IS NOT NULL
+               UNION SELECT symbol, account, con_id, sl_order_id, NULL FROM order_groups WHERE sl_order_id IS NOT NULL""")
         for r in rows:
-            keys.add((r["symbol"], r["account"] or None, r["con_id"] or None, int(r["order_id"])))
+            keys.add((r["symbol"], r["account"] or None, r["con_id"] or None, int(r["order_id"]), r.get("perm_id") or None))
         return keys
 
     @staticmethod
-    def _same_order(key: tuple, known: set[tuple]) -> bool:
-        symbol, account, con_id, oid = key
-        for k_symbol, k_account, k_con, k_oid in known:
+    def _same_order(key: tuple, known: set[tuple]) -> Optional[bool]:
+        """True = a mesma ordem (identidade durável comprovada); False = ordem distinta; None = coincidência
+        parcial (identidade permanente desconhecida de um dos lados): conflito a assinalar, nunca descarte (Y04)."""
+        symbol, account, con_id, oid, perm = key
+        verdict: Optional[bool] = False
+        for k_symbol, k_account, k_con, k_oid, k_perm in known:
             if k_oid != oid or k_symbol != symbol:
                 continue
             if account and k_account and account != k_account:
                 continue
             if con_id and k_con and int(con_id) != int(k_con):
                 continue
-            return True
-        return False
+            if perm and k_perm:
+                if int(perm) == int(k_perm):
+                    return True
+                continue  # mesmo número local, permId diferente: ordens distintas
+            verdict = None
+        return verdict
 
     def merge_open_state_from(self, other: "Database") -> dict[str, int]:
         """Importa de outra base (legado que coexiste com esta) só o estado OPERACIONAL: proteções ainda
         ativas e trades abertos com os seus grupos e pernas (IDs remapeados), numa ÚNICA transação e com
         DEDUPLICAÇÃO pela identidade das ordens e da entrada (W04). O histórico fechado fica no ficheiro
         de origem; paper e live nunca são fundidos cegamente (V05)."""
-        counts = {"protections": 0, "trades": 0, "duplicates": 0}
+        counts = {"protections": 0, "trades": 0, "duplicates": 0, "conflicts": 0}
         now = utc_now()
         known_ids = self.known_order_keys()
         existing = {(t["symbol"], t.get("account") or None, int(t["direction"]), t.get("entry_ts"), round(float(t.get("filled_qty") or 0), 6))
@@ -355,12 +386,19 @@ class Database:
         for t in other.open_trades():
             group = other._query("SELECT * FROM order_groups WHERE id=?", (t["group_id"],))
             g = group[0] if group else None
-            keys = {(g["symbol"], g.get("account") or None, g.get("con_id") or None, int(v))
-                    for v in ((g.get("parent_order_id"), g.get("tp_order_id"), g.get("sl_order_id")) if g else ()) if v is not None}
+            keys = set()
+            if g is not None:
+                for leg, v in (("PARENT", g.get("parent_order_id")), ("TP", g.get("tp_order_id")), ("SL", g.get("sl_order_id"))):
+                    if v is not None:
+                        perm = other.perm_id_for(int(g["id"]), int(v))
+                        keys.add((g["symbol"], g.get("account") or None, g.get("con_id") or None, int(v), perm))
             key = (t["symbol"], t.get("account") or None, int(t["direction"]), t.get("entry_ts"), round(float(t.get("filled_qty") or 0), 6))
-            if any(self._same_order(k, known_ids) for k in keys) or key in existing:
+            verdicts = [self._same_order(k, known_ids) for k in keys]
+            if any(v is True for v in verdicts) or key in existing:
                 counts["duplicates"] += 1
                 continue
+            if any(v is None for v in verdicts):
+                counts["conflicts"] += 1  # importado na mesma, mas assinalado: identidade permanente por confirmar
             gid = None
             if g is not None:
                 gid = self._insert_group_raw(
@@ -371,6 +409,10 @@ class Database:
                 for h in other._query("SELECT * FROM order_history WHERE group_id=? AND replaced_ts IS NOT NULL", (g["id"],)):
                     self._conn.execute("INSERT INTO order_history (group_id, leg, order_id, ts, replaced_ts, perm_id) VALUES (?,?,?,?,?,?)",
                                        (gid, h["leg"], h["order_id"], h["ts"], h["replaced_ts"], h.get("perm_id")))
+                for k_symbol, k_account, k_con, oid, perm in keys:  # identidade permanente das pernas ativas (Y04)
+                    if perm:
+                        self._conn.execute("UPDATE order_history SET perm_id=? WHERE group_id=? AND order_id=? AND perm_id IS NULL",
+                                           (int(perm), gid, int(oid)))
                 known_ids |= keys
             self._conn.execute(
                 """INSERT INTO trades (symbol, decision_id, group_id, direction, qty, filled_qty, entry_ts, entry_price,
@@ -476,6 +518,7 @@ class Database:
         self._execute(
             """UPDATE decisions SET provisional_correct=correct, correct=?, label_source=?, label_final=1 WHERE id=?""",
             (correct, label_source, decision_id))
+        self.set_kv("labels_changed_at", iso(utc_now()))  # modelos ajustados antes disto têm de ser reajustados (Y05)
 
     def settle_decision(self, decision_id: int, *, settled_price: float, settled_return: float,
                         bench_return: Optional[float], alpha: Optional[float], correct: Optional[int],
@@ -488,9 +531,13 @@ class Database:
         )
 
     def settled_decisions(self, since: Optional[datetime] = None, symbol: Optional[str] = None,
-                          directional_only: bool = False) -> list[dict[str, Any]]:
+                          directional_only: bool = False, final_only: bool = True) -> list[dict[str, Any]]:
+        """Decisões avaliadas. Por defeito SÓ rótulos finais: os provisórios (operação ainda aberta) nunca
+        entram em calibração, lições ou métricas finais (Y05)."""
         sql = "SELECT * FROM decisions WHERE settled_ts IS NOT NULL"
         params: list[Any] = []
+        if final_only:
+            sql += " AND label_final=1"
         if since:
             sql += " AND ts >= ?"
             params.append(iso(since))
@@ -902,6 +949,45 @@ class Database:
             (exit_qty, price, iso(ts), reason, gross_increment, gross_increment, commission, commission, status, trade_id),
         )
         return self._query("SELECT * FROM trades WHERE id=?", (trade_id,))[0]
+
+    def add_adjustment(self, trade_id: int, qty: float, price_hint: Optional[float], reason: str,
+                       ts: Optional[datetime] = None) -> None:
+        self._execute("INSERT INTO ledger_adjustments (trade_id, ts, qty, price_hint, reason) VALUES (?,?,?,?,?)",
+                      (int(trade_id), iso(ts or utc_now()), float(qty), price_hint, reason))
+
+    def open_adjustment_qty(self, trade_id: int) -> float:
+        rows = self._query("SELECT COALESCE(SUM(qty - consumed_qty), 0) AS q FROM ledger_adjustments WHERE trade_id=?", (int(trade_id),))
+        return float(rows[0]["q"] or 0.0)
+
+    def open_adjustments_for_symbol(self, symbol: str) -> float:
+        rows = self._query(
+            """SELECT COALESCE(SUM(a.qty - a.consumed_qty), 0) AS q FROM ledger_adjustments a JOIN trades t ON t.id = a.trade_id
+               WHERE t.symbol=? AND t.status='OPEN'""", (symbol,))
+        return float(rows[0]["q"] or 0.0)
+
+    def consume_adjustment(self, trade_id: int, qty: float) -> float:
+        """Uma execução REAL substitui o ajuste provisório na mesma quantidade (nunca se soma duas vezes) (Y03).
+        Devolve a quantidade consumida."""
+        remaining = float(qty)
+        consumed = 0.0
+        for row in self._query("SELECT id, qty, consumed_qty FROM ledger_adjustments WHERE trade_id=? AND qty - consumed_qty > 1e-9 ORDER BY id",
+                               (int(trade_id),)):
+            if remaining <= 1e-9:
+                break
+            portion = min(remaining, float(row["qty"]) - float(row["consumed_qty"]))
+            self._execute("UPDATE ledger_adjustments SET consumed_qty=consumed_qty+? WHERE id=?", (portion, row["id"]))
+            remaining -= portion
+            consumed += portion
+        return consumed
+
+    def record_remote_command(self, *, actor: str, tool: str, args: Any, account: Optional[str], mode: str, result: str) -> int:
+        cur = self._execute(
+            "INSERT INTO remote_commands (ts, actor, tool, args_json, account, mode, result) VALUES (?,?,?,?,?,?,?)",
+            (iso(utc_now()), actor, tool, json.dumps(args, ensure_ascii=False, default=str), account, mode, result))
+        return int(cur.lastrowid)
+
+    def recent_remote_commands(self, limit: int = 50) -> list[dict[str, Any]]:
+        return self._query("SELECT * FROM remote_commands ORDER BY id DESC LIMIT ?", (limit,))
 
     def apply_commission_delta(self, trade_id: int, delta: float) -> dict[str, Any]:
         """Corrige a comissão de um trade quando chega o CommissionReport real da IBKR."""

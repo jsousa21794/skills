@@ -195,6 +195,13 @@ class Settings:
 
     # ---- UI ------------------------------------------------------------------------
     display_currency: str = "auto"  # moeda em que a GUI mostra os valores: "auto" = moeda da conta; ex.: "EUR" (taxa da IBKR)
+
+    # --- Integração ChatGPT / supervisão técnica via MCP (servidor local autenticado; só consultas + pausa) ---
+    mcp_enabled: bool = False
+    mcp_host: str = "127.0.0.1"  # 0.0.0.0 só se o túnel/proxy correr noutra máquina
+    mcp_port: int = 8765
+    mcp_token: str = ""  # gerado automaticamente ao ativar; vai no caminho (/t/<token>/mcp) ou em Authorization: Bearer
+    mcp_public_url: str = ""  # URL pública do túnel (cloudflared/ngrok), só para mostrar o endereço do conector
     ui_poll_ms: int = 100
     log_max_lines: int = 2000
 
@@ -328,7 +335,7 @@ _PCT_FIELDS_0_1 = ("risk_per_trade_pct", "risk_per_trade_pct_validated", "max_po
                    "commission_max_pct", "max_cost_fraction_of_tp", "min_confidence", "edge_margin", "llm_min_agreement",
                    "llm_min_valid_fraction", "max_entry_slippage_pct", "volmodel_block_width_pct", "gate_max_ece",
                    "gate_min_psr", "gate_max_ruin_prob", "atr_floor_percentile_frac")
-_POSITIVE_FIELDS = ("cycle_seconds", "llm_interval_minutes", "signal_persistence_cycles", "decision_bar_minutes",
+_POSITIVE_FIELDS = ("mcp_port", "cycle_seconds", "llm_interval_minutes", "signal_persistence_cycles", "decision_bar_minutes",
                     "rsi_period", "sma_fast", "sma_slow", "ema_period", "atr_period", "llm_samples",
                     "settlement_horizon_minutes", "ollama_timeout_seconds", "ollama_num_ctx", "ib_port_paper",
                     "ib_port_live", "ui_poll_ms", "log_max_lines", "lessons_in_prompt", "retro_max_lessons")

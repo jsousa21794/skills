@@ -142,6 +142,13 @@ def main() -> int:
     brain = OllamaBrain(settings, db)
     engine = TradingEngine(settings, db, bus, brain)
     engine.start()
+    mcp_thread = None
+    if settings.mcp_enabled:
+        from .mcp_server import MCPServerThread
+
+        mcp_thread = MCPServerThread(engine, settings, db)
+        mcp_thread.start()
+    engine.mcp_thread = mcp_thread
 
     from .gui import TraderApp  # import tardio: Tk só na thread principal
 
@@ -155,6 +162,8 @@ def main() -> int:
     try:
         app.mainloop()
     finally:
+        if mcp_thread is not None:
+            mcp_thread.stop()
         engine.shutdown()
         db.close()
         logging.shutdown()

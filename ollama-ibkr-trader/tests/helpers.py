@@ -135,9 +135,12 @@ class FakeIBKR:
         allowed = qty if allowed_qty is None else min(qty, abs(allowed_qty))
         return self.own_exit_quantity(symbol) > allowed + 1e-9
 
-    async def resize_exits(self, symbol, *, stop_price, tp_price, max_qty=None):
-        replaced = [o.orderId for o in self._own_live_orders(symbol)]
+    async def resize_exits(self, symbol, *, stop_price, tp_price, max_qty=None, keep_parent_ids=None):
+        keep = set(keep_parent_ids or ())
+        replaced = [o.orderId for o in self._own_live_orders(symbol) if o.orderId not in keep and o.parentId not in keep]
         for o in self._own_live_orders(symbol):
+            if o.orderId in keep or o.parentId in keep:
+                continue
             o.status = "Cancelled"
             self.cancelled.append(o.orderId)
         self.resized = getattr(self, "resized", []) + [(symbol, max_qty)]
@@ -148,11 +151,21 @@ class FakeIBKR:
         result["replaced_order_ids"] = replaced
         return result
 
-    async def cancel_own_exits(self, symbol):
+    async def cancel_own_exits(self, symbol, keep_parent_ids=None):
+        keep = set(keep_parent_ids or ())
         for o in self._own_live_orders(symbol):
+            if o.orderId in keep or o.parentId in keep:
+                continue
             o.status = "Cancelled"
             self.cancelled.append(o.orderId)
         return True
+
+    def wrong_side_exit_quantity(self, symbol):
+        qty = self.positions.get(symbol, 0.0)
+        if not qty:
+            return 0.0
+        same = "BUY" if qty > 0 else "SELL"
+        return sum(o.remaining for o in self._own_live_orders(symbol) if o.action == same and o.parentId == 0)
 
     def order_is_ours(self, order, contract=None):
         acct = getattr(order, "account", "") or ""

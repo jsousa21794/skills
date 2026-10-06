@@ -36,8 +36,9 @@ def test_c05_reduced_position_resizes_exits_and_blocks_decisions(monkeypatch):
     assert sum(t.order.totalQuantity for t in live if t.order.orderType == "LMT") == 20
     assert not client.has_excess_exits("AAPL") and client.has_protective_orders("AAPL")
     trade = db._query("SELECT * FROM trades WHERE id=?", (tid,))[0]
-    assert trade["exit_qty"] == 80 and trade["exit_reason"] == "EXTERNAL" and trade["status"] == "OPEN"
-    assert engine._own_qty("AAPL") == 20 and "AAPL" not in engine._discrepancies
+    # sem execução comprovada não se fabrica uma saída: ajuste PROVISÓRIO de 80, P&L indeterminado (Y03)
+    assert trade["exit_qty"] == 0 and trade["status"] == "OPEN" and db.open_adjustment_qty(tid) == 80
+    assert engine._own_qty("AAPL") == 20 and "AAPL" in engine._discrepancies  # bloqueado até a execução explicar a diferença
     group = db._query("SELECT * FROM order_groups WHERE id=?", (gid,))[0]
     assert group["sl_order_id"] != g["sl_order_id"] and db.order_leg(group, g["sl_order_id"]) == "SL"
 

@@ -321,12 +321,16 @@ class TraderApp(ctk.CTk):
                       anchor="w", height=38, corner_radius=10, command=self._report).grid(row=7, column=0, sticky="ew", pady=(0, 6), **pad)
         ctk.CTkButton(side, text="⚙   Configurações", fg_color=C["card_alt"], hover_color=C["border"],
                       anchor="w", height=38, corner_radius=10,
-                      command=lambda: self.tabs.set("Configurações")).grid(row=8, column=0, sticky="ew", pady=(0, 16), **pad)
+                      command=lambda: self.tabs.set("Configurações")).grid(row=8, column=0, sticky="ew", pady=(0, 6), **pad)
+        self.btn_resume = ctk.CTkButton(side, text="▶   Retomar novas entradas", fg_color=C["card_alt"], hover_color=C["border"],
+                                        anchor="w", height=38, corner_radius=10, state="disabled",
+                                        command=lambda: self.engine.call(self.engine.resume_entries(actor="gui")))
+        self.btn_resume.grid(row=9, column=0, sticky="ew", pady=(0, 16), **pad)
 
-        side.grid_rowconfigure(9, weight=1)
+        side.grid_rowconfigure(10, weight=1)
         self.lbl_meta = ctk.CTkLabel(side, text="", text_color=C["muted"], justify="left", anchor="w",
                                      font=ctk.CTkFont(FONT, 11), wraplength=230)
-        self.lbl_meta.grid(row=10, column=0, sticky="ew", pady=(0, 16), **pad)
+        self.lbl_meta.grid(row=11, column=0, sticky="ew", pady=(0, 16), **pad)
 
     # ----------------------------------------------------------------- tabs
     def _build_tabs(self) -> None:
@@ -454,6 +458,12 @@ class TraderApp(ctk.CTk):
             ("atr_stop_multiple", "Stop = k × ATR (k)", "float"), ("reward_risk_ratio", "Take-profit = R × distância do stop (R)", "float"),
             ("signal_persistence_cycles", "Sinal tem de repetir-se N consultas seguidas", "int"),
         ],
+        "Integração ChatGPT (MCP)": [
+            ("mcp_enabled", "Ativar servidor MCP local (aplica-se ao reiniciar o programa)", "bool"),
+            ("mcp_host", "Endereço de escuta (127.0.0.1 recomendado)", "str"),
+            ("mcp_port", "Porta", "int"),
+            ("mcp_public_url", "URL pública do túnel HTTPS (cloudflared/ngrok), só para compor o endereço", "str"),
+        ],
         "Custos": [
             ("commission_per_share", "Comissão por ação (USD)", "float"), ("commission_min", "Comissão mínima por ordem (USD)", "float"),
             ("max_cost_fraction_of_tp", "Custo ida+volta máximo (% do ganho no TP)", "pct"),
@@ -559,6 +569,19 @@ class TraderApp(ctk.CTk):
             ctk.CTkSwitch(pres, text="", variable=self.top_var, command=self._toggle_top, progress_color=C["accent"], width=48))
         ctk.CTkLabel(pres, text=f"Ficheiro: {self.settings.config_path()}", text_color=C["muted"], font=ctk.CTkFont(FONT, 10),
                      anchor="w", wraplength=330, justify="left").grid(row=4, column=0, columnspan=2, sticky="w", padx=14, pady=(2, 10))
+
+        # --- Endereço do conector MCP (token no caminho) ---
+        mcp_box = section("Ligação do ChatGPT", r + 1, 0, colspan=2)
+        token = self.settings.mcp_token or "(gerado ao ativar)"
+        base = (self.settings.mcp_public_url or f"http://{self.settings.mcp_host}:{self.settings.mcp_port}").rstrip("/")
+        self.lbl_mcp_url = ctk.CTkLabel(mcp_box, text=f"Conector: {base}/t/{token}/mcp", font=ctk.CTkFont("Consolas", 11),
+                                        anchor="w", wraplength=900, justify="left")
+        self.lbl_mcp_url.grid(row=1, column=0, columnspan=2, sticky="w", padx=14, pady=(2, 2))
+        ctk.CTkLabel(mcp_box, text="No ChatGPT: Definições → Conectores → Criar; URL do servidor MCP = endereço acima; autenticação: nenhuma "
+                                   "(o token vai no caminho). O servidor só expõe consultas, diagnósticos e a pausa de novas entradas. "
+                                   "Exige um túnel HTTPS para o ChatGPT chegar ao teu PC.",
+                     text_color=C["muted"], font=ctk.CTkFont(FONT, 11), anchor="w", wraplength=900, justify="left").grid(
+            row=2, column=0, columnspan=2, sticky="w", padx=14, pady=(0, 10))
 
     def _save_settings(self) -> None:
         """Lê o formulário, valida com ``Settings.apply`` (coerção + limites), grava e aplica no motor."""
@@ -821,6 +844,11 @@ class TraderApp(ctk.CTk):
             prot.append("⚠ posições NÃO abertas pelo bot (não geridas): " + ", ".join(p["external_positions"]))
         if p.get("bound_account"):
             prot.append(f"Base de dados da conta {p['bound_account']} · experiência {p.get('experiment', '—')}")
+        if p.get("discrepancies"):
+            prot.append("⚠ discrepância posição/saídas em reconciliação (decisões bloqueadas): " + ", ".join(p["discrepancies"]))
+        if p.get("entries_paused"):
+            prot.append(f"⏸ NOVAS ENTRADAS EM PAUSA: {p.get('entries_paused_reason') or '—'} (retomar na barra lateral)")
+        self.btn_resume.configure(state="normal" if p.get("entries_paused") else "disabled")
         rs = p.get("risk_summary") or {}
         prot.append(f"Kill-switch {rs.get('daily_loss', 0):.0%}/dia (para o ciclo) · StoplossGuard {rs.get('stoploss_guard')} stops e "
                     f"cooldown {rs.get('cooldown')} min só em perda · entradas ilimitadas em lucro (regra PDT e fundos disponíveis mandam)")

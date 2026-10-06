@@ -9,3 +9,7 @@ tzdata>=2024.1 ; sys_platform == "win32"
 # transformers>=4.40 torch        -> FinBERT (sentiment_enabled)
 # chronos-forecasting>=1.4 torch  -> quantis de volatilidade (volmodel_enabled)
 # quantstats>=0.0.62 pandas       -> relatório HTML adicional
+
+# Integração ChatGPT / supervisão técnica via MCP (servidor local autenticado)
+mcp==2.3.0
+uvicorn==0.54.0

@@ -867,12 +867,15 @@ class IBKRClient:
         return self.own_exit_quantity(symbol) > allowed + 1e-9
 
     async def resize_exits(self, symbol: str, *, stop_price: float, tp_price: float,
-                           max_qty: Optional[float] = None) -> Optional[dict[str, Any]]:
-        """Cancela TODAS as saídas do bot do ativo, espera a confirmação terminal e repõe um par com a
-        quantidade correta. Devolve None (e não coloca nada) enquanto algum cancelamento não for confirmado (X01)."""
+                           max_qty: Optional[float] = None, keep_parent_ids: Optional[set[int]] = None) -> Optional[dict[str, Any]]:
+        """Cancela TODAS as saídas do bot do ativo (de qualquer lado), espera a confirmação terminal e repõe um par
+        com a quantidade correta. Devolve None (e não coloca nada) enquanto algum cancelamento não for confirmado (X01)."""
         if not self.connected:
             return None
-        children = [t for t in self._protective_children(symbol)]
+        keep = {int(x) for x in (keep_parent_ids or set())}
+        children = [t for t in self.open_trades_for(symbol, ours_only=True) if self.is_live_order(t)
+                    and (t.order.orderType in self.STOP_TYPES or t.order.orderType == "LMT")
+                    and int(t.order.orderId) not in keep and int(getattr(t.order, "parentId", 0) or 0) not in keep]
         for t in children:
             if t.orderStatus.status in self.ACTIVE_STATUSES:
                 self.cancel_trade(t)
@@ -887,13 +890,27 @@ class IBKRClient:
             result["replaced_order_ids"] = sorted(set(result.get("replaced_order_ids", [])) | {int(t.order.orderId) for t in children})
         return result
 
-    async def cancel_own_exits(self, symbol: str) -> bool:
-        """Cancela todas as saídas vivas do bot (posição desaparecida): nunca fica uma saída que abriria uma
-        posição inversa (X01)."""
+    def wrong_side_exit_quantity(self, symbol: str) -> float:
+        """Saídas do bot do MESMO lado da posição atual (depois de uma inversão externa): executariam contra a
+        posição nova em vez de a fechar (Y06)."""
+        qty = self.position_qty(symbol)
+        if qty == 0:
+            return 0.0
+        same_side = "BUY" if qty > 0 else "SELL"
+        return sum(self._remaining(t) for t in self.open_trades_for(symbol, ours_only=True)
+                   if t.order.action == same_side and t.order.parentId == 0 and self.is_live_order(t)
+                   and (t.order.orderType in self.STOP_TYPES or t.order.orderType == "LMT"))
+
+    async def cancel_own_exits(self, symbol: str, keep_parent_ids: Optional[set[int]] = None) -> bool:
+        """Cancela todas as saídas vivas do bot (posição desaparecida ou invertida), de QUALQUER lado: nunca fica
+        uma saída que abriria ou aumentaria uma posição inversa (X01/Y06). Entradas pendentes e os seus filhos
+        (``keep_parent_ids``) nunca são tocados por esta rotina (Y02)."""
         if not self.connected:
             return False
+        keep = {int(x) for x in (keep_parent_ids or set())}
         live = [t for t in self.open_trades_for(symbol, ours_only=True) if self.is_live_order(t)
-                and (t.order.orderType in self.STOP_TYPES or t.order.orderType == "LMT")]
+                and (t.order.orderType in self.STOP_TYPES or t.order.orderType == "LMT")
+                and int(t.order.orderId) not in keep and int(getattr(t.order, "parentId", 0) or 0) not in keep]
         for t in live:
             if t.orderStatus.status in self.ACTIVE_STATUSES:
                 self.cancel_trade(t)

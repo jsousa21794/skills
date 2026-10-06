@@ -187,6 +187,9 @@ class Calibrator:
         if self.model is None:
             return True
         fitted = datetime.fromisoformat(self.model.fitted_at)
+        changed = self.db.get_kv("labels_changed_at")
+        if changed and datetime.fromisoformat(changed) > fitted:
+            return True  # rótulos finalizados/corrigidos depois do ajuste invalidam o modelo (Y05)
         return datetime.now(timezone.utc) - fitted > timedelta(hours=self.s.calibration_refit_every_hours)
 
     def fit_from_db(self) -> Optional[PlattModel]:
