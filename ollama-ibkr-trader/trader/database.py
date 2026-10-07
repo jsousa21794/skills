@@ -385,16 +385,22 @@ class Database:
                     # "Depois de o trade existir" pela SEQUÊNCIA de inserção do histórico (monótona, independente da resolução
                     # do relógio): as pernas do grupo do trade marcam o início; sem histórico, o instante do grupo (estrito).
                     start = self._conn.execute("SELECT MIN(id) FROM order_history WHERE group_id=?", (own[0],)).fetchone()[0]
+                    # ... e ANTES de o trade deixar de estar coberto (AF02): uma ordem colocada no instante do fecho/reconciliação do
+                    # trade, ou depois, nunca o cobriu. Sem prova, não há associação (a execução ficará pendente com discrepância).
+                    closed = self._conn.execute(
+                        "SELECT CASE WHEN status='CLOSED' THEN COALESCE(reconciled_ts, exit_ts) END FROM trades WHERE id=?", (tid,)).fetchone()[0]
+                    closed_clause = " AND ts < ?" if closed else ""
+                    closed_params = (closed,) if closed else ()
                     if start is not None:
                         orders = self._conn.execute(
-                            """SELECT DISTINCT order_id FROM order_history WHERE group_id=? AND id > ?
+                            f"""SELECT DISTINCT order_id FROM order_history WHERE group_id=? AND id > ?{closed_clause}
                                AND (leg IN ('TP','SL') OR (leg='PARENT' AND (SELECT role FROM order_groups WHERE id=?)='CLOSE'))""",
-                            (gid, start, gid)).fetchall()
+                            (gid, start, *closed_params, gid)).fetchall()
                     else:
                         orders = self._conn.execute(
-                            """SELECT DISTINCT order_id FROM order_history WHERE group_id=? AND ts > ?
+                            f"""SELECT DISTINCT order_id FROM order_history WHERE group_id=? AND ts > ?{closed_clause}
                                AND (leg IN ('TP','SL') OR (leg='PARENT' AND (SELECT role FROM order_groups WHERE id=?)='CLOSE'))""",
-                            (gid, own[1] or "", gid)).fetchall()
+                            (gid, own[1] or "", *closed_params, gid)).fetchall()
                     for (oid,) in orders:
                         self._conn.execute("INSERT OR IGNORE INTO order_coverage (order_id, group_id, trade_id) VALUES (?,?,?)", (oid, gid, tid))
                 self._conn.execute("DELETE FROM exit_coverage WHERE group_id=? AND trade_id=?", (gid, tid))
@@ -1264,9 +1270,10 @@ class Database:
         return None, f"ledger:{reason or 'OUTRO'}"
 
     def relabel_from_ledger(self, trade: dict[str, Any]) -> bool:
-        """Atualiza o rótulo FINAL da decisão de um trade fechado pela regra do ledger; devolve True se mudou."""
+        """Atualiza o rótulo FINAL da decisão de um trade FECHADO pela regra do ledger; devolve True se mudou. Um trade
+        ainda aberto nunca finaliza o rótulo: a decisão continua provisória até o trade fechar (AF03)."""
         decision_id = trade.get("decision_id")
-        if not decision_id:
+        if not decision_id or trade.get("status") != "CLOSED":
             return False
         rows = self._query("SELECT settled_ts, correct, label_source FROM decisions WHERE id=?", (int(decision_id),))
         if not rows or rows[0]["settled_ts"] is None:

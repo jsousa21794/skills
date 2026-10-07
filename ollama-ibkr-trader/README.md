@@ -23,11 +23,26 @@ escuro).
 > de perda aplicam-se o StoplossGuard, o travão de perdas seguidas e o cooldown
 > após saída em perda. Tudo ajustável em `config.json` (validado ao carregar).
 >
-> Versão 1.0.14: resposta à revisão da 1.0.13 (4 achados P1), ver
-> `../reports/Resposta à revisão 1.0.13.md`; antes, as respostas às revisões
+> Versão 1.0.15: resposta à revisão da 1.0.14 (3 achados, 2 P1 e 1 P2), ver
+> `../reports/Resposta à revisão 1.0.14.md`; antes, as respostas às revisões
 > anteriores e à auditoria da 1.0.2 na mesma pasta.
 
-## Invariantes de segurança (1.0.14)
+## Invariantes de segurança (1.0.15)
+
+- **Evento só altera o objeto pendente do seu grupo**: entradas e fechos
+  pendentes guardam o grupo a que pertencem; um estado terminal validado para
+  um grupo histórico (mesmo `orderId`, `permId` exato) nunca liberta a entrada
+  ou o fecho pendente de outro grupo, nem a sua reserva. O cancelamento da
+  própria entrada continua a libertá-la.
+- **Cobertura legada limitada ao ciclo de vida**: na migração da cobertura por
+  grupo, uma ordem só passa a cobrir um trade se foi colocada depois de o trade
+  existir E antes de ele fechar ou ser reconciliado; "a ordem é posterior ao
+  trade" não basta. Sem prova a execução fica pendente com discrepância.
+- **Só trades fechados finalizam rótulos**: a regra do ledger nunca finaliza a
+  decisão de um trade ainda aberto (saídas parciais mantêm o rótulo provisório),
+  na migração e no motor; o fecho posterior finaliza pela sequência real.
+
+## Invariantes de segurança herdados (1.0.14)
 
 - **Identidade rejeitada = nenhuma mutação**: um estado de ordem cujo `permId`
   não valida nenhum grupo do bot termina sem tocar em entradas ou fechos

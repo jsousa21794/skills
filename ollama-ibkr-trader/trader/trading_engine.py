@@ -747,7 +747,7 @@ class TradingEngine:
                     "notional": float(o.totalQuantity) * float(group.get("ref_price") or 0.0), "ts": placed,
                     "deadline": _time.monotonic() + max(0.0, self.settings.entry_timeout_seconds - age),
                     "trade_id": trade["id"] if trade else None, "filled": float(st.filled or 0.0),
-                    "cancel_sent": in_transition}
+                    "cancel_sent": in_transition, "group_id": int(group["id"])}
                 log.warning("Entrada pendente restaurada: ordem %d %s x%g (há %.0fs%s).", o.orderId, symbol,
                             float(o.totalQuantity), age, "; cancelamento em curso" if in_transition else "")
             elif group["role"] == "CLOSE":
@@ -1395,7 +1395,7 @@ class TradingEngine:
         self._pending_entries[result["parent_order_id"]] = {
             "symbol": symbol, "qty": float(sizing.qty), "notional": sizing.qty * ctx.snapshot.price,
             "ts": datetime.now(timezone.utc), "deadline": _time.monotonic() + self.settings.entry_timeout_seconds,
-            "trade_id": trade_id, "filled": 0.0}
+            "trade_id": trade_id, "filled": 0.0, "group_id": group_id}
         self.db.mark_decision(decision_id, executed=True)
         net_gain = sizing.qty * abs(sizing.tp_price - ctx.snapshot.price) - plan.cost
         self.bus.emit("decision_result", decision_id=decision_id, executed=True,
@@ -1508,16 +1508,28 @@ class TradingEngine:
             self.ibkr.forget_cancel(order_id)
             log.info("Ordem %d (%s %s) -> %s%s", order_id, trade.order.action, symbol, status,
                      " (cancelada pelo bot)" if intentional else "", extra={"category": "ordem"})
-            # Fecho pendente cancelado/rejeitado: libertar o bloqueio e repor cobertura.
+            # Fecho pendente cancelado/rejeitado: libertar o bloqueio e repor cobertura — só se o evento pertence ao MESMO
+            # grupo do fecho pendente (AF01): um orderId coincidente de um grupo histórico validado não autoriza alterações.
             pc = self._pending_close.get(symbol)
+            if pc and pc.get("order_id") == order_id and not self._event_targets(group, pc.get("group_id")):
+                log.critical("[%s] Estado %s da ordem %d pertence ao grupo %s, não ao fecho pendente (grupo %s): ignorado.",
+                             symbol, status, order_id, group["id"] if group else None, pc.get("group_id"))
+                pc = None
             if pc and pc.get("order_id") == order_id:
                 self._pending_close.pop(symbol, None)
                 log.error("[%s] Ordem de fecho %d terminou em %s sem executar: posição mantém-se; cobertura será reposta.",
                           symbol, order_id, status)
                 if self.loop:
                     self.loop.create_task(self._reprotect(symbol))
-            # Entrada pendente cancelada: libertar reserva e marcar o trade como cancelado.
-            entry = self._pending_entries.pop(order_id, None)
+            # Entrada pendente cancelada: libertar reserva e marcar o trade como cancelado — só se o evento pertence ao
+            # grupo da própria entrada (AF01).
+            entry = self._pending_entries.get(order_id)
+            if entry is not None and not self._event_targets(group, self._pending_entry_group(order_id, entry)):
+                log.critical("[%s] Estado %s da ordem %d pertence ao grupo %s, não à entrada pendente (grupo %s): reserva e trade "
+                             "mantidos.", symbol, status, order_id, group["id"] if group else None, self._pending_entry_group(order_id, entry))
+                entry = None
+            else:
+                entry = self._pending_entries.pop(order_id, None)
             if entry and entry["filled"] <= 0 and entry.get("trade_id") is not None:
                 self.db._execute("UPDATE trades SET status='CANCELLED', exit_reason='CANCELLED' WHERE id=? AND filled_qty=0",
                                  (entry["trade_id"],))
@@ -1528,6 +1540,25 @@ class TradingEngine:
             if group and group["role"] == "ENTRY" and self.db.order_leg(group, order_id) in ("TP", "SL") \
                     and symbol not in self._pending_close and self.loop:
                 self.loop.create_task(self._reprotect(symbol))
+
+    def _pending_entry_group(self, order_id: int, entry: dict[str, Any]) -> Optional[int]:
+        if entry.get("group_id") is not None:
+            return int(entry["group_id"])
+        if entry.get("trade_id") is not None:
+            rows = self.db._query("SELECT group_id FROM trades WHERE id=?", (int(entry["trade_id"]),))
+            if rows:
+                return int(rows[0]["group_id"])
+        g = self.db.group_by_parent(int(order_id), role="ENTRY")
+        return int(g["id"]) if g else None
+
+    @staticmethod
+    def _event_targets(group: Optional[dict[str, Any]], pending_group_id: Optional[int]) -> bool:
+        """O evento (grupo validado pela identidade) diz respeito ao objeto pendente (grupo registado)? Com grupos diferentes,
+        nunca (AF01). Sem grupo validado só quando a base também não conhece grupo para a ordem (objeto pendente legado, sem
+        identidade a contradizer); um evento de identidade REJEITADA nunca chega aqui (AE01)."""
+        if group is None or pending_group_id is None:
+            return True  # sem grupo conhecido na base (ou objeto pendente sem grupo) não há identidade que contradiga o evento
+        return int(group["id"]) == int(pending_group_id)
 
     def _live_order_proof(self, order_id: int, symbol: str, perm_id: Any) -> bool:
         """A ordem com este orderId está VIVA na corretora, é nossa e tem exatamente este permId (prova adicional, AD01)."""
