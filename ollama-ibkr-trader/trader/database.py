@@ -382,11 +382,19 @@ class Database:
                 own = self._conn.execute("SELECT group_id, (SELECT ts FROM order_groups WHERE id=trades.group_id) FROM trades WHERE id=?",
                                          (tid,)).fetchone()
                 if own and own[0] != gid:
-                    started = own[1] or ""
-                    orders = self._conn.execute(
-                        """SELECT DISTINCT order_id FROM order_history WHERE group_id=? AND ts >= ?
-                           AND (leg IN ('TP','SL') OR (leg='PARENT' AND (SELECT role FROM order_groups WHERE id=?)='CLOSE'))""",
-                        (gid, started, gid)).fetchall()
+                    # "Depois de o trade existir" pela SEQUÊNCIA de inserção do histórico (monótona, independente da resolução
+                    # do relógio): as pernas do grupo do trade marcam o início; sem histórico, o instante do grupo (estrito).
+                    start = self._conn.execute("SELECT MIN(id) FROM order_history WHERE group_id=?", (own[0],)).fetchone()[0]
+                    if start is not None:
+                        orders = self._conn.execute(
+                            """SELECT DISTINCT order_id FROM order_history WHERE group_id=? AND id > ?
+                               AND (leg IN ('TP','SL') OR (leg='PARENT' AND (SELECT role FROM order_groups WHERE id=?)='CLOSE'))""",
+                            (gid, start, gid)).fetchall()
+                    else:
+                        orders = self._conn.execute(
+                            """SELECT DISTINCT order_id FROM order_history WHERE group_id=? AND ts > ?
+                               AND (leg IN ('TP','SL') OR (leg='PARENT' AND (SELECT role FROM order_groups WHERE id=?)='CLOSE'))""",
+                            (gid, own[1] or "", gid)).fetchall()
                     for (oid,) in orders:
                         self._conn.execute("INSERT OR IGNORE INTO order_coverage (order_id, group_id, trade_id) VALUES (?,?,?)", (oid, gid, tid))
                 self._conn.execute("DELETE FROM exit_coverage WHERE group_id=? AND trade_id=?", (gid, tid))
