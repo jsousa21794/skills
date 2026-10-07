@@ -23,11 +23,28 @@ escuro).
 > de perda aplicam-se o StoplossGuard, o travão de perdas seguidas e o cooldown
 > após saída em perda. Tudo ajustável em `config.json` (validado ao carregar).
 >
-> Versão 1.0.16: resposta à revisão da 1.0.15 (3 achados, 2 P1 e 1 P2), ver
-> `../reports/Resposta à revisão 1.0.15.md`; antes, as respostas às revisões
+> Versão 1.0.17: resposta à revisão da 1.0.16 (2 achados P1), ver
+> `../reports/Resposta à revisão 1.0.16.md`; antes, as respostas às revisões
 > anteriores e à auditoria da 1.0.2 na mesma pasta.
 
-## Invariantes de segurança (1.0.16)
+## Invariantes de segurança (1.0.17)
+
+- **Proveniência da cobertura**: cada relação de cobertura por ordem guarda a
+  sua origem. A gravada na colocação (`placed`) é prova explícita e nunca é
+  removida por comparação de relógios; a inferida por migração (`migrated`)
+  exige prova estrita (um empate temporal não a prova); a de origem
+  desconhecida só cai com prova estrita do contrário. Empates de relógio nunca
+  apagam prova válida.
+- **Alocações dependentes são revertidas**: quando a reparação invalida uma
+  relação de cobertura, as alocações de execuções que dela dependiam são
+  desfeitas (quantidade, P&L, comissões, resumo e rótulo do trade recalculados;
+  um trade reconciliado volta ao estado reconciliado) e o saldo volta à fila por
+  alocar, que a reconciliação de arranque recupera com a cobertura reparada.
+- **Testes com relógio controlado**: os ensaios de migração sequencial usam um
+  relógio explícito, para que a ordem dos eventos não dependa da resolução do
+  relógio da plataforma (a falha intermitente do Windows tinha essa causa).
+
+## Invariantes de segurança herdados (1.0.16)
 
 - **Execuções também respeitam o grupo pendente**: uma execução validada para
   um grupo histórico (mesmo `orderId`, `permId` exato) nunca incrementa nem

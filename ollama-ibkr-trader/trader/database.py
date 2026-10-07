@@ -260,7 +260,8 @@ DECISION_COLUMNS = {
 }
 HISTORY_COLUMNS = {"perm_id": "INTEGER"}
 ADJUSTMENT_COLUMNS = {"order_ids": "TEXT"}
-ALLOCATION_COLUMNS = {"reason": "TEXT"}  # TP | SL | SIGNAL para saídas; NULL para entradas (AB06)  # saídas vivas no instante do ajuste: só as suas execuções o explicam (Z05)
+ALLOCATION_COLUMNS = {"reason": "TEXT"}
+COVERAGE_COLUMNS = {"source": "TEXT"}  # 'placed' = gravada na colocação (prova explícita); 'migrated' = inferida por migração (AH01)  # TP | SL | SIGNAL para saídas; NULL para entradas (AB06)  # saídas vivas no instante do ajuste: só as suas execuções o explicam (Z05)
 TRADE_COLUMNS = {"decision_action": "TEXT", "stop_price": "REAL", "tp_price": "REAL", "risk_amount": "REAL",
                  "commission": "REAL NOT NULL DEFAULT 0", "gross_pnl": "REAL NOT NULL DEFAULT 0", "account": "TEXT",
                  "reconciled_ts": "TEXT"}  # instante da reconciliação, separado da data real de saída (AA06)
@@ -281,7 +282,7 @@ def iso(dt: datetime) -> str:
 
 class Database:
     SUMMARY_MIGRATION = "1.0.14"  # versão da última migração que recalculou resumos/rótulos (AE04)
-    COVERAGE_MIGRATION = "1.0.16"  # versão da última reavaliação da cobertura por ordem pelo ciclo de vida (AG02)
+    COVERAGE_MIGRATION = "1.0.17"  # versão da última reavaliação da cobertura por ordem pelo ciclo de vida (AG02/AH01/AH02)
 
     def __init__(self, path: Path | str = ":memory:") -> None:
         self._lock = threading.RLock()
@@ -317,7 +318,8 @@ class Database:
         with self._lock:
             for table, columns in (("decisions", DECISION_COLUMNS), ("trades", TRADE_COLUMNS), ("fills", FILL_COLUMNS),
                                    ("order_groups", GROUP_COLUMNS), ("order_history", HISTORY_COLUMNS),
-                                   ("ledger_adjustments", ADJUSTMENT_COLUMNS), ("fill_allocations", ALLOCATION_COLUMNS)):
+                                   ("ledger_adjustments", ADJUSTMENT_COLUMNS), ("fill_allocations", ALLOCATION_COLUMNS),
+                                   ("order_coverage", COVERAGE_COLUMNS)):
                 existing = {row[1] for row in self._conn.execute(f"PRAGMA table_info({table})")}
                 for name, decl in columns.items():
                     if name not in existing:
@@ -403,7 +405,8 @@ class Database:
                                AND (leg IN ('TP','SL') OR (leg='PARENT' AND (SELECT role FROM order_groups WHERE id=?)='CLOSE'))""",
                             (gid, own[1] or "", *closed_params, gid)).fetchall()
                     for (oid,) in orders:
-                        self._conn.execute("INSERT OR IGNORE INTO order_coverage (order_id, group_id, trade_id) VALUES (?,?,?)", (oid, gid, tid))
+                        self._conn.execute("INSERT OR IGNORE INTO order_coverage (order_id, group_id, trade_id, source) VALUES (?,?,?,'migrated')",
+                                           (oid, gid, tid))
                 self._conn.execute("DELETE FROM exit_coverage WHERE group_id=? AND trade_id=?", (gid, tid))
             self._conn.commit()
             # Migração identificada por VERSÃO (AE04): resumos de saída e rótulos finais potencialmente desatualizados por
@@ -423,8 +426,14 @@ class Database:
             # foi colocada depois de o trade existir e antes de ele fechar/ser reconciliado. A cobertura válida criada
             # diretamente pelas ordens satisfaz essas condições e é preservada. Idempotente.
             if (self.get_kv("migration:coverage") or "") != self.COVERAGE_MIGRATION:
+                # Proveniência (AH01): uma relação gravada na COLOCAÇÃO ('placed') é prova explícita e nunca é substituída por
+                # uma comparação de relógios; uma relação INFERIDA por migração ('migrated') precisa de prova estrita (empate
+                # temporal = não provada); uma relação de origem desconhecida (versões anteriores) só cai com prova estrita
+                # do contrário (colocada DEPOIS do fecho), nunca por empate.
                 removed = 0
-                for oid, gid, tid in self._conn.execute("SELECT order_id, group_id, trade_id FROM order_coverage").fetchall():
+                for oid, gid, tid, source in self._conn.execute("SELECT order_id, group_id, trade_id, source FROM order_coverage").fetchall():
+                    if source == "placed":
+                        continue
                     placed = self._conn.execute("SELECT MIN(id), MIN(ts) FROM order_history WHERE order_id=? AND group_id=?",
                                                 (oid, gid)).fetchone()
                     trade = self._conn.execute(
@@ -436,12 +445,22 @@ class Database:
                     own_group, status, closed, trade_start = trade
                     invalid = False
                     if own_group != gid and trade_start is not None and placed[0] < trade_start:
-                        invalid = True  # ordem anterior à existência do trade
-                    if status == "CLOSED" and closed and placed[1] and placed[1] >= closed:
-                        invalid = True  # ordem colocada no fecho/reconciliação do trade ou depois
+                        invalid = True  # ordem anterior à existência do trade (sequência do histórico, independente do relógio)
+                    if status == "CLOSED" and closed and placed[1]:
+                        if source == "migrated" and placed[1] >= closed:
+                            invalid = True  # inferida: um empate temporal não a prova
+                        elif source != "migrated" and placed[1] > closed:
+                            invalid = True  # origem desconhecida: só com prova estrita de que foi colocada depois do fecho
                     if invalid:
                         self._conn.execute("DELETE FROM order_coverage WHERE order_id=? AND group_id=? AND trade_id=?", (oid, gid, tid))
                         removed += 1
+                        # As alocações que dependiam desta cobertura são revertidas (AH02): o saldo volta a ficar por alocar e é
+                        # recuperado pela reconciliação com a cobertura reparada; quantidades, P&L, comissões, resumo e rótulo do
+                        # trade são recalculados.
+                        for (alloc_id,) in self._conn.execute(
+                                """SELECT a.id FROM fill_allocations a JOIN fills f ON f.exec_id = a.exec_id
+                                   WHERE f.order_id=? AND a.trade_id=?""", (oid, tid)).fetchall():
+                            self._reverse_allocation(int(alloc_id))
                 self._conn.commit()
                 self.set_kv("migration:coverage", self.COVERAGE_MIGRATION)
             # Reparação de rótulos indevidamente FINALIZADOS em trades ainda abertos (AG03): uma versão anterior finalizou pela
@@ -1348,7 +1367,7 @@ class Database:
                 if oid is None:
                     continue
                 for tid in trade_ids:
-                    self._execute("INSERT OR IGNORE INTO order_coverage (order_id, group_id, trade_id) VALUES (?,?,?)",
+                    self._execute("INSERT OR IGNORE INTO order_coverage (order_id, group_id, trade_id, source) VALUES (?,?,?,'placed')",
                                   (int(oid), int(group_id), tid))
             return
         for tid in trade_ids:
@@ -1417,6 +1436,42 @@ class Database:
 
     def allocations_for_fill(self, exec_id: str) -> list[dict[str, Any]]:
         return self._query("SELECT * FROM fill_allocations WHERE exec_id=? ORDER BY id", (exec_id,))
+
+    def _reverse_allocation(self, alloc_id: int) -> None:
+        """Desfaz UMA alocação de saída (cobertura invalidada, AH02): repõe quantidade, P&L bruto/líquido e comissão do trade,
+        recalcula o resumo de saída (ou repõe o estado reconciliado se não restarem saídas) e reavalia o rótulo da decisão."""
+        rows = self._query(
+            """SELECT a.*, f.price AS fill_price FROM fill_allocations a JOIN fills f ON f.exec_id = a.exec_id WHERE a.id=?""", (alloc_id,))
+        if not rows:
+            return
+        a = rows[0]
+        trade = self._query("SELECT * FROM trades WHERE id=?", (int(a["trade_id"]),))
+        if not trade:
+            self._execute("DELETE FROM fill_allocations WHERE id=?", (alloc_id,))
+            return
+        t = trade[0]
+        shares = float(a["shares"])
+        if a.get("reason") is None:
+            # alocação de ENTRADA: nunca é revertida aqui (a cobertura só diz respeito a saídas)
+            return
+        direction = int(t["direction"])
+        entry = float(t["entry_price"] or a["fill_price"])
+        gross = (float(a["fill_price"]) - entry) * shares * direction
+        commission = float(a["commission"] or 0.0)
+        exit_qty = max(0.0, float(t["exit_qty"] or 0) - shares)
+        status = t["status"]
+        if status == "CLOSED" and t.get("reconciled_ts") is None and exit_qty + 1e-9 < float(t["filled_qty"] or t["qty"]):
+            status = "OPEN"  # fechado só por esta saída: volta a estar aberto
+        self._execute(
+            """UPDATE trades SET exit_qty=?, gross_pnl=gross_pnl-?, pnl=pnl-?+?, commission=commission-?, status=? WHERE id=?""",
+            (exit_qty, gross, gross, commission, commission, status, int(t["id"])))
+        self._execute("DELETE FROM fill_allocations WHERE id=?", (alloc_id,))
+        updated = self.refresh_exit_summary(int(t["id"]))
+        if updated is None:
+            self._execute("UPDATE trades SET exit_reason=?, exit_ts=?, exit_price=NULL WHERE id=?",
+                          ("RECONCILED" if t.get("reconciled_ts") else None, t.get("reconciled_ts"), int(t["id"])))
+            updated = self._query("SELECT * FROM trades WHERE id=?", (int(t["id"]),))[0]
+        self.relabel_from_ledger(updated)
 
     def allocated_shares(self, exec_id: str) -> float:
         rows = self._query("SELECT COALESCE(SUM(shares), 0) AS q FROM fill_allocations WHERE exec_id=?", (exec_id,))

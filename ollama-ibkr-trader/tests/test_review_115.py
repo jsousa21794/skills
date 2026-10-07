@@ -3,6 +3,7 @@ corrigido, mais casos adjacentes (execução da própria entrada liberta a reser
 import asyncio
 from datetime import timedelta
 
+import trader.database as dbmod
 from trader.database import Database
 from trader.settlement import Settler
 from tests.test_engine import NOW, own_position
@@ -54,20 +55,27 @@ def test_ag01_close_fill_of_another_group_never_completes_the_pending_close():
 
 
 # ---------------------------------------------------------------- AG02
-def test_ag02_versioned_repair_removes_coverage_wrongly_inferred_by_the_previous_version(tmp_path):
+def test_ag02_versioned_repair_removes_coverage_wrongly_inferred_by_the_previous_version(tmp_path, monkeypatch):
+    clock = [NOW]
+    monkeypatch.setattr(dbmod, "utc_now", lambda: clock[0])  # relógio controlado (AH01): sem dependência da resolução
     engine, db, s = make_engine()
     g1, t1 = own_position(engine, db, "AAPL", 100)
     g2, t2 = own_position(engine, db, "AAPL", 20)
     engine.ibkr.positions["AAPL"] = 120
     pos = dict(symbol="AAPL", qty=120, avg_cost=100, market_price=101)
+    clock[0] = NOW + timedelta(minutes=1)
     asyncio.run(engine._protect_if_naked("AAPL", pos))
+    clock[0] = NOW + timedelta(minutes=2)
     db.close_trade_reconciled(t2)
+    clock[0] = NOW + timedelta(minutes=3)
     g3, t3 = own_position(engine, db, "AAPL", 20)
     engine.ibkr.positions["AAPL"] = 120
+    clock[0] = NOW + timedelta(minutes=4)
     asyncio.run(engine._resize_exits("AAPL", pos, None, "repor proteção"))
     g1row = db._query("SELECT * FROM order_groups WHERE id=?", (g1,))[0]
     oid = g1row["sl_order_id"]
     db.set_perm_id(oid, 999, group_id=g1)
+    clock[0] = NOW + timedelta(minutes=5)
     db.close_trade_reconciled(t1)
     db.close_trade_reconciled(t3)
     # estado gravado pela migração da 1.0.14: a cobertura inferida incluiu o trade 2, já fechado quando a ordem foi colocada

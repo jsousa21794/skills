@@ -693,6 +693,11 @@ class TradingEngine:
         if imported:
             log.warning("Reconciliação: %d execuções ocorridas sem o bot ligado foram importadas.", imported)
         self._restore_pending_orders()
+        # Saldos por alocar de execuções do bot (identidade revelada entretanto, cobertura reparada na migração, AH02): a
+        # recuperação corre no arranque com a identidade ORIGINAL persistida.
+        for symbol in sorted({f["symbol"] for f in self.db.unallocated_fills()}):
+            if self._pending_own_fills(symbol):
+                self._reconcile_unallocated_fills(symbol)
         positions = {p["symbol"]: p for p in self.ibkr.portfolio_state().get("positions", [])
                      if p.get("sec_type", "STK") == "STK"}
         # Reconciliação de arranque UNIFICADA com a periódica (Y01): um trade sem posição passa pela mesma rotina

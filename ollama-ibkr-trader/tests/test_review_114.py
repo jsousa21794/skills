@@ -3,6 +3,7 @@ corrigido, mais casos adjacentes (cancelamento da própria entrada continua a li
 import asyncio
 from datetime import timedelta
 
+import trader.database as dbmod
 from trader.database import Database
 from trader.settlement import Settler
 from tests.test_engine import NOW, own_position
@@ -48,19 +49,26 @@ def test_af01_cancel_of_the_pending_entry_itself_still_releases_it():
 
 
 # ---------------------------------------------------------------- AF02
-def test_af02_legacy_coverage_migration_excludes_orders_placed_after_the_trade_closed(tmp_path):
+def test_af02_legacy_coverage_migration_excludes_orders_placed_after_the_trade_closed(tmp_path, monkeypatch):
+    clock = [NOW]
+    monkeypatch.setattr(dbmod, "utc_now", lambda: clock[0])  # relógio controlado: ordem dos eventos explícita em qualquer plataforma
     engine, db, s = make_engine()
     g1, t1 = own_position(engine, db, "AAPL", 100)
     g2, t2 = own_position(engine, db, "AAPL", 20)
     engine.ibkr.positions["AAPL"] = 120
     pos = dict(symbol="AAPL", qty=120, avg_cost=100, market_price=101)
+    clock[0] = NOW + timedelta(minutes=1)
     asyncio.run(engine._protect_if_naked("AAPL", pos))
+    clock[0] = NOW + timedelta(minutes=2)
     db.close_trade_reconciled(t2)
+    clock[0] = NOW + timedelta(minutes=3)
     g3, t3 = own_position(engine, db, "AAPL", 20)
     engine.ibkr.positions["AAPL"] = 120
+    clock[0] = NOW + timedelta(minutes=4)
     asyncio.run(engine._resize_exits("AAPL", pos, None, "repor proteção"))
     oid = db._query("SELECT sl_order_id FROM order_groups WHERE id=?", (g1,))[0]["sl_order_id"]
     db.set_perm_id(oid, 999, group_id=g1)
+    clock[0] = NOW + timedelta(minutes=5)
     db.close_trade_reconciled(t1)
     db.close_trade_reconciled(t3)
     # estado gravado pela 1.0.12: cobertura AMPLA por grupo acumulada ao longo das substituições
