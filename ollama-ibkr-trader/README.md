@@ -23,11 +23,30 @@ escuro).
 > de perda aplicam-se o StoplossGuard, o travão de perdas seguidas e o cooldown
 > após saída em perda. Tudo ajustável em `config.json` (validado ao carregar).
 >
-> Versão 1.0.13: resposta à revisão da 1.0.12 (5 achados, 4 P1 e 1 P2), ver
-> `../reports/Resposta à revisão 1.0.12.md`; antes, as respostas às revisões
+> Versão 1.0.14: resposta à revisão da 1.0.13 (4 achados P1), ver
+> `../reports/Resposta à revisão 1.0.13.md`; antes, as respostas às revisões
 > anteriores e à auditoria da 1.0.2 na mesma pasta.
 
-## Invariantes de segurança (1.0.13)
+## Invariantes de segurança (1.0.14)
+
+- **Identidade rejeitada = nenhuma mutação**: um estado de ordem cujo `permId`
+  não valida nenhum grupo do bot termina sem tocar em entradas ou fechos
+  pendentes, reservas ou trades; um `orderId` coincidente nunca cancela uma
+  entrada viva. Um cancelamento com a identidade correta continua a libertar a
+  entrada e a reserva.
+- **Cobertura só dos grupos validados**: a cobertura por ordem é lida apenas
+  para os grupos que o `permId` da execução validou; uma execução nunca
+  recupera cobertura de um grupo rejeitado pela identidade permanente.
+- **Cobertura legada migrada com evidência**: as linhas por grupo gravadas pela
+  1.0.12 são convertidas em cobertura por ordem apenas para as ordens de saída
+  colocadas depois de o trade existir (instante do seu grupo); ordens anteriores
+  nunca passam a cobrir trades novos; as linhas legadas são removidas.
+- **Migração identificada por versão**: os resumos de saída e rótulos finais
+  potencialmente desatualizados por versões anteriores são recalculados uma vez
+  (marcador `migration:summaries`), com invalidação da calibração quando algum
+  rótulo muda, independentemente do caminho de atualização seguido.
+
+## Invariantes de segurança herdados (1.0.13)
 
 - **Identidade conhecida só é reparada com prova**: um `permId` conhecido e
   incompatível com o estado recebido só é substituído quando a ordem VIVA na

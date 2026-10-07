@@ -280,6 +280,8 @@ def iso(dt: datetime) -> str:
 
 
 class Database:
+    SUMMARY_MIGRATION = "1.0.14"  # versão da última migração que recalculou resumos/rótulos (AE04)
+
     def __init__(self, path: Path | str = ":memory:") -> None:
         self._lock = threading.RLock()
         self.path = str(path)
@@ -373,6 +375,34 @@ class Database:
                     relabelled += 1
             if relabelled:
                 self.set_kv("labels_changed_at", iso(utc_now()))
+            # Migração explícita da cobertura LEGADA por grupo (1.0.12) para cobertura por ordem (AE03): um trade só pode ter
+            # sido coberto pelas ordens de saída do grupo colocadas DEPOIS de o próprio trade existir (ts do seu grupo); as
+            # ordens anteriores nunca o cobriram. A linha do próprio grupo do trade é redundante. As linhas legadas são removidas.
+            for gid, tid in self._conn.execute("SELECT group_id, trade_id FROM exit_coverage").fetchall():
+                own = self._conn.execute("SELECT group_id, (SELECT ts FROM order_groups WHERE id=trades.group_id) FROM trades WHERE id=?",
+                                         (tid,)).fetchone()
+                if own and own[0] != gid:
+                    started = own[1] or ""
+                    orders = self._conn.execute(
+                        """SELECT DISTINCT order_id FROM order_history WHERE group_id=? AND ts >= ?
+                           AND (leg IN ('TP','SL') OR (leg='PARENT' AND (SELECT role FROM order_groups WHERE id=?)='CLOSE'))""",
+                        (gid, started, gid)).fetchall()
+                    for (oid,) in orders:
+                        self._conn.execute("INSERT OR IGNORE INTO order_coverage (order_id, group_id, trade_id) VALUES (?,?,?)", (oid, gid, tid))
+                self._conn.execute("DELETE FROM exit_coverage WHERE group_id=? AND trade_id=?", (gid, tid))
+            self._conn.commit()
+            # Migração identificada por VERSÃO (AE04): resumos de saída e rótulos finais potencialmente desatualizados por
+            # versões anteriores (razões preenchidas sem recalcular) são recalculados uma vez, de forma idempotente.
+            if (self.get_kv("migration:summaries") or "") != self.SUMMARY_MIGRATION:
+                changed = 0
+                for (tid,) in self._conn.execute(
+                        "SELECT DISTINCT trade_id FROM fill_allocations WHERE reason IS NOT NULL ORDER BY trade_id").fetchall():
+                    updated = self.refresh_exit_summary(int(tid))
+                    if updated is not None and self.relabel_from_ledger(updated):
+                        changed += 1
+                if changed:
+                    self.set_kv("labels_changed_at", iso(utc_now()))
+                self.set_kv("migration:summaries", self.SUMMARY_MIGRATION)
             # Backfill idempotente (V04): grupos anteriores à tabela order_history ficam com as suas pernas
             # registadas, para que uma reparação posterior arquive em vez de perder os IDs antigos.
             rows = self._conn.execute(
@@ -1299,8 +1329,8 @@ class Database:
         where_symbol = "AND symbol=?" if symbol else ""
         rows = self._query(
             f"""SELECT * FROM trades WHERE (group_id IN ({marks}) OR id IN (SELECT trade_id FROM exit_coverage WHERE group_id IN ({marks}))
-                OR id IN (SELECT trade_id FROM order_coverage WHERE order_id=?))
-                {where_symbol} ORDER BY id""", (*groups, *groups, int(order_id), *([symbol] if symbol else [])))
+                OR id IN (SELECT trade_id FROM order_coverage WHERE order_id=? AND group_id IN ({marks})))
+                {where_symbol} ORDER BY id""", (*groups, *groups, int(order_id), *groups, *([symbol] if symbol else [])))
         if not rows:
             # Fecho por sinal gravado por uma versão anterior (sem ``exit_coverage``): cobre, por CRONOLOGIA, os trades do
             # ativo abertos ANTES da ordem de fecho — nunca os abertos depois (Z04).

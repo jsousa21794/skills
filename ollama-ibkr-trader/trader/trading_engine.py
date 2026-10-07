@@ -1465,6 +1465,7 @@ class TradingEngine:
         group = self.db.group_for_order(order_id, symbol=symbol, con_id=getattr(trade.contract, "conId", None) or None,
                                         account=getattr(trade.order, "account", None) or None, perm_id=perm_id)
         correct_inherited = False
+        candidates: list[dict[str, Any]] = []
         if group is None and perm_id:
             candidates = self.db.groups_for_order(int(order_id), symbol=symbol)
             if len(candidates) == 1 and self._live_order_proof(order_id, symbol, perm_id):
@@ -1485,6 +1486,10 @@ class TradingEngine:
                 else:
                     log.warning("Estado da ordem %d (%s, permId %s) ambíguo entre %d grupos do bot: identidade não gravada.",
                                 order_id, symbol, perm_id, len(candidates))
+        if group is None and candidates:
+            # Identidade REJEITADA (grupos do bot existem, nenhum validado por este permId): nenhum estado terminal pode
+            # tocar em entradas/fechos pendentes, reservas ou trades — um orderId coincidente não é prova (AE01).
+            return
         if group is None and order_id not in self._pending_entries and not any(
                 pc.get("order_id") == order_id for pc in self._pending_close.values()):
             return
