@@ -281,6 +281,7 @@ def iso(dt: datetime) -> str:
 
 class Database:
     SUMMARY_MIGRATION = "1.0.14"  # versão da última migração que recalculou resumos/rótulos (AE04)
+    COVERAGE_MIGRATION = "1.0.16"  # versão da última reavaliação da cobertura por ordem pelo ciclo de vida (AG02)
 
     def __init__(self, path: Path | str = ":memory:") -> None:
         self._lock = threading.RLock()
@@ -417,6 +418,43 @@ class Database:
                 if changed:
                     self.set_kv("labels_changed_at", iso(utc_now()))
                 self.set_kv("migration:summaries", self.SUMMARY_MIGRATION)
+            # Reparação identificada por VERSÃO da cobertura por ordem (AG02): a migração da 1.0.14 inferiu relações sem
+            # respeitar o ciclo de vida. Todas as linhas são reavaliadas pelo histórico: uma ordem só pode cobrir um trade se
+            # foi colocada depois de o trade existir e antes de ele fechar/ser reconciliado. A cobertura válida criada
+            # diretamente pelas ordens satisfaz essas condições e é preservada. Idempotente.
+            if (self.get_kv("migration:coverage") or "") != self.COVERAGE_MIGRATION:
+                removed = 0
+                for oid, gid, tid in self._conn.execute("SELECT order_id, group_id, trade_id FROM order_coverage").fetchall():
+                    placed = self._conn.execute("SELECT MIN(id), MIN(ts) FROM order_history WHERE order_id=? AND group_id=?",
+                                                (oid, gid)).fetchone()
+                    trade = self._conn.execute(
+                        """SELECT group_id, status, COALESCE(reconciled_ts, exit_ts),
+                                  (SELECT MIN(id) FROM order_history WHERE group_id=trades.group_id) FROM trades WHERE id=?""",
+                        (tid,)).fetchone()
+                    if not trade or not placed or placed[0] is None:
+                        continue  # sem histórico não há prova para remover nem para confirmar: mantém-se
+                    own_group, status, closed, trade_start = trade
+                    invalid = False
+                    if own_group != gid and trade_start is not None and placed[0] < trade_start:
+                        invalid = True  # ordem anterior à existência do trade
+                    if status == "CLOSED" and closed and placed[1] and placed[1] >= closed:
+                        invalid = True  # ordem colocada no fecho/reconciliação do trade ou depois
+                    if invalid:
+                        self._conn.execute("DELETE FROM order_coverage WHERE order_id=? AND group_id=? AND trade_id=?", (oid, gid, tid))
+                        removed += 1
+                self._conn.commit()
+                self.set_kv("migration:coverage", self.COVERAGE_MIGRATION)
+            # Reparação de rótulos indevidamente FINALIZADOS em trades ainda abertos (AG03): uma versão anterior finalizou pela
+            # regra do ledger decisões cujo trade continua OPEN. Restaura o estado provisório (rótulo anterior guardado em
+            # ``provisional_correct``) e devolve a decisão à fila provisória. Sempre idempotente: só atua onde há inconsistência.
+            stale = self._conn.execute(
+                """SELECT d.id, d.provisional_correct FROM decisions d JOIN trades t ON t.decision_id = d.id
+                   WHERE d.label_final = 1 AND d.settled_ts IS NOT NULL AND t.status = 'OPEN' AND d.label_source LIKE 'ledger:%'""").fetchall()
+            for did, prov in stale:
+                self._conn.execute("UPDATE decisions SET label_final=0, correct=?, label_source='provisório:restaurado' WHERE id=?", (prov, did))
+            if stale:
+                self._conn.commit()
+                self.set_kv("labels_changed_at", iso(utc_now()))
             # Backfill idempotente (V04): grupos anteriores à tabela order_history ficam com as suas pernas
             # registadas, para que uma reparação posterior arquive em vez de perder os IDs antigos.
             rows = self._conn.execute(

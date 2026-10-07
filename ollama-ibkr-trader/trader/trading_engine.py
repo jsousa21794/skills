@@ -1683,6 +1683,12 @@ class TradingEngine:
                                  "reconciliar com a corretora.", symbol, trade_id, float(reopened["filled_qty"] or 0),
                                  float(reopened["exit_qty"] or 0), float(reopened["filled_qty"] or 0) - float(reopened["exit_qty"] or 0))
                 entry = self._pending_entries.get(execution.orderId)
+                if entry and not self._event_targets(group, self._pending_entry_group(int(execution.orderId), entry)):
+                    # Execução de OUTRO grupo com o mesmo orderId (identidade validada): a entrada pendente deste grupo e a
+                    # sua reserva ficam intactas (AG01).
+                    log.critical("[%s] Execução %s (ordem %d) pertence ao grupo %s, não à entrada pendente (grupo %s): reserva mantida.",
+                                 symbol, execution.execId, execution.orderId, group["id"], self._pending_entry_group(int(execution.orderId), entry))
+                    entry = None
                 if entry:
                     entry["filled"] += float(execution.shares)
                     if entry["filled"] + 1e-9 >= entry["qty"]:
@@ -1696,7 +1702,7 @@ class TradingEngine:
         elif group["role"] == "CLOSE":
             self._allocate_exit(symbol, None, execution, ts, "SIGNAL", commission_value, group_id=int(group["id"]))
             pc = self._pending_close.get(symbol)
-            if pc and pc.get("order_id") == execution.orderId:
+            if pc and pc.get("order_id") == execution.orderId and self._event_targets(group, pc.get("group_id")):
                 pc["filled"] += float(execution.shares)
                 if pc["filled"] + 1e-9 >= pc["qty"]:
                     self._pending_close.pop(symbol, None)

@@ -23,11 +23,29 @@ escuro).
 > de perda aplicam-se o StoplossGuard, o travão de perdas seguidas e o cooldown
 > após saída em perda. Tudo ajustável em `config.json` (validado ao carregar).
 >
-> Versão 1.0.15: resposta à revisão da 1.0.14 (3 achados, 2 P1 e 1 P2), ver
-> `../reports/Resposta à revisão 1.0.14.md`; antes, as respostas às revisões
+> Versão 1.0.16: resposta à revisão da 1.0.15 (3 achados, 2 P1 e 1 P2), ver
+> `../reports/Resposta à revisão 1.0.15.md`; antes, as respostas às revisões
 > anteriores e à auditoria da 1.0.2 na mesma pasta.
 
-## Invariantes de segurança (1.0.15)
+## Invariantes de segurança (1.0.16)
+
+- **Execuções também respeitam o grupo pendente**: uma execução validada para
+  um grupo histórico (mesmo `orderId`, `permId` exato) nunca incrementa nem
+  liberta a entrada ou o fecho pendente de outro grupo; só a execução da própria
+  ordem liberta a reserva.
+- **Reparação da cobertura inferida**: uma migração identificada por versão
+  reavalia todas as relações de cobertura por ordem pelo ciclo de vida (ordem
+  colocada depois de o trade existir e antes de ele fechar) e remove as que uma
+  versão anterior inferiu sem essa prova; a cobertura criada diretamente pelas
+  ordens é preservada. Sequências de atualização (1.0.12 → 1.0.14 → atual) dão
+  o mesmo resultado que a atualização direta.
+- **Rótulos finais de trades abertos são restaurados**: decisões que uma versão
+  anterior finalizou pela regra do ledger com o trade ainda aberto voltam ao
+  estado provisório (rótulo anterior recuperado) e à fila provisória, com a
+  calibração invalidada; a reparação corre sempre e só atua onde há
+  inconsistência.
+
+## Invariantes de segurança herdados (1.0.15)
 
 - **Evento só altera o objeto pendente do seu grupo**: entradas e fechos
   pendentes guardam o grupo a que pertencem; um estado terminal validado para
