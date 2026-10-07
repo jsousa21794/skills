@@ -108,21 +108,9 @@ class Settler:
         """Rótulo de uma operação pelo que REALMENTE aconteceu: saída por TP = 1, por stop = 0; outras saídas
         (sinal contrário, fim de dia, reconciliação) não respondem à pergunta "TP antes do stop" e ficam
         censuradas com a razão explícita; ainda aberta = (None, None) para avaliar pelos níveis absolutos."""
-        if trade.get("status") != "CLOSED":
-            return None, None
-        reason = (trade.get("exit_reason") or "").upper()
-        if "|" in reason or "?" in reason:
-            # Sequência não comprovada (razões diferentes no mesmo instante) ou resumo incompleto: o primeiro toque é
-            # INDETERMINADO -> censurado, fora do treino binário (AC05/AC04).
-            return None, f"ledger:{reason}"
-        # Saída MISTA (ex.: "TP+SL", razões na ordem cronológica das execuções): o PRIMEIRO toque responde à pergunta
-        # "TP antes do stop", tal como no rótulo por trajetória de preço; a fonte guarda a sequência completa (AB06).
-        first = reason.split("+")[0]
-        if first == "TP":
-            return 1, f"ledger:{reason}"
-        if first == "SL":
-            return 0, f"ledger:{reason}"
-        return None, f"ledger:{reason or 'OUTRO'}"
+        # Regra ÚNICA (Database.ledger_label), partilhada com a migração (AD04): primeiro toque decide (TP=1, SL=0);
+        # empate no primeiro instante (``SL|TP``) ou resumo incompleto (``?``) ficam censurados (AB06/AC05/AD05).
+        return Database.ledger_label(trade.get("exit_reason"), trade.get("status"))
 
     def finalize_provisional(self) -> int:
         """Rótulos PROVISÓRIOS (operação ainda aberta no horizonte) passam a FINAIS quando o trade fecha, pelo

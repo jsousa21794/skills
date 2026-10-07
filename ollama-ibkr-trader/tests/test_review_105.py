@@ -115,7 +115,9 @@ def test_w03_unallocated_fill_is_reconciled_when_identity_arrives():
                         acctNumber=engine.ibkr.account, clientId=s.ib_client_id, orderRef=s.order_ref, permId=888), commissionReport=None)
     engine._on_fill(None, f)
     assert db.fill_by_exec("late-tp") is not None and db.allocations_for_fill("late-tp") == []
-    # o estado correto (nosso) corrige o permId e reprocessa o fill registado sem alocação
+    # o estado correto (nosso) corrige o permId — com a PROVA da ordem viva na corretora (AD01) — e reprocessa o fill
+    engine.ibkr.open_orders_all = [NS(order=NS(orderId=oid, permId=888, parentId=0), contract=NS(symbol="AAPL"),
+                                      orderStatus=NS(status="Filled"))]
     engine._on_order_status(NS(orderStatus=NS(status="Filled"),
                                order=NS(orderId=oid, action="SELL", permId=888, clientId=s.ib_client_id, account=engine.ibkr.account,
                                         orderRef=s.order_ref), contract=NS(symbol="AAPL", secType="STK", conId=engine.ibkr.con_id("AAPL"))))

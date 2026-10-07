@@ -198,6 +198,13 @@ CREATE TABLE IF NOT EXISTS remote_commands (
 -- Histórico de TODAS as ordens que já pertenceram a um grupo (pai, TP, SL), incluindo as
 -- substituídas por uma reparação: um fill tardio de um filho antigo continua a encontrar o
 -- seu grupo/trade (N07).
+CREATE TABLE IF NOT EXISTS order_coverage (
+    order_id INTEGER NOT NULL,     -- ordem de saída concreta (AD03): cobertura congelada no momento da colocação
+    group_id INTEGER NOT NULL,
+    trade_id INTEGER NOT NULL,
+    PRIMARY KEY (order_id, trade_id)
+);
+
 CREATE TABLE IF NOT EXISTS exit_coverage (
     group_id INTEGER NOT NULL,     -- grupo cuja(s) ordem(ns) de saída cobre(m) o trade (Z04)
     trade_id INTEGER NOT NULL,
@@ -330,10 +337,12 @@ class Database:
             pending = self._conn.execute(
                 """SELECT a.id, f.order_id, f.side, f.symbol, t.direction, t.group_id FROM fill_allocations a
                    JOIN fills f ON f.exec_id = a.exec_id JOIN trades t ON t.id = a.trade_id WHERE a.reason IS NULL""").fetchall()
+            touched: set[int] = set()
             for alloc_id, order_id, side, symbol, direction, trade_group in pending:
                 entry_side = "BOT" if int(direction) > 0 else "SLD"
                 if (side or "").upper() == entry_side:
                     continue  # entrada: sem razão de saída
+                touched.add(int(self._conn.execute("SELECT trade_id FROM fill_allocations WHERE id=?", (alloc_id,)).fetchone()[0]))
                 reason = "OUTRO"
                 groups = self._conn.execute(
                     """SELECT id, role, parent_order_id, tp_order_id, sl_order_id FROM order_groups WHERE symbol=? AND (parent_order_id=?
@@ -354,6 +363,16 @@ class Database:
                     if reason != "OUTRO":
                         break
                 self._conn.execute("UPDATE fill_allocations SET reason=? WHERE id=?", (reason, alloc_id))
+            self._conn.commit()
+            # Resumos e rótulos FINAIS dos trades afetados são recalculados na própria migração (AD04): uma operação já
+            # fechada não volta a receber execuções que o fizessem. Idempotente (só trades com alocações preenchidas agora).
+            relabelled = 0
+            for tid in sorted(touched):
+                updated = self.refresh_exit_summary(tid)
+                if updated is not None and self.relabel_from_ledger(updated):
+                    relabelled += 1
+            if relabelled:
+                self.set_kv("labels_changed_at", iso(utc_now()))
             # Backfill idempotente (V04): grupos anteriores à tabela order_history ficam com as suas pernas
             # registadas, para que uma reparação posterior arquive em vez de perder os IDs antigos.
             rows = self._conn.execute(
@@ -1041,7 +1060,7 @@ class Database:
 
     def exit_order_ids_for_trade(self, trade_id: int) -> set[int]:
         """Ordens de saída (TP/SL ativas e arquivadas, fechos por sinal) de todos os grupos que cobrem o trade."""
-        ids: set[int] = set()
+        ids: set[int] = {int(r["order_id"]) for r in self._query("SELECT order_id FROM order_coverage WHERE trade_id=?", (int(trade_id),))}
         for g in self._query(
                 """SELECT g.* FROM order_groups g WHERE g.id IN (SELECT group_id FROM trades WHERE id=?)
                    OR g.id IN (SELECT group_id FROM exit_coverage WHERE trade_id=?)""", (int(trade_id), int(trade_id))):
@@ -1163,15 +1182,21 @@ class Database:
             return None
         # Sequência só é comprovada quando os instantes de execução a ordenam: razões DIFERENTES no mesmo instante
         # tornam o primeiro toque indeterminado -> ``SL|TP`` (ordem alfabética, censurado no treino) (AC05).
-        by_ts: dict[str, set[str]] = {}
+        by_ts: dict[str, list[str]] = {}
         for r in rows:
-            by_ts.setdefault(r["ts"], set()).add(r["reason"])
-        indeterminate = any(len(v) > 1 for v in by_ts.values())
-        reasons: list[str] = []
-        for r in rows:
-            if r["reason"] not in reasons:
-                reasons.append(r["reason"])
-        label = "|".join(sorted(reasons)) if indeterminate else "+".join(reasons)
+            group = by_ts.setdefault(r["ts"], [])
+            if r["reason"] not in group:
+                group.append(r["reason"])
+        instants = [by_ts[k] for k in sorted(by_ts)]
+        first = instants[0]
+        # Só o PRIMEIRO instante decide o primeiro toque: um empate posterior não apaga um toque já comprovado (AD05).
+        label = "|".join(sorted(first)) if len(first) > 1 else first[0]
+        seen = set(first)
+        for group in instants[1:]:
+            for reason in sorted(group):
+                if reason not in seen:
+                    seen.add(reason)
+                    label += "+" + reason
         trade = self._query("SELECT exit_qty FROM trades WHERE id=?", (int(trade_id),))[0]
         covered = sum(float(r["shares"]) for r in rows)
         if covered + 1e-9 < float(trade["exit_qty"] or 0):
@@ -1182,6 +1207,38 @@ class Database:
         self._execute("UPDATE trades SET exit_reason=?, exit_ts=?, exit_price=? WHERE id=?",
                       (label, last_ts, price, int(trade_id)))
         return self._query("SELECT * FROM trades WHERE id=?", (int(trade_id),))[0]
+
+    @staticmethod
+    def ledger_label(exit_reason: Optional[str], status: Optional[str]) -> tuple[Optional[int], Optional[str]]:
+        """Rótulo de uma operação pelo que REALMENTE aconteceu (regra única, usada pelo avaliador e pela migração):
+        TP = 1, stop = 0 pelo PRIMEIRO toque; ``SL|TP`` (empate no primeiro instante) ou ``?`` (resumo incompleto) ficam
+        censurados; outras saídas (sinal, reconciliação) censuradas com a razão; ainda aberta = (None, None)."""
+        if status != "CLOSED":
+            return None, None
+        reason = (exit_reason or "").upper()
+        first = reason.split("+")[0]
+        if "|" in first or "?" in reason:
+            return None, f"ledger:{reason}"
+        if first == "TP":
+            return 1, f"ledger:{reason}"
+        if first == "SL":
+            return 0, f"ledger:{reason}"
+        return None, f"ledger:{reason or 'OUTRO'}"
+
+    def relabel_from_ledger(self, trade: dict[str, Any]) -> bool:
+        """Atualiza o rótulo FINAL da decisão de um trade fechado pela regra do ledger; devolve True se mudou."""
+        decision_id = trade.get("decision_id")
+        if not decision_id:
+            return False
+        rows = self._query("SELECT settled_ts, correct, label_source FROM decisions WHERE id=?", (int(decision_id),))
+        if not rows or rows[0]["settled_ts"] is None:
+            return False
+        label, source = self.ledger_label(trade.get("exit_reason"), trade.get("status"))
+        source = source or "ledger:OUTRO"
+        if rows[0]["correct"] == label and rows[0]["label_source"] == source:
+            return False
+        self.finalize_label(int(decision_id), correct=label, label_source=source)
+        return True
 
     @staticmethod
     def exit_components(reason: Optional[str]) -> set[str]:
@@ -1198,10 +1255,21 @@ class Database:
         self._execute("UPDATE decisions SET label_final=0 WHERE id=? AND settled_ts IS NOT NULL AND label_final=1", (int(decision_id),))
         self.set_kv("labels_changed_at", iso(utc_now()))
 
-    def add_exit_coverage(self, group_id: int, trade_ids: Iterable[int]) -> None:
-        """Relação EXPLÍCITA entre uma ordem de saída (grupo) e os trades que ela cobre (Z04)."""
+    def add_exit_coverage(self, group_id: int, trade_ids: Iterable[int], order_ids: Optional[Iterable[int]] = None) -> None:
+        """Relação EXPLÍCITA entre ordens de saída e os trades que cobrem (Z04). Com ``order_ids`` a cobertura é por ORDEM
+        concreta e fica congelada no momento da colocação: uma proteção nova nunca amplia a cobertura das ordens
+        anteriores do mesmo grupo (AD03). Sem ``order_ids`` (legado) a cobertura é do grupo inteiro."""
+        trade_ids = [int(t) for t in trade_ids]
+        if order_ids:
+            for oid in order_ids:
+                if oid is None:
+                    continue
+                for tid in trade_ids:
+                    self._execute("INSERT OR IGNORE INTO order_coverage (order_id, group_id, trade_id) VALUES (?,?,?)",
+                                  (int(oid), int(group_id), tid))
+            return
         for tid in trade_ids:
-            self._execute("INSERT OR IGNORE INTO exit_coverage (group_id, trade_id) VALUES (?,?)", (int(group_id), int(tid)))
+            self._execute("INSERT OR IGNORE INTO exit_coverage (group_id, trade_id) VALUES (?,?)", (int(group_id), tid))
 
     def trades_for_order(self, order_id: int, symbol: Optional[str] = None, perm_id: Optional[int] = None,
                          group_id: Optional[int] = None) -> list[dict[str, Any]]:
@@ -1230,8 +1298,9 @@ class Database:
         marks = ",".join("?" * len(groups))
         where_symbol = "AND symbol=?" if symbol else ""
         rows = self._query(
-            f"""SELECT * FROM trades WHERE (group_id IN ({marks}) OR id IN (SELECT trade_id FROM exit_coverage WHERE group_id IN ({marks})))
-                {where_symbol} ORDER BY id""", (*groups, *groups, *([symbol] if symbol else [])))
+            f"""SELECT * FROM trades WHERE (group_id IN ({marks}) OR id IN (SELECT trade_id FROM exit_coverage WHERE group_id IN ({marks}))
+                OR id IN (SELECT trade_id FROM order_coverage WHERE order_id=?))
+                {where_symbol} ORDER BY id""", (*groups, *groups, int(order_id), *([symbol] if symbol else [])))
         if not rows:
             # Fecho por sinal gravado por uma versão anterior (sem ``exit_coverage``): cobre, por CRONOLOGIA, os trades do
             # ativo abertos ANTES da ordem de fecho — nunca os abertos depois (Z04).

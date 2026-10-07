@@ -624,12 +624,26 @@ class TradingEngine:
         self._discrepancies.add(symbol)
         self.db.set_kv(f"conflict:{symbol}", f"{kind} @ {datetime.now(timezone.utc).isoformat()}")
 
-    def _resolve_conflict(self, symbol: str) -> None:
+    def _pending_own_fills(self, symbol: str) -> list[dict[str, Any]]:
+        """Execuções do BOT ainda por alocar neste ativo (identidade ambígua ou entrada por comprovar)."""
+        return [f for f in self.db.unallocated_fills(symbol) if self.db.trades_for_order(int(f["order_id"] or 0), symbol=symbol)]
+
+    def _release_block(self, symbol: str) -> bool:
+        """Ponto ÚNICO de desbloqueio (AD02): a discrepância só sai quando não há execuções próprias pendentes — a
+        resolução de um risco de quantidade (saídas redimensionadas, posição desaparecida) nunca apaga um bloqueio de
+        identidade. Devolve True se o ativo ficou desbloqueado."""
+        if self._pending_own_fills(symbol):
+            self._discrepancies.add(symbol)
+            return False
         self._discrepancies.discard(symbol)
+        return True
+
+    def _resolve_conflict(self, symbol: str) -> None:
         self._reduction_warned.discard(symbol)
         if self.db.get_kv(f"conflict:{symbol}"):
             self.db.set_kv(f"conflict:{symbol}", "")
             log.warning("[%s] Conflito posição/ledger resolvido: execuções explicam a diferença.", symbol)
+        self._release_block(symbol)
 
     def _load_conflicts(self) -> None:
         """Os conflitos sobrevivem a um reinício: ficam na base de dados até as execuções os explicarem (Z01)."""
@@ -806,7 +820,8 @@ class TradingEngine:
         else:
             self.db.update_group_orders(int(trade["group_id"]), tp_order_id=result["tp_order_id"], sl_order_id=result["sl_order_id"])
             open_rows = self.db.open_trades(symbol)
-            self.db.add_exit_coverage(int(trade["group_id"]), [int(r["id"]) for r in open_rows])  # cobre todos os trades abertos (Y07)
+            self.db.add_exit_coverage(int(trade["group_id"]), [int(r["id"]) for r in open_rows],
+                                      order_ids=[result["tp_order_id"], result["sl_order_id"]])  # cobertura por ORDEM, congelada (Y07/AD03)
             for row in open_rows:
                 self.db._execute("UPDATE trades SET stop_price=?, tp_price=? WHERE id=?",
                                  (result["sl_price"], result["tp_price"], row["id"]))
@@ -881,12 +896,10 @@ class TradingEngine:
             return
         if self.db.open_adjustments_for_symbol(symbol) > 1e-9:
             self._discrepancies.add(symbol)  # ajuste provisório por explicar: bloqueio persiste até à execução real (Y03/Y06)
-        elif self.db.unallocated_fills(symbol):
-            self._discrepancies.add(symbol)  # execução por alocar (identidade ambígua ou entrada por comprovar): bloqueio mantém-se (AC02)
-        else:
-            self._discrepancies.discard(symbol)
-            if self.db.open_adjustments_for_symbol(symbol, include_closed=True) <= 1e-9:
-                self._resolve_conflict(symbol)
+        elif not self._release_block(symbol):
+            pass  # execução por alocar (identidade ambígua ou entrada por comprovar): bloqueio mantém-se (AC02/AD02)
+        elif self.db.open_adjustments_for_symbol(symbol, include_closed=True) <= 1e-9:
+            self._resolve_conflict(symbol)
         if not self.ibkr.has_protective_orders(symbol, needed_qty=needed, ours_only=mixed):
             log.critical("[%s] Posição x%g SEM cobertura completa (stops ativos %.0f): a repor proteção.",
                          symbol, pos["qty"], self.ibkr.protective_coverage(symbol))
@@ -978,7 +991,7 @@ class TradingEngine:
             for row in filled_trades:
                 self.db.close_trade_reconciled(row["id"])
                 log.warning("Trade #%d %s sem posição na IBKR -> fechado como RECONCILED (verifica o extrato).", row["id"], symbol)
-            self._discrepancies.discard(symbol)
+            self._release_block(symbol)  # nunca apaga um bloqueio de identidade (AD02)
             self._reduction_warned.discard(symbol)
             if self.db.open_adjustments_for_symbol(symbol, include_closed=True) > 1e-9:
                 # execuções ainda por receber: o resultado fica INDETERMINADO (assinalado na base) até chegarem (Z05);
@@ -1016,7 +1029,8 @@ class TradingEngine:
             rows = self.db.open_trades(symbol)
             if rows:
                 self.db.update_group_orders(int(rows[0]["group_id"]), tp_order_id=result["tp_order_id"], sl_order_id=result["sl_order_id"])
-                self.db.add_exit_coverage(int(rows[0]["group_id"]), [int(r["id"]) for r in rows])
+                self.db.add_exit_coverage(int(rows[0]["group_id"]), [int(r["id"]) for r in rows],
+                                          order_ids=[result["tp_order_id"], result["sl_order_id"]])  # por ORDEM, congelada (AD03)
             for row in rows:
                 self.db._execute("UPDATE trades SET stop_price=?, tp_price=? WHERE id=?", (result["sl_price"], result["tp_price"], row["id"]))
         if not self.ibkr.has_excess_exits(symbol, allowed_qty=allowed) and self.db.open_adjustments_for_symbol(symbol, include_closed=True) <= 1e-9:
@@ -1329,7 +1343,7 @@ class TradingEngine:
                 symbol=symbol, decision_id=decision_id, role="CLOSE", direction=result["direction"], qty=result["qty"],
                 parent_order_id=result["order_id"], tp_order_id=None, sl_order_id=None, ref_price=ctx.snapshot.price,
                 tp_price=None, sl_price=None, account=self.ibkr.account, con_id=self.ibkr.con_id(symbol))
-            self.db.add_exit_coverage(group_id, [int(t["id"]) for t in self.db.open_trades(symbol)])  # Z04
+            self.db.add_exit_coverage(group_id, [int(t["id"]) for t in self.db.open_trades(symbol)], order_ids=[result["order_id"]])  # Z04/AD03
             self._pending_close[symbol] = {"state": "SENT", "order_id": result["order_id"], "group_id": group_id,
                                            "qty": float(result["qty"]), "filled": 0.0, "ts": datetime.now(timezone.utc)}
         self.persistence.reset(symbol)
@@ -1453,10 +1467,15 @@ class TradingEngine:
         correct_inherited = False
         if group is None and perm_id:
             candidates = self.db.groups_for_order(int(order_id), symbol=symbol)
-            if len(candidates) == 1:
-                # Um único grupo com esta ordem e um permId herdado DIFERENTE: associação errada herdada, corrigida pelo
-                # estado da própria ordem (W03). Com vários grupos nunca se substitui uma identidade conhecida (AC01).
+            if len(candidates) == 1 and self._live_order_proof(order_id, symbol, perm_id):
+                # Um único grupo com permId herdado DIFERENTE e a ordem VIVA na corretora confirma este permId: associação
+                # herdada errada, corrigida com prova (W03). Sem essa prova o estado pode ser de uma ordem antiga sem
+                # história nesta base: a identidade conhecida é preservada e a discrepância registada (AD01).
                 group, correct_inherited = candidates[0], True
+            elif len(candidates) == 1:
+                known = self.db.perm_id_for(int(candidates[0]["id"]), int(order_id))
+                log.critical("Estado da ordem %d (%s): permId %s incompatível com o conhecido %s e sem ordem viva que o confirme: "
+                             "identidade preservada; execuções com esse permId ficam pendentes.", order_id, symbol, perm_id, known)
             elif len(candidates) > 1:
                 qty = float(getattr(trade.order, "totalQuantity", 0) or 0)
                 unknown = [g for g in candidates if self.db.perm_id_for(int(g["id"]), int(order_id)) is None]
@@ -1504,6 +1523,17 @@ class TradingEngine:
             if group and group["role"] == "ENTRY" and self.db.order_leg(group, order_id) in ("TP", "SL") \
                     and symbol not in self._pending_close and self.loop:
                 self.loop.create_task(self._reprotect(symbol))
+
+    def _live_order_proof(self, order_id: int, symbol: str, perm_id: Any) -> bool:
+        """A ordem com este orderId está VIVA na corretora, é nossa e tem exatamente este permId (prova adicional, AD01)."""
+        try:
+            for t in self.ibkr.our_open_orders():
+                o = t.order
+                if int(o.orderId) == int(order_id) and t.contract.symbol == symbol and (getattr(o, "permId", None) or None) == perm_id:
+                    return True
+        except Exception:  # noqa: BLE001
+            pass
+        return False
 
     def _reconcile_unallocated_fills(self, symbol: str, order_id: Optional[int] = None) -> None:
         """Execuções já registadas mas sem alocação são reprocessadas com a sua identidade ORIGINAL persistida
@@ -1697,8 +1727,8 @@ class TradingEngine:
                          "alocar (discrepância registada).", symbol, execution.execId, shares, order_id, remaining)
         elif self.db.open_adjustments_for_symbol(symbol, include_closed=True) <= 1e-9 and self.db.get_kv(f"conflict:{symbol}"):
             self._resolve_conflict(symbol)  # as execuções explicaram toda a diferença
-        elif not self.db.unallocated_fills(symbol) and self.db.open_adjustments_for_symbol(symbol, include_closed=True) <= 1e-9:
-            self._discrepancies.discard(symbol)  # saldo por alocar recuperado na totalidade (AA03); o supervisor revalida o resto
+        elif self.db.open_adjustments_for_symbol(symbol, include_closed=True) <= 1e-9:
+            self._release_block(symbol)  # saldo por alocar recuperado na totalidade (AA03); o supervisor revalida o resto
 
     def _relabel_decision(self, trade_row: dict[str, Any]) -> None:
         """Uma correção tardia que muda o resultado de um trade encerrado atualiza, na mesma operação lógica, o rótulo
@@ -1706,16 +1736,10 @@ class TradingEngine:
         decision_id = trade_row.get("decision_id")
         if not decision_id:
             return
-        rows = self.db._query("SELECT settled_ts, correct, label_source FROM decisions WHERE id=?", (int(decision_id),))
-        if not rows or rows[0]["settled_ts"] is None:
-            return  # ainda não avaliada: o avaliador usará o ledger já corrigido
-        label, source = Settler._ledger_label(trade_row, datetime.now(timezone.utc))
-        source = source or "ledger:OUTRO"
-        if rows[0]["correct"] == label and rows[0]["label_source"] == source:
-            return
-        self.db.finalize_label(int(decision_id), correct=label, label_source=source)
-        log.warning("Decisão #%d: rótulo final atualizado por execução tardia (%s -> %s, acerto %s).",
-                    int(decision_id), rows[0]["label_source"], source, label)
+        before = self.db._query("SELECT label_source FROM decisions WHERE id=?", (int(decision_id),))
+        if self.db.relabel_from_ledger(trade_row):
+            log.warning("Decisão #%d: rótulo final atualizado por execução tardia (%s -> %s).", int(decision_id),
+                        before[0]["label_source"] if before else None, trade_row.get("exit_reason"))
 
     def _on_commission(self, trade: Any, fill: Any, report: Any) -> None:
         """CommissionReport real da IBKR: substitui a estimativa e corrige exatamente os trades que a execução tocou."""

@@ -23,11 +23,34 @@ escuro).
 > de perda aplicam-se o StoplossGuard, o travão de perdas seguidas e o cooldown
 > após saída em perda. Tudo ajustável em `config.json` (validado ao carregar).
 >
-> Versão 1.0.12: resposta à revisão da 1.0.11 (6 achados, 5 P1 e 1 P2), ver
-> `../reports/Resposta à revisão 1.0.11.md`; antes, as respostas às revisões
+> Versão 1.0.13: resposta à revisão da 1.0.12 (5 achados, 4 P1 e 1 P2), ver
+> `../reports/Resposta à revisão 1.0.12.md`; antes, as respostas às revisões
 > anteriores e à auditoria da 1.0.2 na mesma pasta.
 
-## Invariantes de segurança (1.0.12)
+## Invariantes de segurança (1.0.13)
+
+- **Identidade conhecida só é reparada com prova**: um `permId` conhecido e
+  incompatível com o estado recebido só é substituído quando a ordem VIVA na
+  corretora, nossa e com esse `orderId`, confirma o novo `permId`; sem essa
+  prova a identidade é preservada, o conflito registado e as execuções com o
+  `permId` incompatível ficam pendentes (nunca consomem um trade).
+- **Desbloqueio centralizado**: a discrepância de um ativo só é retirada por um
+  único ponto, que exige ausência de execuções próprias por alocar; redimensionar
+  saídas, reconciliar uma posição desaparecida ou explicar ajustes nunca apaga
+  um bloqueio de identidade.
+- **Cobertura por ordem, congelada**: cada ordem de saída (proteção agregada,
+  fecho por sinal) cobre o conjunto de trades fixado no momento da colocação
+  (`order_coverage`); uma proteção nova nunca amplia a cobertura das ordens
+  anteriores do mesmo grupo, e os ajustes provisórios seguem essa cobertura.
+- **Migração recalcula o que corrigiu**: ao preencher razões de alocações
+  antigas, a migração recalcula o resumo de saída dos trades afetados, atualiza
+  os rótulos finais pela regra única do ledger e invalida a calibração
+  dependente, de forma idempotente e sem esperar por novas execuções.
+- **Só o primeiro instante decide**: um empate TP/SL no primeiro instante de
+  execução continua indeterminado (`SL|TP`, censurado); um empate posterior não
+  apaga um primeiro toque já comprovado (`TP+SL`, rótulo 1).
+
+## Invariantes de segurança herdados (1.0.12)
 
 - **Identidade permanente nunca é sobrescrita**: o estado de uma ordem resolve
   o grupo com o seu próprio `permId` (correspondência exata primeiro); um
