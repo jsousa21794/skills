@@ -23,11 +23,40 @@ escuro).
 > de perda aplicam-se o StoplossGuard, o travão de perdas seguidas e o cooldown
 > após saída em perda. Tudo ajustável em `config.json` (validado ao carregar).
 >
-> Versão 1.0.11: resposta à revisão da 1.0.10 (6 achados P1), ver
-> `../reports/Resposta à revisão 1.0.10.md`; antes, as respostas às revisões
+> Versão 1.0.12: resposta à revisão da 1.0.11 (6 achados, 5 P1 e 1 P2), ver
+> `../reports/Resposta à revisão 1.0.11.md`; antes, as respostas às revisões
 > anteriores e à auditoria da 1.0.2 na mesma pasta.
 
-## Invariantes de segurança (1.0.11)
+## Invariantes de segurança (1.0.12)
+
+- **Identidade permanente nunca é sobrescrita**: o estado de uma ordem resolve
+  o grupo com o seu próprio `permId` (correspondência exata primeiro); um
+  `permId` conhecido e diferente nunca é substituído quando a ordem pertence a
+  vários grupos; só um grupo único com `permId` herdado errado é corrigido pelo
+  estado da própria ordem. Com vários grupos sem identidade, a quantidade da
+  ordem é a única evidência aceite; sem ela nada é gravado.
+- **Uma ordem, um grupo**: a proteção agregada que cobre vários trades pertence
+  ao grupo do primeiro trade e cobre os restantes em `exit_coverage`; nenhuma
+  ordem do bot fica partilhada por grupos distintos.
+- **Bloqueio por execução pendente persiste**: um ativo com execuções do bot
+  por alocar (identidade ambígua ou entrada por comprovar) mantém a discrepância
+  em todos os ciclos da supervisão e após reinício, até a identidade ser
+  revelada e a alocação concluída.
+- **Sem custo de entrada não há resultado**: uma saída recebida antes de
+  qualquer execução de entrada fica pendente e é contabilizada quando a entrada
+  chega, com o custo comprovado. O saldo disponível de um trade é entradas −
+  saídas − ajustes por explicar.
+- **Migração das razões**: alocações de saída anteriores recebem a razão pela
+  identidade histórica da ordem (perna TP/SL, fecho por sinal) e pela direção
+  do trade; um resumo que não cobre toda a saída fica marcado `+?` e censurado.
+- **Empate temporal é indeterminado**: razões diferentes no mesmo instante de
+  execução produzem `SL|TP` (sem ordem comprovada), rótulo censurado e fora do
+  treino binário; só instantes distintos ordenam o primeiro toque.
+- **Contadores por componente**: stops e take-profits de saídas mistas
+  (`SL+TP`, `TP+SL`, `SL|TP`) contam uma vez cada por trade nos limites de
+  risco (StoplossGuard) e nos relatórios.
+
+## Invariantes de segurança herdados (1.0.11)
 
 - **Identidade exata prevalece, ambiguidade fica pendente**: ao associar uma
   execução a um grupo, uma correspondência exata de `permId` ganha sempre a um

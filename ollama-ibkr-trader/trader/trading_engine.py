@@ -636,6 +636,9 @@ class TradingEngine:
         for symbol in self.db.kv_with_prefix("conflict:"):
             if self._conflict_pending(symbol):
                 self._discrepancies.add(symbol)
+        for fill in self.db.unallocated_fills():
+            if self.db.trades_for_order(int(fill["order_id"] or 0), symbol=fill["symbol"]):
+                self._discrepancies.add(fill["symbol"])  # execução do bot por alocar: a causa persiste até ser esclarecida (AC02)
 
     def _own_qty(self, symbol: str) -> float:
         """Quantidade (com sinal) que o bot abriu e ainda não fechou, segundo a base de dados."""
@@ -802,8 +805,11 @@ class TradingEngine:
             log.warning("Posição %s sem registo: trade #%d criado a partir da posição da corretora.", symbol, trade_id)
         else:
             self.db.update_group_orders(int(trade["group_id"]), tp_order_id=result["tp_order_id"], sl_order_id=result["sl_order_id"])
-            self.db._execute("UPDATE trades SET stop_price=?, tp_price=? WHERE id=?",
-                             (result["sl_price"], result["tp_price"], trade["id"]))
+            open_rows = self.db.open_trades(symbol)
+            self.db.add_exit_coverage(int(trade["group_id"]), [int(r["id"]) for r in open_rows])  # cobre todos os trades abertos (Y07)
+            for row in open_rows:
+                self.db._execute("UPDATE trades SET stop_price=?, tp_price=? WHERE id=?",
+                                 (result["sl_price"], result["tp_price"], row["id"]))
 
     async def _supervisor_loop(self) -> None:
         """Tarefa CURTA e independente do ciclo de inferência (N14): prazos monotónicos das entradas,
@@ -875,6 +881,8 @@ class TradingEngine:
             return
         if self.db.open_adjustments_for_symbol(symbol) > 1e-9:
             self._discrepancies.add(symbol)  # ajuste provisório por explicar: bloqueio persiste até à execução real (Y03/Y06)
+        elif self.db.unallocated_fills(symbol):
+            self._discrepancies.add(symbol)  # execução por alocar (identidade ambígua ou entrada por comprovar): bloqueio mantém-se (AC02)
         else:
             self._discrepancies.discard(symbol)
             if self.db.open_adjustments_for_symbol(symbol, include_closed=True) <= 1e-9:
@@ -1002,10 +1010,14 @@ class TradingEngine:
         if result is None:
             return  # cancelamentos não confirmados: a discrepância mantém o bloqueio e o supervisor repete
         if result.get("tp_order_id"):
-            # A proteção agregada fica associada a TODOS os trades abertos do ativo (Y07): o fill é depois
-            # distribuído pelos saldos de cada um.
-            for row in self.db.open_trades(symbol):
-                self.db.update_group_orders(int(row["group_id"]), tp_order_id=result["tp_order_id"], sl_order_id=result["sl_order_id"])
+            # A proteção agregada cobre TODOS os trades abertos do ativo (Y07), mas cada ordem pertence a UM só grupo (AC01/AC02):
+            # o par fica no grupo do primeiro trade e os restantes são cobertos explicitamente em ``exit_coverage``; o fill é
+            # depois distribuído pelos saldos de cada um.
+            rows = self.db.open_trades(symbol)
+            if rows:
+                self.db.update_group_orders(int(rows[0]["group_id"]), tp_order_id=result["tp_order_id"], sl_order_id=result["sl_order_id"])
+                self.db.add_exit_coverage(int(rows[0]["group_id"]), [int(r["id"]) for r in rows])
+            for row in rows:
                 self.db._execute("UPDATE trades SET stop_price=?, tp_price=? WHERE id=?", (result["sl_price"], result["tp_price"], row["id"]))
         if not self.ibkr.has_excess_exits(symbol, allowed_qty=allowed) and self.db.open_adjustments_for_symbol(symbol, include_closed=True) <= 1e-9:
             self._resolve_conflict(symbol)
@@ -1433,14 +1445,39 @@ class TradingEngine:
         if not self.ibkr.order_is_ours(trade.order, trade.contract):
             log.debug("Estado da ordem %d (%s) de outra conta/cliente: ignorado.", order_id, symbol)
             return
+        perm_id = getattr(trade.order, "permId", None) or None
+        # O grupo é resolvido com a identidade PERMANENTE do próprio estado (AC01): correspondência exata prevalece,
+        # um grupo com permId conhecido e diferente nunca é escolhido, e vários grupos sem permId são ambíguos (None).
         group = self.db.group_for_order(order_id, symbol=symbol, con_id=getattr(trade.contract, "conId", None) or None,
-                                        account=getattr(trade.order, "account", None) or None)
+                                        account=getattr(trade.order, "account", None) or None, perm_id=perm_id)
+        correct_inherited = False
+        if group is None and perm_id:
+            candidates = self.db.groups_for_order(int(order_id), symbol=symbol)
+            if len(candidates) == 1:
+                # Um único grupo com esta ordem e um permId herdado DIFERENTE: associação errada herdada, corrigida pelo
+                # estado da própria ordem (W03). Com vários grupos nunca se substitui uma identidade conhecida (AC01).
+                group, correct_inherited = candidates[0], True
+            elif len(candidates) > 1:
+                qty = float(getattr(trade.order, "totalQuantity", 0) or 0)
+                unknown = [g for g in candidates if self.db.perm_id_for(int(g["id"]), int(order_id)) is None]
+                by_qty = [g for g in unknown if abs(float(g["qty"] or 0) - qty) < 1e-9]
+                if len(by_qty) == 1:
+                    group = by_qty[0]  # evidência explícita: a quantidade da ordem identifica o grupo candidato (AC02)
+                else:
+                    log.warning("Estado da ordem %d (%s, permId %s) ambíguo entre %d grupos do bot: identidade não gravada.",
+                                order_id, symbol, perm_id, len(candidates))
         if group is None and order_id not in self._pending_entries and not any(
                 pc.get("order_id") == order_id for pc in self._pending_close.values()):
             return
-        perm_id = getattr(trade.order, "permId", None)
         if perm_id and group is not None:
-            self.db.set_perm_id(int(order_id), int(perm_id), group_id=int(group["id"]), overwrite=True)  # identidade durável (V03/W03)
+            known = self.db.perm_id_for(int(group["id"]), int(order_id))
+            if known is None or (correct_inherited and int(known) != int(perm_id)):
+                if known is not None:
+                    log.warning("Ordem %d (%s): permId herdado %s corrigido para %s pelo estado da própria ordem.", order_id, symbol, known, perm_id)
+                self.db.set_perm_id(int(order_id), int(perm_id), group_id=int(group["id"]), overwrite=correct_inherited)  # identidade durável (V03/W03)
+            elif int(known) != int(perm_id):
+                log.critical("Estado da ordem %d (%s): permId %s incompatível com o conhecido %s do grupo %d: identidade preservada.",
+                             order_id, symbol, perm_id, known, group["id"])
             self._reconcile_unallocated_fills(symbol, order_id=int(order_id))
         if status in ("Cancelled", "Inactive", "ApiCancelled"):
             intentional = self.ibkr.is_intentional_cancel(order_id)
@@ -1624,11 +1661,20 @@ class TradingEngine:
         for row in open_rows + closed_rows:
             if remaining <= 1e-9:
                 break
-            balance = float(row["filled_qty"] or row["qty"]) - float(row["exit_qty"] or 0)
+            if float(row["filled_qty"] or 0) <= 1e-9:
+                # Sem execução de ENTRADA comprovada não há custo: a saída fica pendente e é contabilizada quando a
+                # entrada chegar (o resto da entrada recupera o saldo por alocar) (AC03).
+                log.warning("[%s] Execução de saída %s antes de qualquer entrada do trade #%d: fica por alocar até a entrada chegar.",
+                            symbol, execution.execId, row["id"])
+                continue
+            # Primeiro o ajuste provisório que esta execução EXPLICA (ordem viva na altura da discrepância, Z05); o saldo
+            # disponível é então o que resta por explicar: entradas − saídas − ajustes ainda abertos. Uma saída nova nunca
+            # ocupa a quantidade que já saiu fora do bot (D07/AC02).
+            self.db.consume_adjustment(int(row["id"]), remaining, order_id=order_id)
+            balance = float(row["filled_qty"] or 0) - float(row["exit_qty"] or 0) - self.db.open_adjustment_qty(int(row["id"]))
             portion = min(remaining, balance)
             if portion <= 1e-9:
                 continue
-            self.db.consume_adjustment(int(row["id"]), portion, order_id=order_id)
             share = commission_value * portion / max(shares, 1e-9)
             self.db.allocate_fill(execution.execId, int(row["id"]), portion, share, reason=reason)
             if row["status"] == "OPEN":

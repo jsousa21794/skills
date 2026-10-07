@@ -111,6 +111,10 @@ class Settler:
         if trade.get("status") != "CLOSED":
             return None, None
         reason = (trade.get("exit_reason") or "").upper()
+        if "|" in reason or "?" in reason:
+            # Sequência não comprovada (razões diferentes no mesmo instante) ou resumo incompleto: o primeiro toque é
+            # INDETERMINADO -> censurado, fora do treino binário (AC05/AC04).
+            return None, f"ledger:{reason}"
         # Saída MISTA (ex.: "TP+SL", razões na ordem cronológica das execuções): o PRIMEIRO toque responde à pergunta
         # "TP antes do stop", tal como no rótulo por trajetória de preço; a fonte guarda a sequência completa (AB06).
         first = reason.split("+")[0]

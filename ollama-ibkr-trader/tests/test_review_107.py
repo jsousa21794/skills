@@ -186,7 +186,8 @@ def test_d07_aggregated_exit_is_distributed_across_open_trades():
     asyncio.run(engine._supervise())
     assert client.ib.placed[-1].order.totalQuantity == 80
     new_sl = db._query("SELECT sl_order_id FROM order_groups WHERE id=?", (g1,))[0]["sl_order_id"]
-    assert db._query("SELECT sl_order_id FROM order_groups WHERE id=?", (g2,))[0]["sl_order_id"] == new_sl  # ligado a ambos
+    # a ordem pertence a UM grupo (identidade sem ambiguidade, AC01/AC02) e cobre explicitamente os dois trades (Y07)
+    assert {t["id"] for t in db.trades_for_order(new_sl, symbol="AAPL")} == {t1, t2}
     engine._on_fill(None, own_fill(engine, new_sl, 80, 98, "combined-exit"))
     r1 = db._query("SELECT exit_qty, status FROM trades WHERE id=?", (t1,))[0]
     r2 = db._query("SELECT exit_qty, status FROM trades WHERE id=?", (t2,))[0]

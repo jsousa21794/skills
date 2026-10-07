@@ -325,6 +325,35 @@ class Database:
                     (tid, tid)).fetchone()[0]
                 if last:
                     self._conn.execute("UPDATE trades SET exit_ts=? WHERE id=?", (last, tid))
+            # Backfill idempotente (AC04): alocações de SAÍDA anteriores à coluna ``reason`` recebem a razão pela identidade
+            # histórica da ordem (perna TP/SL do grupo, fecho por sinal) e pela direção do trade; entradas ficam NULL.
+            pending = self._conn.execute(
+                """SELECT a.id, f.order_id, f.side, f.symbol, t.direction, t.group_id FROM fill_allocations a
+                   JOIN fills f ON f.exec_id = a.exec_id JOIN trades t ON t.id = a.trade_id WHERE a.reason IS NULL""").fetchall()
+            for alloc_id, order_id, side, symbol, direction, trade_group in pending:
+                entry_side = "BOT" if int(direction) > 0 else "SLD"
+                if (side or "").upper() == entry_side:
+                    continue  # entrada: sem razão de saída
+                reason = "OUTRO"
+                groups = self._conn.execute(
+                    """SELECT id, role, parent_order_id, tp_order_id, sl_order_id FROM order_groups WHERE symbol=? AND (parent_order_id=?
+                       OR tp_order_id=? OR sl_order_id=? OR id IN (SELECT group_id FROM order_history WHERE order_id=?))
+                       ORDER BY CASE WHEN id=? THEN 0 ELSE 1 END, id DESC""",
+                    (symbol, order_id, order_id, order_id, order_id, trade_group)).fetchall()
+                for gid, role, parent, tp, sl in groups:
+                    if role == "CLOSE":
+                        reason = "SIGNAL"
+                    elif order_id == tp:
+                        reason = "TP"
+                    elif order_id == sl:
+                        reason = "SL"
+                    else:
+                        leg = self._conn.execute("SELECT leg FROM order_history WHERE group_id=? AND order_id=? ORDER BY id DESC LIMIT 1",
+                                                 (gid, order_id)).fetchone()
+                        reason = leg[0] if leg and leg[0] in ("TP", "SL") else reason
+                    if reason != "OUTRO":
+                        break
+                self._conn.execute("UPDATE fill_allocations SET reason=? WHERE id=?", (reason, alloc_id))
             # Backfill idempotente (V04): grupos anteriores à tabela order_history ficam com as suas pernas
             # registadas, para que uma reparação posterior arquive em vez de perder os IDs antigos.
             rows = self._conn.execute(
@@ -596,8 +625,9 @@ class Database:
         return self._query(sql + " ORDER BY t.exit_ts", params)
 
     def recent_stop_count(self, since: datetime) -> int:
+        # Um stop numa saída MISTA (SL+TP, SL|TP) conta como evento de stop uma só vez por trade (AC06).
         rows = self._query(
-            "SELECT COUNT(*) AS n FROM trades WHERE status='CLOSED' AND exit_reason='SL' AND exit_ts >= ?",
+            f"SELECT COUNT(*) AS n FROM trades WHERE status='CLOSED' AND {self._component_sql('exit_reason', 'SL')} AND exit_ts >= ?",
             (iso(since),),
         )
         return int(rows[0]["n"])
@@ -918,6 +948,14 @@ class Database:
             return None  # identidade AMBÍGUA (vários grupos sem permId conhecido): a execução fica pendente (AB01)
         return candidates[0]
 
+    def groups_for_order(self, order_id: int, symbol: Optional[str] = None) -> list[dict[str, Any]]:
+        """Todos os grupos (do símbolo) em que a ordem é ou foi perna, do mais recente ao mais antigo."""
+        rows = self._query(
+            """SELECT g.* FROM order_groups g WHERE g.parent_order_id=? OR g.tp_order_id=? OR g.sl_order_id=?
+               OR g.id IN (SELECT group_id FROM order_history WHERE order_id=?) ORDER BY g.id DESC""",
+            (order_id, order_id, order_id, order_id))
+        return [r for r in rows if symbol is None or r["symbol"] == symbol]
+
     def group_by_parent(self, parent_order_id: int, role: Optional[str] = None) -> Optional[dict[str, Any]]:
         if role:
             rows = self._query("SELECT * FROM order_groups WHERE parent_order_id=? AND role=? ORDER BY id DESC LIMIT 1",
@@ -1123,16 +1161,37 @@ class Database:
                WHERE a.trade_id=? AND a.reason IS NOT NULL ORDER BY f.ts, a.id""", (int(trade_id),))
         if not rows:
             return None
+        # Sequência só é comprovada quando os instantes de execução a ordenam: razões DIFERENTES no mesmo instante
+        # tornam o primeiro toque indeterminado -> ``SL|TP`` (ordem alfabética, censurado no treino) (AC05).
+        by_ts: dict[str, set[str]] = {}
+        for r in rows:
+            by_ts.setdefault(r["ts"], set()).add(r["reason"])
+        indeterminate = any(len(v) > 1 for v in by_ts.values())
         reasons: list[str] = []
         for r in rows:
             if r["reason"] not in reasons:
                 reasons.append(r["reason"])
-        total = sum(float(r["shares"]) for r in rows) or 1.0
+        label = "|".join(sorted(reasons)) if indeterminate else "+".join(reasons)
+        trade = self._query("SELECT exit_qty FROM trades WHERE id=?", (int(trade_id),))[0]
+        covered = sum(float(r["shares"]) for r in rows)
+        if covered + 1e-9 < float(trade["exit_qty"] or 0):
+            label += "+?"  # saídas sem razão conhecida: resumo INCOMPLETO, nunca apresentado como conclusão (AC04)
+        total = covered or 1.0
         price = sum(float(r["shares"]) * float(r["price"]) for r in rows) / total
         last_ts = max(r["ts"] for r in rows)
         self._execute("UPDATE trades SET exit_reason=?, exit_ts=?, exit_price=? WHERE id=?",
-                      ("+".join(reasons), last_ts, price, int(trade_id)))
+                      (label, last_ts, price, int(trade_id)))
         return self._query("SELECT * FROM trades WHERE id=?", (int(trade_id),))[0]
+
+    @staticmethod
+    def exit_components(reason: Optional[str]) -> set[str]:
+        """Razões elementares de uma saída (``TP``, ``SL``, ``SIGNAL``...) a partir de ``TP+SL``, ``SL|TP`` ou ``TP+?`` (AC06)."""
+        return {p for p in (reason or "").replace("|", "+").split("+") if p and p != "?"}
+
+    @staticmethod
+    def _component_sql(column: str, component: str) -> str:
+        """Condição SQL: ``component`` é uma das razões elementares de ``column`` (AC06)."""
+        return f"('+' || REPLACE(COALESCE({column}, ''), '|', '+') || '+') LIKE '%+{component}+%'"
 
     def unfinalize_label(self, decision_id: int) -> None:
         """A decisão volta a rótulo PROVISÓRIO (o trade reabriu): o avaliador finaliza de novo pelo ledger (AB04)."""
@@ -1244,8 +1303,8 @@ class Database:
             "total_pnl": round(total, 2),
             "avg_win": round(sum(t["pnl"] for t in wins) / len(wins), 2) if wins else 0.0,
             "avg_loss": round(sum(t["pnl"] for t in losses) / len(losses), 2) if losses else 0.0,
-            "stop_hits": sum(1 for t in trades if (t["exit_reason"] or "") == "SL"),
-            "tp_hits": sum(1 for t in trades if (t["exit_reason"] or "") == "TP"),
+            "stop_hits": sum(1 for t in trades if "SL" in self.exit_components(t["exit_reason"])),
+            "tp_hits": sum(1 for t in trades if "TP" in self.exit_components(t["exit_reason"])),
             "gross_pnl": round(sum(float(t.get("gross_pnl") or 0) for t in trades), 2),
             "commissions": round(sum(float(t.get("commission") or 0) for t in trades), 2),
         }
