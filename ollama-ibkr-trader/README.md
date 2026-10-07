@@ -23,11 +23,38 @@ escuro).
 > de perda aplicam-se o StoplossGuard, o travão de perdas seguidas e o cooldown
 > após saída em perda. Tudo ajustável em `config.json` (validado ao carregar).
 >
-> Versão 1.0.10: resposta à revisão da 1.0.9 (6 achados, 1 P0), ver
-> `../reports/Resposta à revisão 1.0.9.md`; antes, as respostas às revisões
+> Versão 1.0.11: resposta à revisão da 1.0.10 (6 achados P1), ver
+> `../reports/Resposta à revisão 1.0.10.md`; antes, as respostas às revisões
 > anteriores e à auditoria da 1.0.2 na mesma pasta.
 
-## Invariantes de segurança (1.0.10)
+## Invariantes de segurança (1.0.11)
+
+- **Identidade exata prevalece, ambiguidade fica pendente**: ao associar uma
+  execução a um grupo, uma correspondência exata de `permId` ganha sempre a um
+  grupo sem `permId` conhecido; com vários grupos candidatos e nenhum exato, a
+  execução fica por alocar (sem consumir nenhum trade) e o ativo bloqueado até
+  a corretora revelar o `permId`, que então reconcilia a execução pendente.
+- **Comissão cobrada uma só vez**: a comissão devida a cada alocação é a quota
+  da quantidade TOTAL da execução; um relatório real reescala cada alocação e
+  aplica só a diferença; a parte ainda por alocar conserva a sua quota.
+- **Custo médio corrige o passado**: uma entrada tardia que altera o custo
+  médio reprecifica as saídas já contabilizadas, para que as mesmas execuções
+  deem o mesmo P&L em qualquer ordem de chegada.
+- **Entrada tardia reabre o trade**: se a quantidade comprovada de entrada
+  exceder as saídas de um trade dado como fechado, o trade volta a OPEN, o
+  saldo volta a ser próprio, o ativo entra em discrepância até reconciliar
+  com a corretora e o rótulo da decisão deixa de ser final.
+- **Migração dos fechos reconciliados**: bases anteriores recebem
+  `reconciled_ts` nos fechos por reconciliação (e nos fechos incompletos); os
+  que já tinham correções parciais ficam com a data de fecho reconstruída pela
+  execução mais recente.
+- **Saída mista é cronológica**: razão, data e preço de saída derivam do
+  conjunto ordenado das execuções (`exit_reason` = razões por ordem de
+  execução, p. ex. `TP+SL`); o primeiro toque decide o rótulo (TP → 1, SL →
+  0) e a fonte guarda a sequência; a ordem de chegada dos callbacks nunca
+  altera o resultado.
+
+## Invariantes de segurança herdados (1.0.10)
 
 - **Arranque = supervisão**: no primeiro contacto após um período desligado,
   cada ativo gerido com posição passa pela MESMA classificação da supervisão

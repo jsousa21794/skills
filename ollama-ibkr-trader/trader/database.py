@@ -252,7 +252,8 @@ DECISION_COLUMNS = {
     "provisional_correct": "INTEGER",  # rótulo provisório guardado quando o final o substitui (X06)
 }
 HISTORY_COLUMNS = {"perm_id": "INTEGER"}
-ADJUSTMENT_COLUMNS = {"order_ids": "TEXT"}  # saídas vivas no instante do ajuste: só as suas execuções o explicam (Z05)
+ADJUSTMENT_COLUMNS = {"order_ids": "TEXT"}
+ALLOCATION_COLUMNS = {"reason": "TEXT"}  # TP | SL | SIGNAL para saídas; NULL para entradas (AB06)  # saídas vivas no instante do ajuste: só as suas execuções o explicam (Z05)
 TRADE_COLUMNS = {"decision_action": "TEXT", "stop_price": "REAL", "tp_price": "REAL", "risk_amount": "REAL",
                  "commission": "REAL NOT NULL DEFAULT 0", "gross_pnl": "REAL NOT NULL DEFAULT 0", "account": "TEXT",
                  "reconciled_ts": "TEXT"}  # instante da reconciliação, separado da data real de saída (AA06)
@@ -306,11 +307,24 @@ class Database:
         with self._lock:
             for table, columns in (("decisions", DECISION_COLUMNS), ("trades", TRADE_COLUMNS), ("fills", FILL_COLUMNS),
                                    ("order_groups", GROUP_COLUMNS), ("order_history", HISTORY_COLUMNS),
-                                   ("ledger_adjustments", ADJUSTMENT_COLUMNS)):
+                                   ("ledger_adjustments", ADJUSTMENT_COLUMNS), ("fill_allocations", ALLOCATION_COLUMNS)):
                 existing = {row[1] for row in self._conn.execute(f"PRAGMA table_info({table})")}
                 for name, decl in columns.items():
                     if name not in existing:
                         self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+            # Backfill idempotente (AB05): fechos por reconciliação anteriores à coluna ``reconciled_ts`` guardam a data da
+            # reconciliação à parte; se já tinham correções parciais, a data de fecho é reconstruída pelas execuções.
+            self._conn.execute("""UPDATE trades SET reconciled_ts=exit_ts WHERE reconciled_ts IS NULL AND status='CLOSED'
+                                  AND exit_ts IS NOT NULL AND (exit_reason='RECONCILED' OR exit_qty < COALESCE(filled_qty, qty) - 1e-9)""")
+            for tid, in self._conn.execute(
+                    """SELECT t.id FROM trades t WHERE t.reconciled_ts IS NOT NULL AND t.exit_ts = t.reconciled_ts
+                       AND EXISTS (SELECT 1 FROM fill_allocations a WHERE a.trade_id = t.id)""").fetchall():
+                last = self._conn.execute(
+                    """SELECT MAX(f.ts) FROM fill_allocations a JOIN fills f ON f.exec_id = a.exec_id
+                       WHERE a.trade_id=? AND f.side != (SELECT CASE WHEN direction > 0 THEN 'BOT' ELSE 'SLD' END FROM trades WHERE id=?)""",
+                    (tid, tid)).fetchone()[0]
+                if last:
+                    self._conn.execute("UPDATE trades SET exit_ts=? WHERE id=?", (last, tid))
             # Backfill idempotente (V04): grupos anteriores à tabela order_history ficam com as suas pernas
             # registadas, para que uma reparação posterior arquive em vez de perder os IDs antigos.
             rows = self._conn.execute(
@@ -883,6 +897,7 @@ class Database:
                ORDER BY g.id DESC""",
             (order_id, order_id, order_id, order_id),
         )
+        candidates = []
         for row in rows:
             if symbol is not None and row["symbol"] != symbol:
                 continue
@@ -894,8 +909,14 @@ class Database:
                 known = self.perm_id_for(int(row["id"]), int(order_id))
                 if known is not None and known != int(perm_id):
                     continue
-            return row
-        return None
+                if known is not None:
+                    return row  # correspondência permanente EXATA prevalece sobre identidades desconhecidas (AB01)
+            candidates.append(row)
+        if not candidates:
+            return None
+        if perm_id and len(candidates) > 1:
+            return None  # identidade AMBÍGUA (vários grupos sem permId conhecido): a execução fica pendente (AB01)
+        return candidates[0]
 
     def group_by_parent(self, parent_order_id: int, role: Optional[str] = None) -> Optional[dict[str, Any]]:
         if role:
@@ -933,7 +954,7 @@ class Database:
         return self._query("SELECT * FROM trades WHERE status='OPEN' ORDER BY id")
 
     def record_entry_fill(self, trade_id: int, shares: float, price: float, ts: datetime,
-                          commission: float = 0.0) -> None:
+                          commission: float = 0.0) -> dict[str, Any]:
         """Atualiza preço médio de entrada com execuções (possivelmente parciais); a comissão
         entra logo no P&L líquido (``pnl``), ficando ``gross_pnl`` sem custos."""
         trade = self._query("SELECT * FROM trades WHERE id=?", (trade_id,))[0]
@@ -941,11 +962,18 @@ class Database:
         prev_price = float(trade["entry_price"] or 0)
         new_filled = filled + shares
         avg = (prev_price * filled + price * shares) / new_filled if new_filled else price
+        # Saídas já contabilizadas usaram o custo médio antigo: o lucro bruto é corrigido para o custo médio novo, para
+        # que as mesmas execuções deem o mesmo resultado em qualquer ordem de chegada (AB03).
+        exit_qty = float(trade["exit_qty"] or 0)
+        reprice = -(avg - prev_price) * exit_qty * int(trade["direction"]) if (exit_qty > 0 and filled > 0) else 0.0
+        # Uma entrada tardia que excede as saídas REABRE um trade dado como fechado: o saldo volta a ser próprio (AB04).
+        reopened = trade["status"] == "CLOSED" and new_filled > exit_qty + 1e-9
         self._execute(
             """UPDATE trades SET filled_qty=?, entry_price=?, entry_ts=COALESCE(entry_ts, ?),
-               commission=commission+?, pnl=pnl-? WHERE id=?""",
-            (new_filled, avg, iso(ts), commission, commission, trade_id),
+               commission=commission+?, pnl=pnl-?+?, gross_pnl=gross_pnl+?, status=? WHERE id=?""",
+            (new_filled, avg, iso(ts), commission, commission, reprice, reprice, "OPEN" if reopened else trade["status"], trade_id),
         )
+        return {"reopened": reopened, "trade": self._query("SELECT * FROM trades WHERE id=?", (trade_id,))[0]}
 
     def record_exit_fill(self, trade_id: int, shares: float, price: float, ts: datetime,
                          reason: str, commission: float = 0.0) -> dict[str, Any]:
@@ -1079,9 +1107,37 @@ class Database:
         self._execute("UPDATE fills SET commission=?, commission_estimated=0 WHERE exec_id=?", (commission, exec_id))
         return delta
 
-    def allocate_fill(self, exec_id: str, trade_id: int, shares: float, commission: float) -> None:
-        self._execute("INSERT INTO fill_allocations (exec_id, trade_id, shares, commission) VALUES (?,?,?,?)",
-                      (exec_id, trade_id, shares, commission))
+    def allocate_fill(self, exec_id: str, trade_id: int, shares: float, commission: float, reason: Optional[str] = None) -> None:
+        self._execute("INSERT INTO fill_allocations (exec_id, trade_id, shares, commission, reason) VALUES (?,?,?,?,?)",
+                      (exec_id, trade_id, shares, commission, reason))
+
+    def set_allocation_commission(self, allocation_id: int, commission: float) -> None:
+        self._execute("UPDATE fill_allocations SET commission=? WHERE id=?", (float(commission), int(allocation_id)))
+
+    def refresh_exit_summary(self, trade_id: int) -> Optional[dict[str, Any]]:
+        """Razão, data e preço de saída derivados do conjunto CRONOLÓGICO das execuções de saída alocadas ao trade
+        (AB06): ``exit_reason`` = razões distintas por ordem de execução unidas por ``+`` (ex.: ``TP+SL``),
+        ``exit_ts`` = execução mais recente, ``exit_price`` = média ponderada. Independente da ordem de chegada."""
+        rows = self._query(
+            """SELECT a.shares, a.reason, f.ts, f.price FROM fill_allocations a JOIN fills f ON f.exec_id = a.exec_id
+               WHERE a.trade_id=? AND a.reason IS NOT NULL ORDER BY f.ts, a.id""", (int(trade_id),))
+        if not rows:
+            return None
+        reasons: list[str] = []
+        for r in rows:
+            if r["reason"] not in reasons:
+                reasons.append(r["reason"])
+        total = sum(float(r["shares"]) for r in rows) or 1.0
+        price = sum(float(r["shares"]) * float(r["price"]) for r in rows) / total
+        last_ts = max(r["ts"] for r in rows)
+        self._execute("UPDATE trades SET exit_reason=?, exit_ts=?, exit_price=? WHERE id=?",
+                      ("+".join(reasons), last_ts, price, int(trade_id)))
+        return self._query("SELECT * FROM trades WHERE id=?", (int(trade_id),))[0]
+
+    def unfinalize_label(self, decision_id: int) -> None:
+        """A decisão volta a rótulo PROVISÓRIO (o trade reabriu): o avaliador finaliza de novo pelo ledger (AB04)."""
+        self._execute("UPDATE decisions SET label_final=0 WHERE id=? AND settled_ts IS NOT NULL AND label_final=1", (int(decision_id),))
+        self.set_kv("labels_changed_at", iso(utc_now()))
 
     def add_exit_coverage(self, group_id: int, trade_ids: Iterable[int]) -> None:
         """Relação EXPLÍCITA entre uma ordem de saída (grupo) e os trades que ela cobre (Z04)."""
@@ -1100,12 +1156,14 @@ class Database:
         if symbol:
             groups = [g for g in groups if self._query("SELECT 1 FROM order_groups WHERE id=? AND symbol=?", (g, symbol))]
         if perm_id:
-            kept = []
+            exact, unknown = [], []
             for g in groups:
                 known = self.perm_id_for(g, int(order_id))
-                if known is None or int(known) == int(perm_id):
-                    kept.append(g)
-            groups = kept
+                if known is None:
+                    unknown.append(g)
+                elif int(known) == int(perm_id):
+                    exact.append(g)
+            groups = exact or unknown  # a correspondência exata prevalece sobre identidades desconhecidas (AB01)
         if group_id is not None and int(group_id) not in groups:
             groups.append(int(group_id))
         if not groups:

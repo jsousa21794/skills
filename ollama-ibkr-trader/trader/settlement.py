@@ -111,10 +111,13 @@ class Settler:
         if trade.get("status") != "CLOSED":
             return None, None
         reason = (trade.get("exit_reason") or "").upper()
-        if reason == "TP":
-            return 1, "ledger:TP"
-        if reason == "SL":
-            return 0, "ledger:SL"
+        # Saída MISTA (ex.: "TP+SL", razões na ordem cronológica das execuções): o PRIMEIRO toque responde à pergunta
+        # "TP antes do stop", tal como no rótulo por trajetória de preço; a fonte guarda a sequência completa (AB06).
+        first = reason.split("+")[0]
+        if first == "TP":
+            return 1, f"ledger:{reason}"
+        if first == "SL":
+            return 0, f"ledger:{reason}"
         return None, f"ledger:{reason or 'OUTRO'}"
 
     def finalize_provisional(self) -> int:

@@ -1546,7 +1546,15 @@ class TradingEngine:
         group = self.db.group_for_order(execution.orderId, symbol=symbol, con_id=getattr(fill.contract, "conId", None),
                                         account=getattr(execution, "acctNumber", None) or None, perm_id=perm_id)
         if not group:
-            if not reprocess:
+            if perm_id and self.db.trades_for_order(int(execution.orderId), symbol=symbol):
+                # Há grupos do bot com este orderId mas nenhum com permId conhecido igual: identidade AMBÍGUA. A execução
+                # fica pendente (não consome nenhum trade) e o ativo bloqueado até a corretora revelar o permId (AB01).
+                self._discrepancies.add(symbol)
+                if not reprocess:
+                    log.critical("[%s] Execução %s (ordem %d, permId %s) com identidade ambígua entre grupos do bot: fica por "
+                                 "alocar até o permId da ordem ser conhecido; decisões bloqueadas.", symbol, execution.execId,
+                                 execution.orderId, perm_id)
+            elif not reprocess:
                 log.warning("Execução %s (ordem %d) sem grupo conhecido para este contrato/conta: ordem externa ou de "
                             "outra sessão; só registada (reconciliável quando a identidade for conhecida).", symbol, execution.orderId)
             return
@@ -1559,8 +1567,18 @@ class TradingEngine:
                 trade_id = trade_row["id"]
             leg = self.db.order_leg(group, execution.orderId)
             if leg == "PARENT":
-                self.db.record_entry_fill(trade_id, float(execution.shares), float(execution.price), ts, commission_value)
+                booked = self.db.record_entry_fill(trade_id, float(execution.shares), float(execution.price), ts, commission_value)
                 self.db.allocate_fill(execution.execId, trade_id, float(execution.shares), commission_value)
+                if booked.get("reopened"):
+                    # Entrada tardia excede as saídas de um trade dado como fechado: o saldo volta a ser próprio, o ativo
+                    # fica em discrepância até reconciliar com a corretora e o rótulo da decisão deixa de ser final (AB04).
+                    self._discrepancies.add(symbol)
+                    reopened = booked["trade"]
+                    if reopened.get("decision_id"):
+                        self.db.unfinalize_label(int(reopened["decision_id"]))
+                    log.critical("[%s] Trade #%d REABERTO por entrada tardia: %g executadas vs %g saídas; saldo próprio %g a "
+                                 "reconciliar com a corretora.", symbol, trade_id, float(reopened["filled_qty"] or 0),
+                                 float(reopened["exit_qty"] or 0), float(reopened["filled_qty"] or 0) - float(reopened["exit_qty"] or 0))
                 entry = self._pending_entries.get(execution.orderId)
                 if entry:
                     entry["filled"] += float(execution.shares)
@@ -1612,16 +1630,20 @@ class TradingEngine:
                 continue
             self.db.consume_adjustment(int(row["id"]), portion, order_id=order_id)
             share = commission_value * portion / max(shares, 1e-9)
+            self.db.allocate_fill(execution.execId, int(row["id"]), portion, share, reason=reason)
             if row["status"] == "OPEN":
                 updated = self.db.record_exit_fill(int(row["id"]), portion, float(execution.price), ts, reason, share)
-                self._announce_close(updated, reason)
+                updated = self.db.refresh_exit_summary(int(row["id"])) or updated  # cronologia das execuções (AB06)
+                self._announce_close(updated, updated.get("exit_reason") or reason)
+                if updated["status"] == "CLOSED":
+                    self._relabel_decision(updated)
             else:
                 updated = self.db.record_late_exit_fill(int(row["id"]), portion, float(execution.price), ts, reason, share)
+                updated = self.db.refresh_exit_summary(int(row["id"])) or updated
                 log.warning("Trade #%d %s (fechado por %s) corrigido por execução tardia %s: %g ações @ %.2f, P&L bruto %+.2f.",
                             row["id"], symbol, row.get("exit_reason"), execution.execId, portion, float(execution.price),
                             float(updated.get("gross_pnl") or 0.0))
                 self._relabel_decision(updated)
-            self.db.allocate_fill(execution.execId, int(row["id"]), portion, share)
             remaining -= portion
         if remaining > 1e-9:
             self._discrepancies.add(symbol)
@@ -1661,11 +1683,20 @@ class TradingEngine:
         allocations = self.db.allocations_for_fill(exec_id)
         if not allocations:
             return
-        total = sum(float(a["shares"]) for a in allocations) or 1.0
+        stored = self.db.fill_by_exec(exec_id)
+        total = float(stored["shares"]) if stored and stored.get("shares") else sum(float(a["shares"]) for a in allocations) or 1.0
+        # A comissão devida a cada alocação é a quota da quantidade TOTAL da execução; só a diferença face ao já
+        # atribuído é aplicada, e a parte ainda não alocada conserva a sua quota para a recuperação (AB02).
+        applied = 0.0
         for a in allocations:
-            self.db.apply_commission_delta(int(a["trade_id"]), delta * float(a["shares"]) / total)
-        log.info("Comissão real %s: %.2f USD (ajuste %+.2f em %d trade(s))", fill.contract.symbol, float(commission_value),
-                 delta, len(allocations), extra={"category": "ordem"})
+            due = float(commission_value) * float(a["shares"]) / total
+            diff = due - float(a["commission"] or 0.0)
+            if abs(diff) > 1e-9:
+                self.db.set_allocation_commission(int(a["id"]), due)
+                self.db.apply_commission_delta(int(a["trade_id"]), diff)
+                applied += diff
+        log.info("Comissão real %s: %.2f USD (ajuste %+.2f em %d alocação(ões))", fill.contract.symbol, float(commission_value),
+                 applied, len(allocations), extra={"category": "ordem"})
 
     def _announce_close(self, trade_row: dict[str, Any], reason: str) -> None:
         if trade_row["status"] == "CLOSED":
