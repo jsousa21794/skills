@@ -208,20 +208,21 @@ e os preços ao modelo, para ele não "adivinhar" pelo nome.
 ### 4.1 Juntar e verificar o ficheiro
 
 1. Cria a pasta `C:\Trader\`.
-2. Copia para lá os três ficheiros recebidos (`OllamaIBKRTrader-1.0.17.part0`, `.part1`, `.part2`) **ou** descarrega
-   o ficheiro inteiro `OllamaIBKRTrader-windows-x64.exe` em
-   https://github.com/jsousa21794/skills/releases/tag/trader-v1.0.17 e renomeia-o para `OllamaIBKRTrader.exe`.
+2. Copia para lá os três ficheiros recebidos (`OllamaIBKRTrader-<versão>.part0`, `.part1`, `.part2`) **ou** descarrega
+   o ficheiro inteiro `OllamaIBKRTrader-windows-x64.exe` da release mais recente em
+   https://github.com/jsousa21794/skills/releases e renomeia-o para `OllamaIBKRTrader.exe`.
 3. Se tiveres as três partes: abre a Linha de comandos (Windows + R → `cmd`), escreve `cd C:\Trader` e depois:
    ```
-   copy /b OllamaIBKRTrader-1.0.17.part0+OllamaIBKRTrader-1.0.17.part1+OllamaIBKRTrader-1.0.17.part2 OllamaIBKRTrader.exe
+   copy /b OllamaIBKRTrader-1.0.18.part0+OllamaIBKRTrader-1.0.18.part1+OllamaIBKRTrader-1.0.18.part2 OllamaIBKRTrader.exe
    ```
+   (substitui `1.0.18` pelo número que aparece no nome dos ficheiros que recebeste.)
 4. Verifica que o ficheiro não está corrompido:
    ```
    certutil -hashfile OllamaIBKRTrader.exe SHA256
    ```
-   A linha longa de letras e números tem de ser exatamente:
-   `12c3b54ddb7b83ffa8e91d54a0feacbff05111ab512dd26091f01bfd6db74853`
-   (se for diferente, volta a descarregar; não executes).
+   A linha longa de letras e números tem de ser exatamente a indicada na mensagem que acompanha os ficheiros (cada
+   versão tem a sua; a da 1.0.17 é `12c3b54ddb7b83ffa8e91d54a0feacbff05111ab512dd26091f01bfd6db74853`). Se for
+   diferente, volta a descarregar; não executes.
 
 ### 4.2 Primeira abertura
 
