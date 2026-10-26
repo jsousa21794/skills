@@ -104,7 +104,7 @@ def test_f04_protective_coverage_checks_side_quantity_and_state():
 # ---------------------------------------------------------------- F05
 def test_f05_lost_protection_is_restored():
     engine, db, _ = make_engine()
-    engine.ibkr.positions["AAPL"] = 50
+    own_position(engine, db, "AAPL", 50)  # posição do bot (com registo) cuja proteção se perdeu
     asyncio.run(engine._reprotect("AAPL"))
     assert "AAPL" in engine.ibkr.protections
     # supervisor por ciclo também repõe
@@ -112,6 +112,19 @@ def test_f05_lost_protection_is_restored():
     engine.ibkr.orders.clear()
     asyncio.run(engine._supervise())
     assert "AAPL" in engine.ibkr.protections
+
+
+def test_f05b_position_without_record_is_adopted_only_with_explicit_option():
+    # Sem registo e sem adoção explícita, uma posição nunca é protegida/adotada (1.0.4, AI08)...
+    engine, db, _ = make_engine()
+    engine.ibkr.positions["AAPL"] = 50
+    asyncio.run(engine._reprotect("AAPL"))
+    assert engine.ibkr.protections == [] and db.open_trades("AAPL") == []
+    # ...e com manage_external_positions o registo perdido é reconstruído a partir da corretora (caminho anterior).
+    engine, db, _ = make_engine(manage_external_positions=True)
+    engine.ibkr.positions["AAPL"] = 50
+    asyncio.run(engine._reprotect("AAPL"))
+    assert "AAPL" in engine.ibkr.protections and db.open_trades("AAPL")[0]["filled_qty"] == 50
 
 
 # ---------------------------------------------------------------- F06 / F07 / F09 cobertos em test_engine (reconcile)
@@ -455,4 +468,4 @@ def test_f38_close_commission_is_split_over_the_trades_it_closed(monkeypatch):
 
 # ---------------------------------------------------------------- F40
 def test_f40_version_matches_release_line():
-    assert __version__ == "1.0.17"
+    assert __version__ == "1.0.18"

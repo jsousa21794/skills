@@ -693,6 +693,7 @@ class TradingEngine:
         if imported:
             log.warning("Reconciliação: %d execuções ocorridas sem o bot ligado foram importadas.", imported)
         self._restore_pending_orders()
+        self._cancel_dead_entries()
         # Saldos por alocar de execuções do bot (identidade revelada entretanto, cobertura reparada na migração, AH02): a
         # recuperação corre no arranque com a identidade ORIGINAL persistida.
         for symbol in sorted({f["symbol"] for f in self.db.unallocated_fills()}):
@@ -760,6 +761,27 @@ class TradingEngine:
                                                "qty": float(o.totalQuantity), "filled": float(st.filled or 0.0), "ts": placed}
                 log.warning("Fecho pendente restaurado: ordem %d %s x%g.", o.orderId, symbol, float(o.totalQuantity))
 
+    def _cancel_dead_entries(self) -> None:
+        """Trades OPEN sem execução cuja ordem de entrada já não está viva na corretora (cancelada/expirada com o bot
+        desligado) passam a CANCELLED: deixam de contar como posição do bot, de absorver ajustes e de manter o ativo
+        gerido (AI06). Uma execução que chegue mais tarde reabre o trade (``record_entry_fill``, AI07). A API da IBKR só
+        devolve execuções do dia corrente: uma entrada executada num dia anterior com o bot desligado não é recuperável
+        automaticamente e a posição correspondente fica como externa/não explicada, com aviso."""
+        pending_trades = {e.get("trade_id") for e in self._pending_entries.values()}
+        for t in self.db.open_trades():
+            if float(t["filled_qty"] or 0) > 0 or t["id"] in pending_trades:
+                continue
+            rows = self.db._query("SELECT parent_order_id FROM order_groups WHERE id=?", (int(t["group_id"]),)) if t.get("group_id") else []
+            group = rows[0] if rows else None
+            parent = int(group["parent_order_id"]) if group and group.get("parent_order_id") else None
+            if parent is not None and any(int(o.order.orderId) == parent and IBKRClient.is_live_order(o) for o in self.ibkr.our_open_orders()):
+                continue
+            self.db._execute("UPDATE trades SET status='CANCELLED', exit_reason='CANCELLED' WHERE id=? AND filled_qty=0 AND status='OPEN'",
+                             (t["id"],))
+            log.warning("Trade #%d %s sem execução e sem ordem de entrada viva: marcado CANCELLED na reconciliação (se a entrada tiver "
+                        "executado num dia anterior, a posição aparece como não pertencente ao bot: confirma no Trade Log).",
+                        t["id"], t["symbol"])
+
     async def _protect_if_naked(self, symbol: str, pos: dict[str, Any]) -> None:
         async with self._lock_for(symbol):
             await self._protect_if_naked_locked(symbol, pos)
@@ -783,6 +805,16 @@ class TradingEngine:
                 self._mixed_warned.add(symbol)
                 log.critical("[%s] Posição %+g na corretora não pertence ao bot (quantidade própria 0): sem proteção automática; "
                              "ativo bloqueado até as execuções explicarem a diferença.", symbol, float(pos["qty"]))
+            return
+        if own <= 1e-9 and not self.settings.manage_external_positions:
+            # Só há ordens próprias vivas (sem trade aberto): sem adoção explícita, a posição não é do bot. As saídas
+            # próprias órfãs são canceladas (atuariam sobre uma posição alheia) e o ativo fica externo (AI08).
+            if symbol not in self._mixed_warned:
+                self._mixed_warned.add(symbol)
+                log.critical("[%s] Ordens próprias vivas sem trade aberto e posição %+g na corretora: posição NÃO adotada "
+                             "(manage_external_positions=False); saídas órfãs canceladas.", symbol, float(pos["qty"]))
+            await self.ibkr.cancel_own_exits(symbol, keep_parent_ids=self._pending_entry_ids(symbol))
+            self._external_positions.add(symbol)
             return
         mixed = not self.settings.manage_external_positions and own > 0 and abs(float(pos["qty"])) > own + 1e-6
         max_qty = own if mixed else None
@@ -859,7 +891,11 @@ class TradingEngine:
                     log.warning("[%s] Entrada %d não executada em %ds: cancelada.", entry["symbol"], oid,
                                 self.settings.entry_timeout_seconds)
                 else:
+                    # A ordem já não existe na corretora: sem execução, o trade não fica aberto para sempre (AI06).
                     self._pending_entries.pop(oid, None)
+                    if entry.get("filled", 0) <= 0 and entry.get("trade_id") is not None:
+                        self.db._execute("UPDATE trades SET status='CANCELLED', exit_reason='CANCELLED' WHERE id=? AND filled_qty=0",
+                                         (entry["trade_id"],))
         positions = {p["symbol"]: p for p in self.ibkr.portfolio_state().get("positions", [])
                      if p.get("sec_type", "STK") == "STK"}
         for symbol in self._managed_symbols():
@@ -947,7 +983,8 @@ class TradingEngine:
             for row in self.db.open_trades(symbol):
                 if remaining <= 1e-9:
                     break
-                open_qty = float(row["filled_qty"] or row["qty"]) - float(row["exit_qty"] or 0) - self.db.open_adjustment_qty(int(row["id"]))
+                # Só quantidade EXECUTADA pode ter saído fora do bot: um trade sem execução nunca absorve ajustes (AI05).
+                open_qty = float(row["filled_qty"] or 0) - float(row["exit_qty"] or 0) - self.db.open_adjustment_qty(int(row["id"]))
                 portion = min(remaining, open_qty)
                 if portion <= 0:
                     continue
@@ -972,7 +1009,7 @@ class TradingEngine:
                 return
             price = float(pos.get("market_price") or pos.get("avg_cost") or 0.0)
             for row in self.db.open_trades(symbol):
-                open_qty = float(row["filled_qty"] or row["qty"]) - float(row["exit_qty"] or 0) - self.db.open_adjustment_qty(int(row["id"]))
+                open_qty = float(row["filled_qty"] or 0) - float(row["exit_qty"] or 0) - self.db.open_adjustment_qty(int(row["id"]))  # AI05
                 if open_qty > 1e-9:
                     self.db.add_adjustment(int(row["id"]), open_qty, price, "posição invertida fora do bot (provisório)")
 
@@ -1103,6 +1140,9 @@ class TradingEngine:
             try:
                 if self.ibkr.connected:
                     self.settler.run()
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Erro no settlement (o ciclo de decisão continua): %s", exc)
+            try:
                 if self.trading_enabled and self.ibkr.connected and self._reconciled:
                     await self._run_cycle()
             except Exception as exc:  # noqa: BLE001
@@ -1147,7 +1187,7 @@ class TradingEngine:
         await loop.run_in_executor(None, self.events.prefetch, list(self.settings.symbols),
                                    self.settings.sentiment_window_hours if self.sentiment else 0)
         state = self.ibkr.portfolio_state()
-        global_gate = self.gate.check_global(equity=state.get("net_liq"), now=now)
+        global_gate = self.gate.check_global(equity=state.get("net_liq"), now=now, equity_usd=state.get("net_liq_usd"))
         if self.gate.halted and self.trading_enabled:
             self.trading_enabled = False
             self.generation += 1
@@ -1285,7 +1325,7 @@ class TradingEngine:
             return self._skip(decision_id, symbol, action, "migração da base de dados por resolver (ver log)")
         now = datetime.now(timezone.utc)
         state = self.ibkr.portfolio_state()
-        global_gate = self.gate.check_global(equity=state.get("net_liq"), now=now)
+        global_gate = self.gate.check_global(equity=state.get("net_liq"), now=now, equity_usd=state.get("net_liq_usd"))
         if self.gate.halted:
             return self._skip(decision_id, symbol, action, "kill-switch diário")
         position_qty = self.ibkr.position_qty(symbol)

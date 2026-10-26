@@ -1,6 +1,6 @@
 # Ollama × IBKR Trader — Guia passo a passo (instalação, ligações e utilização)
 
-Versão de referência: **1.0.17** (Windows). O programa é um único executável; não precisa de Python nem de
+Versão de referência: **1.0.18** (Windows). O programa é um único executável; não precisa de Python nem de
 instalação. Precisa de três coisas externas: a **TWS** (ou IB Gateway) da Interactive Brokers com a API ligada, o
 **Ollama** com um modelo descarregado e, opcionalmente, um **túnel HTTPS** para ligar o ChatGPT por MCP.
 
@@ -60,7 +60,7 @@ tua sessão iniciada. O que tens de fazer é **autorizar essa ligação**.
 
 ### 2.3 Dados de mercado
 - Sem subscrição paga, a IBKR fornece dados **atrasados 15 min**. O programa vem configurado para isso
-  (*Configurações → Apresentação → Dados de mercado → Atrasados 15 min*). Funciona, mas as decisões baseiam-se em
+  (*Configurações → Apresentação → Dados de mercado → Atrasados 15 min (sem subscrição)*). Funciona, mas as decisões baseiam-se em
   velas atrasadas.
 - Para tempo real, subscreve em *Account Management → Settings → Market Data Subscriptions* (para ações dos EUA
   normalmente "US Securities Snapshot and Futures Value Bundle" + "NASDAQ/NYSE") e muda a opção para
@@ -114,7 +114,7 @@ notícias; se falhar, continua sem esses filtros (*fail-soft*) e regista no log.
 
 ## Parte 5 — Primeira configuração dentro do programa
 
-Abre o programa e vai ao separador **Configurações** (ou botão ⚙ na barra lateral). Tudo o que é opção está aqui.
+Abre o programa e vai ao separador **Configurações** (ou botão ⚙ na barra lateral). As opções de uso corrente estão aqui; as avançadas (stops fixos, PDT, drawdown, Finnhub, módulos opcionais) editam-se em `config.json` com o programa fechado (Partes 2.4 e 4).
 
 1. **Conta e modelo**
    - *Conta*: **Paper** para começar. *Real* pede confirmação (escrever `REAL`) uma única vez e fica guardada.
@@ -166,8 +166,9 @@ Opção B — **ngrok** (precisa de conta gratuita): `ngrok config add-authtoken
 A URL temporária muda sempre que reinicias o túnel. Para uma URL fixa usa um túnel nomeado do Cloudflare (conta
 gratuita, domínio próprio) ou um domínio reservado do ngrok (plano pago).
 
-3. Cola a URL pública em *Configurações → Integração ChatGPT (MCP) → URL pública do túnel* e guarda: o endereço do
-   conector passa a mostrar `https://<túnel>/t/<token>/mcp`.
+3. Cola a URL pública em *Configurações → Integração ChatGPT (MCP) → URL pública do túnel HTTPS* e **Guardar e aplicar**:
+   a secção *Ligação do ChatGPT* passa a mostrar `https://<túnel>/t/<token>/mcp` (a partir da 1.0.18; na 1.0.17 só após
+   reiniciar o programa).
 
 ### 6.3 Criar o conector no ChatGPT
 1. No ChatGPT (web ou app): **Definições → Conectores → Criar** (nalgumas contas: *Apps e conectores* → *Avançado* →
@@ -199,22 +200,23 @@ gratuita, domínio próprio) ou um domínio reservado do ngrok (plano pago).
 ### 7.1 Arranque diário
 1. Abre a TWS e inicia sessão (ou confirma que o auto-restart a manteve ligada).
 2. Confirma que o Ollama está a correr (ícone na barra de tarefas) e, se usares o ChatGPT, arranca o túnel.
-3. Abre `OllamaIBKRTrader.exe`. Na barra lateral vês: estado da IBKR, Ollama, modo (PAPER / CONTA REAL · porta),
-   equity, P&L do dia.
+3. Abre `OllamaIBKRTrader.exe`. No cabeçalho vês o valor da carteira, a variação do dia e o estado IBKR / Ollama /
+   ciclo / dados; na barra lateral, o modo (PAPER / CONTA REAL), a porta, a conta, a moeda e o modelo.
 4. Ao ligar, o programa **reconcilia** antes de qualquer decisão: importa execuções que ocorreram enquanto estava
    desligado, restaura entradas/fechos pendentes, cancela saídas órfãs com confirmação, verifica a cobertura das
-   posições e classifica cada ativo (próprio, misto, externo, invertido). Enquanto `Reconciliado` não aparecer no
-   separador *Risco*, nenhuma ordem nova sai.
+   posições e classifica cada ativo (próprio, misto, externo, invertido). Enquanto no separador *Risco* aparecer
+   «⏳ a reconciliar o estado da corretora», nenhuma ordem nova sai.
 5. Clica **▶ Iniciar trading**. Em conta real a primeira vez pede que escrevas `REAL`.
 
 ### 7.2 Separadores
 - **Visão geral**: valor da carteira (48 h), posições com P&L, última proposta do modelo.
 - **Decisões**: cada consulta ao modelo (ação, confiança, acordo, probabilidade calibrada) e o que a camada de risco
-  fez com ela: `executado`, ou o motivo exato do bloqueio (custo, horário, PDT, kill-switch, discrepância, pausa…).
+  fez com ela: `EXECUTADA · …`, ou `não executada · motivo` com o motivo exato do bloqueio (custo, horário, PDT,
+  kill-switch, discrepância, pausa…).
 - **Risco**: *Proteções e kill-switch* (pausas ativas e até quando), *Gates estatísticos* (quantas decisões já
   avaliadas, se o risco validado está ativo), *Calibração*, *Lições ativas*, estado da reconciliação, posições
   externas, discrepâncias e a pausa remota.
-- **Consola**: log em tempo real com categorias (ordem, decisão, risco, erro).
+- **Consola**: log em tempo real, colorido por nível (INFO/WARNING/ERROR) e por categoria (ordens, Ollama).
 - **Configurações**: tudo o que é opção (Parte 5 e 6).
 
 ### 7.3 Botões da barra lateral
@@ -222,12 +224,12 @@ gratuita, domínio próprio) ou um domínio reservado do ngrok (plano pago).
   a supervisão das posições existentes continua (cobertura, prazos de entradas, fechos pendentes).
 - **🧠 Retrospetiva agora**: avalia decisões passadas (settlement), recalcula lições e calibração.
 - **📊 Relatório estatístico**: Brier, expectancy, Monte Carlo, gates; mostra se o risco validado pode subir.
-- **▶ Retomar novas entradas**: só aparece quando há pausa (local ou pedida pelo ChatGPT).
+- **▶ Retomar novas entradas**: só fica ativo quando há pausa (local ou pedida pelo ChatGPT).
 
 ### 7.4 O que esperar nas primeiras semanas
 - O programa começa **sem calibração** (heurística) e com risco por trade limitado pelo multiplicador de aprendizagem
   até os *gates estatísticos* passarem (precisa de dezenas de decisões avaliadas). Isto é intencional.
-- Só decide em horário regular de NY (15:30–22:00 Lisboa, hora de verão), fora dos primeiros 15 e últimos 10 minutos.
+- Só decide em horário regular de NY (09:30–16:00 em Nova Iorque = 14:30–21:00 em Lisboa durante quase todo o ano; a diferença é de 5 h), fora dos primeiros 15 e últimos 10 minutos.
 - Cada entrada é um **bracket**: ordem limite marketable + take-profit limite + stop (OCA, GTC). Se a entrada não
   executar em 120 s é cancelada.
 
@@ -251,7 +253,7 @@ ficam protegidas pelos stops GTC na corretora, e ao reabrir a reconciliação im
 
 | Sintoma | Causa provável | O que fazer |
 |---|---|---|
-| "IBKR: desligado" | TWS fechada, API não ativada, porta errada, Trusted IP em falta | Parte 2.2; confirma a porta no rodapé da barra lateral |
+| "IBKR: desligado" | TWS fechada, API não ativada, porta errada, Trusted IP em falta | Parte 2.2; confirma a porta na secção *Ligação* da barra lateral |
 | Pop-up na TWS a cada ligação | `127.0.0.1` não está em *Trusted IPs* | Adiciona e marca *Enable ActiveX and Socket Clients* |
 | "Ollama: indisponível" | Ollama fechado ou URL errada | Abre o Ollama; `curl http://localhost:11434/api/tags` |
 | Lista de modelos vazia | Nenhum modelo descarregado | `ollama pull llama3` e clica ↻ |

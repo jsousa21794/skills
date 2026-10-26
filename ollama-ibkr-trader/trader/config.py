@@ -14,6 +14,7 @@ ambiente ``OLLAMA_TRADER_HOME``).
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import shutil
@@ -207,6 +208,7 @@ class Settings:
 
     # ------------------------------------------------------------------------------
     load_warnings: ClassVar[list[str]] = []
+    last_save_error: ClassVar[str] = ""
 
     @classmethod
     def config_path(cls) -> Path:
@@ -289,16 +291,19 @@ class Settings:
         type(self).load_warnings.extend(warnings)
         return warnings
 
-    def save(self) -> None:
-        """Gravação atómica: escreve num temporário e substitui."""
+    def save(self) -> bool:
+        """Gravação atómica: escreve num temporário e substitui. Devolve False (e regista) se não conseguir gravar."""
         path = self.config_path()
         try:
             fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".config-", suffix=".json")
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(asdict(self), fh, indent=2, ensure_ascii=False)
             os.replace(tmp, path)
-        except OSError:
-            pass
+            return True
+        except OSError as exc:
+            type(self).last_save_error = str(exc)
+            logging.getLogger("trader.config").error("Não foi possível gravar %s: %s", path, exc)
+            return False
 
     @property
     def is_live(self) -> bool:
@@ -334,7 +339,8 @@ _PCT_FIELDS_0_1 = ("risk_per_trade_pct", "risk_per_trade_pct_validated", "max_po
                    "take_profit_pct", "daily_loss_limit_pct", "max_drawdown_pct", "reduce_size_drawdown_pct",
                    "commission_max_pct", "max_cost_fraction_of_tp", "min_confidence", "edge_margin", "llm_min_agreement",
                    "llm_min_valid_fraction", "max_entry_slippage_pct", "volmodel_block_width_pct", "gate_max_ece",
-                   "gate_min_psr", "gate_max_ruin_prob", "atr_floor_percentile_frac")
+                   "gate_min_psr", "gate_max_ruin_prob")
+_PORT_FIELDS = ("mcp_port", "ib_port_paper", "ib_port_live")
 _POSITIVE_FIELDS = ("mcp_port", "cycle_seconds", "llm_interval_minutes", "signal_persistence_cycles", "decision_bar_minutes",
                     "rsi_period", "sma_fast", "sma_slow", "ema_period", "atr_period", "llm_samples",
                     "settlement_horizon_minutes", "ollama_timeout_seconds", "ollama_num_ctx", "ib_port_paper",
@@ -409,6 +415,14 @@ def _validate(name: str, value: Any) -> tuple[bool, str]:
         return False, "tem de estar entre 0 e 1"
     if name == "atr_floor_percentile" and not (0.0 <= float(value) <= 100.0):
         return False, "tem de estar entre 0 e 100"
+    if name in ("risk_per_trade_pct", "risk_per_trade_pct_validated") and not (0.0 < float(value) <= 0.10):
+        return False, "tem de estar entre 0 e 0,10 (até 10% do equity por operação)"
+    if name == "daily_loss_limit_pct" and not (0.0 < float(value) <= 1.0):
+        return False, "tem de estar entre 0 (exclusivo) e 1; 0 pararia o ciclo logo no arranque do dia"
+    if name == "sentiment_veto_threshold" and not (-1.0 <= float(value) <= 0.0):
+        return False, "tem de estar entre -1 e 0 (sentimento negativo que veta compras)"
+    if name in _PORT_FIELDS and not (1 <= int(value) <= 65535):
+        return False, "porta tem de estar entre 1 e 65535"
     if name in _POSITIVE_FIELDS and not (float(value) > 0):
         return False, "tem de ser positivo"
     if name in _NON_NEGATIVE_FIELDS and float(value) < 0:

@@ -54,6 +54,13 @@ FONT = "Segoe UI"
 CURRENCY = {"code": "USD", "rate": 1.0, "exact": True}  # moeda de apresentação e fator a partir da moeda base
 
 
+def connector_text(settings: Any) -> str:
+    """Endereço do conector MCP mostrado em Configurações (recomposto a cada gravação; nunca vai para o log)."""
+    token = settings.mcp_token or "(gerado ao ativar)"
+    base = (settings.mcp_public_url or f"http://{settings.mcp_host}:{settings.mcp_port}").rstrip("/")
+    return f"Conector: {base}/t/{token}/mcp"
+
+
 def money(v: Any, suffix: Optional[str] = None) -> str:
     """Formata um montante da moeda base na moeda de apresentação escolhida em Configurações."""
     suffix = f" {CURRENCY['code']}" if suffix is None else suffix
@@ -477,7 +484,9 @@ class TraderApp(ctk.CTk):
         head = ctk.CTkFrame(tab, fg_color="transparent")
         head.grid(row=0, column=0, sticky="ew", pady=(4, 6))
         head.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(head, text="Todas as opções do programa. As alterações aplicam-se ao gravar; conta e modelo aplicam-se de imediato.",
+        ctk.CTkLabel(head, text="Opções de uso corrente; as avançadas editam-se em config.json (ver README). "
+                                "As alterações aplicam-se ao gravar; conta e modelo aplicam-se de imediato.",
+                     wraplength=720, justify="left",
                      text_color=C["muted"], font=ctk.CTkFont(FONT, 12), anchor="w").grid(row=0, column=0, sticky="w")
         ctk.CTkButton(head, text="💾  Guardar e aplicar", fg_color=C["accent"], hover_color=C["accent_hover"], height=36,
                       font=ctk.CTkFont(FONT, 13, "bold"), command=self._save_settings).grid(row=0, column=1, padx=(8, 0))
@@ -572,9 +581,7 @@ class TraderApp(ctk.CTk):
 
         # --- Endereço do conector MCP (token no caminho) ---
         mcp_box = section("Ligação do ChatGPT", r + 1, 0, colspan=2)
-        token = self.settings.mcp_token or "(gerado ao ativar)"
-        base = (self.settings.mcp_public_url or f"http://{self.settings.mcp_host}:{self.settings.mcp_port}").rstrip("/")
-        self.lbl_mcp_url = ctk.CTkLabel(mcp_box, text=f"Conector: {base}/t/{token}/mcp", font=ctk.CTkFont("Consolas", 11),
+        self.lbl_mcp_url = ctk.CTkLabel(mcp_box, text=connector_text(self.settings), font=ctk.CTkFont("Consolas", 11),
                                         anchor="w", wraplength=900, justify="left")
         self.lbl_mcp_url.grid(row=1, column=0, columnspan=2, sticky="w", padx=14, pady=(2, 2))
         ctk.CTkLabel(mcp_box, text="No ChatGPT: Definições → Conectores → Criar; URL do servidor MCP = endereço acima; autenticação: nenhuma "
@@ -603,7 +610,7 @@ class TraderApp(ctk.CTk):
         before = {k: getattr(self.settings, k) for k in ("ib_host", "ib_port_live", "ib_port_paper", "ib_client_id",
                                                            "ib_account", "market_data_type", "symbols", "ollama_url")}
         warnings = self.settings.apply(data)
-        self.settings.save()
+        saved = self.settings.save()
         self.settings.load_warnings.clear()
         # Repor o formulário com os valores efetivamente aceites.
         for name, (var, kind) in self._setting_vars.items():
@@ -614,11 +621,16 @@ class TraderApp(ctk.CTk):
         self.engine.call(self.engine.settings_changed())
         if connection_changed:
             self.engine.call(self.engine.reconnect())
-        status = "Configurações guardadas e aplicadas." + (" Ligação à IBKR reiniciada." if connection_changed else "")
+        self.lbl_mcp_url.configure(text=connector_text(self.settings))  # URL pública/porta/host podem ter mudado
+        if saved:
+            status = "Configurações guardadas e aplicadas." + (" Ligação à IBKR reiniciada." if connection_changed else "")
+        else:
+            status = (f"Aplicadas nesta sessão mas NÃO gravadas em {self.settings.config_path()}: "
+                      f"{type(self.settings).last_save_error}")
         if warnings:
             status += "  Rejeitado: " + "; ".join(warnings)
-        self.lbl_settings_status.configure(text=status, text_color=C["amber"] if warnings else C["green"])
-        self.append_log("WARNING" if warnings else "INFO", status)
+        self.lbl_settings_status.configure(text=status, text_color=C["amber"] if (warnings or not saved) else C["green"])
+        self.append_log("WARNING" if (warnings or not saved) else "INFO", status)
 
     # ------------------------------------------------------------- comandos
     def _start(self) -> None:
@@ -667,6 +679,9 @@ class TraderApp(ctk.CTk):
     def _on_mode_change(self, value: str) -> None:
         if value == "Real":
             if self.settings.is_live and self.settings.live_confirmed:
+                return
+            if self.settings.live_confirmed:  # confirmação única já dada: Paper -> Real sem voltar a perguntar
+                self.engine.call(self.engine.set_mode("live", confirmed=True))
                 return
             ConfirmLiveDialog(self, self.settings.ib_port_live,
                               on_confirm=lambda: self.engine.call(self.engine.set_mode("live", confirmed=True)),
@@ -795,7 +810,7 @@ class TraderApp(ctk.CTk):
             covered = pos.get("covered")
             stop_txt = (f"{pos['stop']:.2f}" if pos.get("stop") else "—") + ("" if covered in (None, True) else " ⚠ sem cobertura")
             values = (pos["symbol"], f"{pos['qty']:g}", f"{pos['avg_cost']:.2f}", f"{pos['market_price']:.2f}",
-                      money(pos["market_value"], ""), f"{pos['unrealized_pnl']:+,.2f}",
+                      money(pos["market_value"], ""), ("+" if pos["unrealized_pnl"] >= 0 else "") + money(pos["unrealized_pnl"], ""),
                       stop_txt, f"{pos['tp']:.2f}" if pos.get("tp") else "—")
             tag = "review" if covered is False else ("pos" if pos["unrealized_pnl"] >= 0 else "neg")
             if pos["symbol"] in existing:

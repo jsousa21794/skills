@@ -32,6 +32,7 @@ import secrets
 import sqlite3
 import threading
 from collections import deque
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -72,6 +73,14 @@ class RemoteSupervisor:
                                           mode=self.settings.trading_mode, result=summary[:2000])
         except Exception as exc:  # noqa: BLE001
             log.warning("Auditoria MCP falhou para %s: %s", tool, exc)
+
+    # ---- redação de identificadores (AI02): a conta completa nunca sai pelo MCP, nem dentro de texto livre
+    def _redact(self, text: str) -> str:
+        out = str(text)
+        for acct in {self.engine.ibkr.account or "", self.settings.ib_account or ""}:
+            if len(acct) > 4:
+                out = out.replace(acct, mask_account(acct))
+        return out
 
     # ---- identidade do contexto
     def context_id(self) -> str:
@@ -130,7 +139,7 @@ class RemoteSupervisor:
         except Exception as exc:  # noqa: BLE001
             orders = [{"error": str(exc)}]
         pending = [{"order_id": oid, "symbol": e["symbol"], "qty": e["qty"], "filled": e.get("filled"), "cancel_sent": e.get("cancel_sent", False)}
-                   for oid, e in self.engine._pending_entries.items()]
+                   for oid, e in list(self.engine._pending_entries.items())]  # cópia: o motor altera o dict na sua thread
         result = {"orders": orders, "pending_entries": pending, "pending_closes": dict(self.engine._pending_close)}
         self._audit("get_open_orders", {}, {"n": len(orders)})
         return result
@@ -148,9 +157,11 @@ class RemoteSupervisor:
                     if levels.get(level, 20) >= threshold:
                         out.append(line.rstrip("\n"))
         except OSError as exc:
-            return {"lines": [], "error": str(exc)}
+            self._audit("get_recent_log", {"lines": lines, "min_level": min_level}, {"error": str(exc)})
+            return {"lines": [], "error": self._redact(str(exc))}
         self._audit("get_recent_log", {"lines": lines, "min_level": min_level}, {"n": len(out)})
-        return {"lines": list(out), "path": str(self.settings.log_path())}
+        # Só o nome do ficheiro (o caminho completo tem o utilizador do SO) e linhas com a conta mascarada (AI02).
+        return {"lines": [self._redact(line) for line in out], "file": Path(self.settings.log_path()).name}
 
     def recent_decisions(self, limit: int = 20) -> dict[str, Any]:
         limit = max(1, min(int(limit), 200))
@@ -246,7 +257,7 @@ class RemoteSupervisor:
             checks["sqlite_quick_check"] = self.db._query("PRAGMA quick_check")[0].get("quick_check")
         except Exception as exc:  # noqa: BLE001
             checks["sqlite_quick_check"] = f"erro: {exc}"
-        checks["database"] = self.db.path
+        checks["database"] = self._redact(Path(str(self.db.path)).name)  # nome do ficheiro com a conta mascarada (AI02)
         checks["config_warnings"] = list(Settings.load_warnings)
         checks["migration_blocked"] = self.engine._migration_blocked()
         checks["ibkr_connected"] = self.engine.ibkr.connected
@@ -271,7 +282,10 @@ class RemoteSupervisor:
         return checks
 
     def remote_commands(self, limit: int = 50) -> dict[str, Any]:
-        return {"commands": self.db.recent_remote_commands(max(1, min(int(limit), 500)))}
+        limit = max(1, min(int(limit), 500))
+        rows = self.db.recent_remote_commands(limit)
+        self._audit("get_remote_commands", {"limit": limit}, {"n": len(rows)})
+        return {"commands": rows}
 
     # ---- comando
     async def pause_entries(self, account: str, mode: str, reason: str, context_id: str = "") -> dict[str, Any]:
@@ -281,7 +295,9 @@ class RemoteSupervisor:
         expected_mode = self.settings.trading_mode
         exact_account = self.engine.ibkr.account
         expected_acct = mask_account(exact_account)
-        args = {"account": account, "mode": mode, "reason": reason, "context_id": context_id}
+        # A auditoria guarda a conta mascarada mesmo quando o cliente envia a conta completa (AI02).
+        args = {"account": mask_account(account) if (account or "").strip() == exact_account and exact_account else account,
+                "mode": mode, "reason": reason, "context_id": context_id}
         current_context = self.context_id()
         if not (context_id or "").strip():
             result = {"applied": False, "error": "indica o context_id devolvido por get_status (identidade do contexto consultado)"}
@@ -403,7 +419,10 @@ class TokenGate:
         self.mcp_path = mcp_path
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
-        if scope.get("type") not in ("http", "websocket"):
+        if scope.get("type") == "websocket":
+            await send({"type": "websocket.close", "code": 1008})  # transporte não suportado (AI02)
+            return
+        if scope.get("type") != "http":
             await self.app(scope, receive, send)
             return
         path = scope.get("path", "")
@@ -418,7 +437,7 @@ class TokenGate:
                 scope["path"] = "/" + tail
                 scope["raw_path"] = scope["path"].encode()
         if not ok:
-            headers = {k.decode().lower(): v.decode() for k, v in scope.get("headers", [])}
+            headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
             auth = headers.get("authorization", "")
             if auth.lower().startswith("bearer ") and hmac.compare_digest(auth[7:].strip(), self.token):
                 ok = True
@@ -479,8 +498,8 @@ class MCPServerThread:
 
         self._thread = threading.Thread(target=run, name="mcp-server", daemon=True)
         self._thread.start()
-        log.warning("Servidor MCP (ChatGPT) a escutar em http://%s:%d — conector: %s", self.settings.mcp_host,
-                    self.settings.mcp_port, self.connector_url())
+        log.warning("Servidor MCP (ChatGPT) a escutar em http://%s:%d — o endereço do conector (com o token) está em "
+                    "Configurações → Ligação do ChatGPT; não é escrito no log.", self.settings.mcp_host, self.settings.mcp_port)
         return True
 
     def stop(self, timeout: float = 5.0) -> None:

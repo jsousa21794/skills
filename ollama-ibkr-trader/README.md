@@ -23,11 +23,53 @@ escuro).
 > de perda aplicam-se o StoplossGuard, o travão de perdas seguidas e o cooldown
 > após saída em perda. Tudo ajustável em `config.json` (validado ao carregar).
 >
-> Versão 1.0.17: resposta à revisão da 1.0.16 (2 achados P1), ver
-> `../reports/Resposta à revisão 1.0.16.md`; antes, as respostas às revisões
-> anteriores e à auditoria da 1.0.2 na mesma pasta.
+> Versão 1.0.18: conselho de verificação interno da 1.0.17 (três revisores:
+> ciclo de ordens; risco/custos/aprendizagem; MCP/interface/build/docs), ver
+> `../reports/Conselho de verificação 1.0.17.md`; antes, as respostas às revisões
+> anteriores e à auditoria da 1.0.2 na mesma pasta. Guias de utilização em
+> `../reports/Guia para principiantes.md` e `../reports/Guia de instalação e utilização.md`.
 
-## Invariantes de segurança (1.0.17)
+## Invariantes de segurança (1.0.18)
+
+- **Settlement nunca para o ciclo**: cada decisão é avaliada isoladamente; uma
+  decisão com dados inconsistentes é registada e saltada, e o ciclo de decisão
+  corre mesmo que o settlement falhe. Uma entrada cancelada/expirada sem
+  execução (trade `CANCELLED` ou sem `entry_ts`) é avaliada como decisão não
+  negociada, pelos níveis hipotéticos, nunca pelo ledger.
+- **Regra PDT em USD**: o limiar de 25 000 USD compara-se com o equity em USD
+  (`net_liq_usd`), não com o valor na moeda da conta.
+- **Ajustes provisórios só sobre quantidade executada**: um trade aberto sem
+  execução nunca absorve ajustes de redução/inversão (usa-se `filled_qty`, nunca
+  a quantidade nominal), logo não gera bloqueios inexplicáveis nem churn de
+  saídas.
+- **Entradas mortas não ficam abertas**: na reconciliação, e quando a corretora
+  já não conhece a ordem de uma entrada expirada, um trade sem execução e sem
+  ordem de entrada viva passa a `CANCELLED` (deixa de contar como posição do bot
+  e de manter o ativo gerido). Uma execução que chegue depois do estado
+  `Cancelled` reabre o trade como posição própria (com discrepância até
+  reconciliar). Limitação conhecida: a API da IBKR só devolve execuções do dia
+  corrente; uma entrada executada num dia anterior com o bot desligado não é
+  recuperada automaticamente e a posição aparece como não pertencente ao bot.
+- **Nunca adotar sem registo**: ordens próprias vivas sem trade aberto não
+  autorizam a adoção da posição da corretora com `manage_external_positions`
+  desligado: as saídas órfãs são canceladas e a posição fica externa. A
+  reconstrução do registo perdido só acontece com a opção ligada.
+- **MCP sem identificadores completos**: o número de conta completo nunca sai
+  pelo servidor MCP (linhas de log e nome da base de dados são mascarados, o
+  caminho do log não é devolvido, a conta nos argumentos auditados é
+  mascarada); o endereço do conector com o token não é escrito no log;
+  cabeçalhos não-UTF-8 dão 401 e não 500; websockets são recusados;
+  `get_remote_commands` também é auditado.
+- **Configuração**: `risk_per_trade_pct` e `risk_per_trade_pct_validated` entre
+  0 e 0,10 (a promessa "até 10%" é imposta), `daily_loss_limit_pct` entre 0
+  (exclusivo) e 1, `sentiment_veto_threshold` entre -1 e 0, portas entre 1 e
+  65535; uma gravação falhada de `config.json` é assinalada na interface.
+- **Interface**: o endereço do conector é recomposto ao gravar; a confirmação
+  `REAL` é pedida uma única vez (também ao voltar de Paper para Real); a coluna
+  "P&L não real." usa a moeda de apresentação; o texto do separador diz quais
+  opções vivem em `config.json`.
+
+## Invariantes de segurança herdados (1.0.17)
 
 - **Proveniência da cobertura**: cada relação de cobertura por ordem guarda a
   sua origem. A gravada na colocação (`placed`) é prova explícita e nunca é
@@ -575,16 +617,22 @@ aceitar adaptadores LoRA (só GGUF já fundidos). O que existe e é usável:
   conhecido** com a hora, lido do histórico em SQLite; o título da janela
   repete o valor para ficar visível na barra de tarefas.
 - **Barra lateral** só com controlo (Iniciar/Parar), estado da ligação e
-  análise (retrospetiva, relatório estatístico, atalho para Configurações).
-- **Separador Configurações**: TODAS as opções do programa vivem aqui, por
-  secções: *Conta e modelo* (Paper/Real com confirmação, modelo Ollama com
+  análise (retrospetiva, relatório estatístico, atalho para Configurações) e
+  *Retomar novas entradas* (ativo só quando há pausa).
+- **Separador Configurações**: as opções de uso corrente vivem aqui, por
+  secções (as avançadas — stops fixos, PDT, drawdown, cooldown, horário,
+  Finnhub, módulos opcionais — editam-se em `config.json` com o programa
+  fechado): *Conta e modelo* (Paper/Real com confirmação, modelo Ollama com
   lista de `/api/tags`, ativos; aplicação imediata), *Ligação à IBKR* (host,
-  portas, client ID, conta, adoção de posições externas), *Ollama* (URL,
+  portas, client ID, conta, adoção de posições externas, cancelamento de
+  saídas manuais ao fechar), *Ollama* (URL,
   cadência, amostras, acordo mínimo, duas etapas, anonimização), *Trading e
   risco* (posições, risco por operação, kill-switch diário, entradas
   ilimitadas em lucro, short, slippage, stop ATR, R:R, persistência do sinal),
-  *Custos* (comissões e gate de custos) e *Apresentação* (**moeda em que os
-  valores são mostrados**, dados de mercado, janela sempre visível).
+  *Integração ChatGPT (MCP)* (ativar, endereço, porta, URL pública do túnel),
+  *Custos* (comissões e gate de custos), *Apresentação* (**moeda em que os
+  valores são mostrados**, dados de mercado, janela sempre visível) e
+  *Ligação do ChatGPT* (endereço do conector, recomposto a cada gravação).
   "Guardar e aplicar" valida com as mesmas regras do `config.json` (valores
   inválidos são rejeitados e assinalados), grava e aplica no motor; alterações
   de ligação reiniciam a ligação à IBKR.
@@ -653,7 +701,9 @@ python main.py
 ```
 
 Requisitos:
-- Python 3.10+ (exigido pelo `ib_async`) com Tk (`sudo apt install python3-tk` no Linux).
+- Python 3.10+ (exigido pelo `ib_async`) com Tk (`sudo apt install python3-tk` no Linux) para
+  `requirements.txt`; o `requirements.lock` (versões exatas usadas no workflow e em `build.sh`/`build.bat`)
+  exige Python 3.12.
 - **TWS ou IB Gateway** com API ativa: *Configure → API → Settings*:
   ✔ Enable ActiveX and Socket Clients, ✘ Read-Only API, porta **7496**
   (real, predefinido) ou **7497** (paper), 127.0.0.1 nos Trusted IPs. Sem subscrição, o paper usa dados com
@@ -661,7 +711,7 @@ Requisitos:
 - **Ollama** (`ollama serve`) com pelo menos um modelo; o dropdown lista `/api/tags`.
 
 Configuração em `~/.ollamaibkrtrader/config.json`; base de dados, log e
-`relatorio_estatistico.md` na mesma pasta (`OLLAMA_TRADER_HOME` muda-a).
+`relatorio_estatistico_<modo>.md` (`live`/`paper`) na mesma pasta (`OLLAMA_TRADER_HOME` muda-a).
 
 ## Executável único (PyInstaller)
 
@@ -683,7 +733,8 @@ No Windows o SmartScreen pode avisar por o executável não estar assinado:
 build.bat           # Windows
 ```
 
-`trader.spec` recolhe CustomTkinter, ib_async e eventkit e exclui torch,
+`trader.spec` recolhe CustomTkinter, ib_async/eventkit, a pilha MCP (mcp,
+uvicorn, starlette, pydantic, httpx2) e yfinance, e exclui torch,
 transformers e chronos (os módulos opcionais são importados tardiamente e
 ficam desativados no executável se não estiverem presentes).
 

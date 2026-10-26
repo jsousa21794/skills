@@ -1124,12 +1124,15 @@ class Database:
         # que as mesmas execuções deem o mesmo resultado em qualquer ordem de chegada (AB03).
         exit_qty = float(trade["exit_qty"] or 0)
         reprice = -(avg - prev_price) * exit_qty * int(trade["direction"]) if (exit_qty > 0 and filled > 0) else 0.0
-        # Uma entrada tardia que excede as saídas REABRE um trade dado como fechado: o saldo volta a ser próprio (AB04).
-        reopened = trade["status"] == "CLOSED" and new_filled > exit_qty + 1e-9
+        # Uma entrada tardia que excede as saídas REABRE um trade dado como fechado (AB04) ou CANCELADO (execução que chega
+        # depois do estado Cancelled, em sessão ou na importação de arranque): o saldo volta a ser próprio (AI07).
+        reopened = trade["status"] in ("CLOSED", "CANCELLED") and new_filled > exit_qty + 1e-9
+        status = "OPEN" if reopened else trade["status"]
+        exit_reason = None if (reopened and trade["status"] == "CANCELLED") else trade.get("exit_reason")
         self._execute(
             """UPDATE trades SET filled_qty=?, entry_price=?, entry_ts=COALESCE(entry_ts, ?),
-               commission=commission+?, pnl=pnl-?+?, gross_pnl=gross_pnl+?, status=? WHERE id=?""",
-            (new_filled, avg, iso(ts), commission, commission, reprice, reprice, "OPEN" if reopened else trade["status"], trade_id),
+               commission=commission+?, pnl=pnl-?+?, gross_pnl=gross_pnl+?, status=?, exit_reason=? WHERE id=?""",
+            (new_filled, avg, iso(ts), commission, commission, reprice, reprice, status, exit_reason, trade_id),
         )
         return {"reopened": reopened, "trade": self._query("SELECT * FROM trades WHERE id=?", (trade_id,))[0]}
 

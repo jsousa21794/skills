@@ -205,7 +205,7 @@ class RiskGate:
         return self._halted_day is not None
 
     # ------------------------------------------------------------- global
-    def check_global(self, *, equity: Optional[float], now: datetime) -> GateResult:
+    def check_global(self, *, equity: Optional[float], now: datetime, equity_usd: Optional[float] = None) -> GateResult:
         """Gates que não dependem do ativo. Chamado uma vez por ciclo.
 
         Com ``relax_limits_when_in_profit`` e o dia em lucro, o limite de entradas, o
@@ -274,8 +274,10 @@ class RiskGate:
         if self.s.max_trades_per_day > 0 and not in_profit and self.db.entries_today(day_start) >= self.s.max_trades_per_day:
             return result.block(f"máximo de {self.s.max_trades_per_day} entradas/dia (dia em perda)")
 
-        # Regra PDT da corretora: contas abaixo do limiar só podem fazer N day trades em 5 dias úteis.
-        if self.s.pdt_guard_enabled and equity is not None and equity < self.s.pdt_equity_threshold:
+        # Regra PDT da corretora: contas abaixo do limiar (em USD) só podem fazer N day trades em 5 dias úteis. O limiar é
+        # em USD, logo compara-se com o equity EM USD e não com o da moeda da conta (AI03).
+        pdt_equity = equity_usd if equity_usd is not None else equity
+        if self.s.pdt_guard_enabled and pdt_equity is not None and pdt_equity < self.s.pdt_equity_threshold:
             count = self.db.day_trades_since(now - timedelta(days=7))
             if count >= self.s.pdt_max_day_trades:
                 return result.block(f"regra PDT: {count} day trades em 5 dias úteis com equity < {self.s.pdt_equity_threshold:,.0f} USD")
